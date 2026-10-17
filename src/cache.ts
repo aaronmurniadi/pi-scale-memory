@@ -9,7 +9,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { buildContext, dailyPath, listDaily, readSafe, searchIn } from "../brain/memory.mjs";
-import type { BrainClient } from "./client.js";
+import type { BrainClient, SearchResponse } from "./client.js";
 import { CONFIG_DIR } from "./config.js";
 
 export type MemorySource = "brain" | "cache";
@@ -134,17 +134,27 @@ export async function readWithFallback(
 	return { source: "cache", takenAt: meta?.takenAt ?? null, value: readFromCache(dir, target, date) };
 }
 
+export interface CacheSearch extends SearchResponse {
+	source: MemorySource;
+	takenAt: string | null;
+}
+
+/**
+ * The brain answers with qmd when it is installed. The offline mirror only has
+ * its own BM25 index, so cached results are reported as engine "bm25".
+ */
 export async function searchWithFallback(
 	client: BrainClient | null,
 	dir: string,
 	query: string,
 	limit: number,
-): Promise<Sourced<unknown[]>> {
+	mode?: string,
+): Promise<CacheSearch> {
 	let failure: unknown = null;
 	if (client) {
 		try {
-			const results = await client.search(query, limit);
-			return { source: "brain", takenAt: null, value: results };
+			const res = await client.search(query, limit, mode);
+			return { ...res, source: "brain", takenAt: null };
 		} catch (err) {
 			failure = err;
 		}
@@ -154,7 +164,13 @@ export async function searchWithFallback(
 		throw new Error("brain is not connected and there is no cached memory yet");
 	}
 	const meta = metaOf(dir);
-	return { source: "cache", takenAt: meta?.takenAt ?? null, value: searchIn(dir, query, limit) };
+	return {
+		source: "cache",
+		takenAt: meta?.takenAt ?? null,
+		engine: "bm25",
+		mode: "keyword",
+		results: searchIn(dir, query, limit),
+	};
 }
 
 /** Session-start snapshot: live context when reachable, otherwise the mirror. */

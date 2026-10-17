@@ -8,6 +8,9 @@
  *
  * Storage layout (see brain/memory.mjs): MEMORY.md, SCRATCHPAD.md, daily/*.md
  *
+ * Search: qmd (keyword / semantic / deep) when installed, otherwise the built-in
+ * BM25 search over the same files. See brain/qmd.mjs.
+ *
  * Env: BRAIN_DIR (default ~/.pi-scale-brain), BRAIN_PORT (8787),
  *      BRAIN_HOST (0.0.0.0), BRAIN_TOKEN (optional shared bearer token)
  */
@@ -31,12 +34,34 @@ import {
 	snapshotFiles,
 	todayStr,
 } from "./memory.mjs";
+import {
+	clampLimit,
+	COLLECTION,
+	detectQmd,
+	ensureCollection,
+	hasCollection,
+	isIndexDirty,
+	isIndexing,
+	normalizeMode,
+	qmdSearch,
+	refreshIndex,
+	scheduleIndexRefresh,
+	stripAnsi,
+	updateMode,
+	waitForIndex,
+} from "./qmd.mjs";
 
 const DIR = process.env.BRAIN_DIR || path.join(os.homedir(), ".pi-scale-brain");
 const PORT = Number(process.env.BRAIN_PORT || 8787);
 const HOST = process.env.BRAIN_HOST || "0.0.0.0";
 const TOKEN = process.env.BRAIN_TOKEN || "";
 const MAX_BODY = 2 * 1024 * 1024;
+const SEARCH_MODE = normalizeMode(process.env.QMD_SEARCH_MODE);
+/** How long a search waits for an in-flight re-index so it sees the latest write. */
+const INDEX_WAIT_MS = Number(process.env.QMD_INDEX_WAIT_MS ?? 5_000);
+
+/** Search state reported by /v1/health so agents can label their results. */
+const searchState = { engine: "bm25", mode: SEARCH_MODE, collection: COLLECTION, ready: false, note: null };
 
 fs.mkdirSync(path.join(DIR, "daily"), { recursive: true });
 
@@ -137,6 +162,48 @@ function handleForget(body) {
 	return { ok: true, removed: 0 };
 }
 
+/**
+ * One search request: qmd when it is usable, BM25 otherwise. Never throws for a
+ * missing or failing qmd — the caller always gets results plus the engine used.
+ */
+async function runSearch(query, mode, limit) {
+	const keywordFallback = (note) => {
+		searchState.engine = "bm25";
+		searchState.note = note ?? null;
+		return { engine: "bm25", mode: "keyword", results: searchIn(DIR, query, limit), note };
+	};
+
+	if (!query.trim() || !(await detectQmd())) return keywordFallback(undefined);
+	if (!(await hasCollection())) return keywordFallback("qmd collection is not ready yet");
+
+	// A write marks the index dirty; give the indexer a moment so a search finds
+	// what was just written instead of reporting a stale (or empty) index.
+	if (isIndexDirty()) await waitForIndex(INDEX_WAIT_MS);
+
+	try {
+		const { results } = await qmdSearch(mode, query, limit);
+		searchState.engine = "qmd";
+		searchState.ready = true;
+		searchState.note = null;
+		if (results.length === 0) {
+			// qmd's index can still be behind a very recent write. BM25 reads the
+			// files directly, so prefer a real hit over an empty answer.
+			const direct = searchIn(DIR, query, limit);
+			if (direct.length > 0) {
+				searchState.engine = "bm25";
+				searchState.note = "qmd index is catching up";
+				return { engine: "bm25", mode: "keyword", results: direct, note: "qmd index is catching up" };
+			}
+		}
+		return { engine: "qmd", mode, results };
+	} catch (err) {
+		let message = String(err);
+		if (err instanceof Error) message = err.message;
+		console.log(`[search] qmd ${mode} failed, using bm25: ${stripAnsi(message).trim().slice(0, 200)}`);
+		return keywordFallback(`qmd failed: ${stripAnsi(message).trim().slice(0, 160)}`);
+	}
+}
+
 function handleRead(q) {
 	const target = q.get("target");
 	if (target === "list") return { files: listDaily(DIR) };
@@ -179,7 +246,14 @@ const server = http.createServer(async (req, res) => {
 		if (TOKEN && req.headers.authorization !== `Bearer ${TOKEN}`) throw httpErr(401, "unauthorized");
 		const url = new URL(req.url, "http://brain");
 		const route = `${req.method} ${url.pathname}`;
-		if (route === "GET /v1/health") return send(200, { ok: true, role: "brain", date: todayStr() });
+		if (route === "GET /v1/health") {
+			return send(200, {
+				ok: true,
+				role: "brain",
+				date: todayStr(),
+				search: { ...searchState, indexing: isIndexing(), update: updateMode() },
+			});
+		}
 		if (route === "GET /v1/context") return send(200, { context: buildContext(DIR) });
 		// Full mirror for agent caches: every memory file in one response.
 		if (route === "GET /v1/snapshot") {
@@ -187,12 +261,26 @@ const server = http.createServer(async (req, res) => {
 		}
 		if (route === "GET /v1/read") return send(200, handleRead(url.searchParams));
 		if (route === "GET /v1/search") {
-			const limit = Math.min(Number(url.searchParams.get("limit")) || 5, 20);
-			return send(200, { results: searchIn(DIR, url.searchParams.get("q") || "", limit) });
+			const limit = clampLimit(Number(url.searchParams.get("limit")) || 5);
+			const mode = normalizeMode(url.searchParams.get("mode") ?? SEARCH_MODE);
+			const query = url.searchParams.get("q") || "";
+			return send(200, await runSearch(query, mode, limit));
 		}
-		if (route === "POST /v1/write") return send(200, handleWrite(await readBody(req)));
-		if (route === "POST /v1/scratchpad") return send(200, handleScratchpad(await readBody(req)));
-		if (route === "POST /v1/forget") return send(200, handleForget(await readBody(req)));
+		if (route === "POST /v1/write") {
+			const out = handleWrite(await readBody(req));
+			scheduleIndexRefresh("write");
+			return send(200, out);
+		}
+		if (route === "POST /v1/scratchpad") {
+			const out = handleScratchpad(await readBody(req));
+			scheduleIndexRefresh("scratchpad");
+			return send(200, out);
+		}
+		if (route === "POST /v1/forget") {
+			const out = handleForget(await readBody(req));
+			scheduleIndexRefresh("forget");
+			return send(200, out);
+		}
 		throw httpErr(404, "not found");
 	} catch (e) {
 		send(e.status || 500, { error: e.message });
@@ -200,3 +288,28 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, HOST, () => console.log(`pi-scale-memory brain listening on ${HOST}:${PORT}, dir=${DIR}`));
+
+/** Wire up qmd once at startup: collection, index and vectors. */
+async function initSearch() {
+	if (!(await detectQmd())) {
+		console.log("[search] qmd not found; using built-in bm25 search");
+		return;
+	}
+	if (!(await ensureCollection(DIR))) {
+		console.log("[search] could not create the qmd collection; using bm25");
+		return;
+	}
+	searchState.ready = true;
+	if (updateMode() !== "background") {
+		// "manual"/"off" means the operator owns the index; search still uses it.
+		console.log(`[search] qmd collection '${COLLECTION}' in use, automatic indexing ${updateMode()}`);
+		return;
+	}
+	// Build the index and vectors in the background so startup stays fast.
+	const result = await refreshIndex("startup");
+	let state = "pending";
+	if (result.ok) state = "ready";
+	console.log(`[search] qmd collection '${COLLECTION}' ${state} — ${result.detail}`);
+}
+
+initSearch().catch((err) => console.log(`[search] init failed: ${err.message}`));

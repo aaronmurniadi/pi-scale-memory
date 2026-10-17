@@ -3,7 +3,7 @@
  * No tailnet is involved — the brain server is exercised over loopback.
  */
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as net from "node:net";
 import * as os from "node:os";
@@ -21,6 +21,16 @@ import {
 	syncCache,
 } from "../src/cache.js";
 import { BrainClient, localTransport } from "../src/client.js";
+import {
+	clampLimit,
+	normalizeHits,
+	normalizeMode,
+	parseCollections,
+	parseQmdJson,
+	qmdArgs,
+	relativeFile,
+	stripAnsi,
+} from "../brain/qmd.mjs";
 import {
 	checksumFor,
 	compareVersions,
@@ -177,14 +187,94 @@ check("joinCommand matches the tailscale CLI", () => {
 	);
 });
 
+console.log("qmd plumbing");
+check("parseQmdJson survives progress noise and empty output", () => {
+	assert.deepEqual(parseQmdJson(""), []);
+	assert.deepEqual(parseQmdJson("No results found."), []);
+	const noisy = "\u001b[?25lEmbedding 2 queries...\n\u001b[?25h\n[\n  {\"file\": \"qmd://c/MEMORY.md\"}\n]\n";
+	assert.deepEqual(parseQmdJson(noisy), [{ file: "qmd://c/MEMORY.md" }]);
+	assert.throws(() => parseQmdJson("total nonsense"));
+});
+check("normalizeHits flattens qmd's field names", () => {
+	const hits = normalizeHits(
+		[
+			{ file: "qmd://pi-scale-memory/MEMORY.md", score: 0.6412, snippet: "  hello  ", line: 3 },
+			{ path: "qmd://pi-scale-memory/daily/2026-10-18.md", content: "note" },
+			{ file: "qmd://other/x.md", chunk: "best" },
+		],
+		"pi-scale-memory",
+	);
+	assert.equal(hits[0].file, "MEMORY.md");
+	assert.equal(hits[0].score, 0.641);
+	assert.equal(hits[0].text, "hello");
+	assert.equal(hits[0].line, 3);
+	assert.equal(hits[1].file, "daily/2026-10-18.md");
+	assert.equal(hits[1].text, "note");
+	assert.equal(hits[1].score, 0);
+	assert.equal(hits[2].file, "qmd://other/x.md", "a foreign collection stays untouched");
+});
+check("relativeFile strips only the matching collection", () => {
+	assert.equal(relativeFile("qmd://c/a/b.md", "c"), "a/b.md");
+	assert.equal(relativeFile("qmd://d/a.md", "c"), "qmd://d/a.md");
+	assert.equal(relativeFile("", "c"), "");
+});
+check("qmdArgs builds the right subcommand per mode", () => {
+	assert.deepEqual(qmdArgs("keyword", "col", "postgres", 3), ["search", "--json", "-c", "col", "-n", "3", "postgres"]);
+	assert.deepEqual(qmdArgs("semantic", "col", "q", 5), ["vsearch", "--json", "-c", "col", "-n", "5", "q"]);
+	assert.deepEqual(qmdArgs("deep", "col", "q", 5), ["query", "--json", "-c", "col", "-n", "5", "q"]);
+	assert.equal(qmdArgs("bogus", "col", "q", 5)[0], "vsearch", "an unknown mode must not become a broken invocation");
+});
+check("clampLimit and normalizeMode reject nonsense", () => {
+	assert.equal(clampLimit(undefined), 5);
+	assert.equal(clampLimit(Number.NaN), 5);
+	assert.equal(clampLimit(0), 1);
+	assert.equal(clampLimit(-4), 1);
+	assert.equal(clampLimit(1000), 20);
+	assert.equal(clampLimit(7), 7);
+	assert.equal(normalizeMode("deep"), "deep");
+	assert.equal(normalizeMode("keyword"), "keyword");
+	assert.equal(normalizeMode("garbage"), "semantic");
+	assert.equal(normalizeMode(undefined), "semantic");
+});
+check("parseCollections reads the collection list", () => {
+	const out = stripAnsi("Collections (2):\n\npi-memory (qmd://pi-memory/)\n  Pattern:  **/*.md\npsmtest (qmd://psmtest/)\n");
+	assert.deepEqual(parseCollections(out), ["pi-memory", "psmtest"]);
+	assert.deepEqual(parseCollections(""), []);
+});
+
 // ---------------------------------------------------------------------------
 // brain server over loopback (the exact path the brain role uses)
 // ---------------------------------------------------------------------------
 
-async function startBrain(dir: string, port: number) {
+/**
+ * The suite must not disturb the qmd install on this machine: every brain runs
+ * under a throwaway collection name with automatic indexing off, and the
+ * collection is removed afterwards.
+ */
+function qmdInstalled(): boolean {
+	const res = spawnSync("qmd", ["--version"], { encoding: "utf-8" });
+	return res.status === 0;
+}
+
+function removeCollection(name: string): void {
+	spawnSync("qmd", ["collection", "remove", name], { encoding: "utf-8" });
+}
+
+function testCollection(): string {
+	return `psm-test-${process.pid}-${Math.floor(Math.random() * 1e6)}`;
+}
+
+async function startBrain(dir: string, port: number, collection: string) {
 	const server = path.join(ROOT, "brain", "server.mjs");
 	const child = spawn(process.execPath, [server], {
-		env: { ...process.env, BRAIN_DIR: dir, BRAIN_PORT: String(port), BRAIN_HOST: "127.0.0.1" },
+		env: {
+			...process.env,
+			BRAIN_DIR: dir,
+			BRAIN_PORT: String(port),
+			BRAIN_HOST: "127.0.0.1",
+			QMD_COLLECTION: collection,
+			QMD_UPDATE: "off",
+		},
 		stdio: "ignore",
 	});
 	const deadline = Date.now() + 10000;
@@ -207,7 +297,8 @@ console.log("brain client over loopback");
 await checkAsync("write/read/search/scratchpad/forget round-trip", async () => {
 	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "psm-brain-"));
 	const port = await freePort();
-	const child = await startBrain(dir, port);
+	const collection = testCollection();
+	const child = await startBrain(dir, port, collection);
 	const client = new BrainClient({
 		host: "127.0.0.1",
 		port,
@@ -237,8 +328,8 @@ await checkAsync("write/read/search/scratchpad/forget round-trip", async () => {
 		assert.match(context, /fixed \[\[auth\]\]/);
 
 		const hits = await client.search("#postgres", 5);
-		assert.ok(hits.length >= 1, "search should find the long-term note");
-		assert.equal(hits[0].file, "MEMORY.md");
+		assert.ok(hits.results.length >= 1, "search should find the long-term note");
+		assert.equal(hits.results[0].file, "MEMORY.md");
 
 		const read = await client.read("long_term");
 		assert.match(read.content, /chose #postgres/);
@@ -267,6 +358,7 @@ await checkAsync("write/read/search/scratchpad/forget round-trip", async () => {
 	} finally {
 		child.kill("SIGKILL");
 		fs.rmSync(dir, { recursive: true, force: true });
+		removeCollection(collection);
 	}
 });
 
@@ -287,7 +379,8 @@ console.log("agent offline cache");
 await checkAsync("mirrors the brain, then serves reads while offline", async () => {
 	const brainDir = fs.mkdtempSync(path.join(os.tmpdir(), "psm-brainsrc-"));
 	const port = await freePort();
-	const child = await startBrain(brainDir, port);
+	const collection = testCollection();
+	const child = await startBrain(brainDir, port, collection);
 	const cache = cacheDir(fs.mkdtempSync(path.join(os.tmpdir(), "psm-cache-")));
 	const live = new BrainClient({
 		host: "127.0.0.1",
@@ -323,7 +416,8 @@ await checkAsync("mirrors the brain, then serves reads while offline", async () 
 
 		const offlineSearch = await searchWithFallback(dead, cache, "#alpha", 5);
 		assert.equal(offlineSearch.source, "cache");
-		assert.equal((offlineSearch.value[0] as { file: string }).file, "MEMORY.md");
+		assert.equal(offlineSearch.engine, "bm25");
+		assert.equal(offlineSearch.results[0].file, "MEMORY.md");
 
 		const offlineContext = await contextWithFallback(dead, cache);
 		assert.equal(offlineContext.source, "cache");
@@ -335,6 +429,7 @@ await checkAsync("mirrors the brain, then serves reads while offline", async () 
 		assert.equal(onlineRead.source, "brain");
 		const onlineSearch = await searchWithFallback(live, cache, "#alpha", 5);
 		assert.equal(onlineSearch.source, "brain");
+		assert.ok(onlineSearch.results.length >= 1);
 		assert.equal((await contextWithFallback(live, cache)).source, "brain");
 
 		// never synced and offline: the fallback must not invent an empty answer
@@ -353,6 +448,7 @@ await checkAsync("mirrors the brain, then serves reads while offline", async () 
 		child.kill("SIGKILL");
 		fs.rmSync(brainDir, { recursive: true, force: true });
 		fs.rmSync(cache, { recursive: true, force: true });
+		removeCollection(collection);
 	}
 });
 
@@ -381,6 +477,76 @@ await checkAsync("cache sync ignores paths outside the memory layout", async () 
 		fs.rmSync(cache, { recursive: true, force: true });
 	}
 });
+
+if (qmdInstalled()) {
+	await checkAsync("qmd answers semantic and keyword searches through the brain", async () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "psm-qmd-"));
+		const port = await freePort();
+		const collection = testCollection();
+		// Written before the brain starts so the collection is indexed on creation.
+		fs.writeFileSync(
+			path.join(dir, "MEMORY.md"),
+			"# Memory\n\nWe chose postgres for the billing database because of JSON support.\n",
+		);
+		const child = await startBrain(dir, port, collection);
+		const client = new BrainClient({
+			host: "127.0.0.1",
+			port,
+			token: "",
+			agentId: "test-agent",
+			transport: localTransport(),
+		});
+		try {
+			// The brain wires qmd up just after it starts listening.
+			let ready = false;
+			const deadline = Date.now() + 30000;
+			while (Date.now() < deadline) {
+				const h = await client.health();
+				if (h.search?.ready === true && h.search.collection === collection) {
+					ready = true;
+					break;
+				}
+				await new Promise((r) => setTimeout(r, 250));
+			}
+			assert.ok(ready, "the brain should report its qmd collection ready");
+
+			// Embeddings for semantic search (scoped to this test's collection).
+			const embedded = spawnSync("qmd", ["embed", "-c", collection, "--timeout", "5"], {
+				encoding: "utf-8",
+				timeout: 240000,
+			});
+			if (embedded.status !== 0) {
+				const detail = String(embedded.stderr).trim().split("\n").pop() ?? "";
+				// A missing collection is our bug; a missing model is this machine's limit.
+				if (/Collection not found/i.test(detail)) throw new Error(`embed failed: ${detail}`);
+				console.log(`  skip qmd search: embeddings unavailable (${detail})`);
+				return;
+			}
+
+			const semantic = await client.search("which database did we pick for billing", 3, "semantic");
+			assert.equal(semantic.engine, "qmd");
+			assert.equal(semantic.mode, "semantic");
+			assert.ok(semantic.results.length >= 1, "semantic search should find the note");
+			assert.equal(semantic.results[0].file, "MEMORY.md", "the qmd:// prefix must be stripped");
+			assert.match(semantic.results[0].text, /postgres/);
+
+			const keyword = await client.search("postgres", 3, "keyword");
+			assert.equal(keyword.engine, "qmd");
+			assert.ok(keyword.results.length >= 1);
+
+			// After a qmd-backed search the health endpoint must report qmd.
+			const after = await client.health();
+			assert.equal(after.search?.engine, "qmd");
+			assert.equal(after.search?.mode, "semantic");
+		} finally {
+			child.kill("SIGKILL");
+			fs.rmSync(dir, { recursive: true, force: true });
+			removeCollection(collection);
+		}
+	});
+} else {
+	console.log("  skip qmd search test: qmd is not installed");
+}
 
 console.log("extension registration");
 await checkAsync("the extension registers its commands and tools", async () => {

@@ -4,13 +4,14 @@ A pi extension that gives many pi agents one shared, remote memory (a "brain") o
 
 Each agent runs its **own userspace `tailscaled`** (`--tun=userspace-networking`): no network interface, no route changes, only a local SOCKS5 proxy that this extension uses. It joins your tailnet as `tag:agent`, finds the machine tagged `tag:brain`, and reads/writes memory there.
 
-Memory model and tools follow [pi-memory](https://github.com/jayzeng/pi-memory): `MEMORY.md`, `SCRATCHPAD.md`, `daily/YYYY-MM-DD.md`, tools `memory_write`, `memory_read`, `scratchpad`, `memory_search`, `memory_forget`, plus a memory snapshot injected into the system prompt. Differences: storage is remote and shared, and search is built-in BM25 (no qmd).
+Memory model and tools follow [pi-memory](https://github.com/jayzeng/pi-memory): `MEMORY.md`, `SCRATCHPAD.md`, `daily/YYYY-MM-DD.md`, tools `memory_write`, `memory_read`, `scratchpad`, `memory_search`, `memory_forget`, plus a memory snapshot injected into the system prompt. Differences: storage is remote and shared, and the search index lives on the brain (qmd, with built-in BM25 as a fallback) instead of on each machine.
 
 ## Requirements
 
 - Tailscale installed on every **agent** machine (`tailscale` and `tailscaled` in `PATH`).
 - A tailnet: Tailscale, or self-hosted Headscale (which `/setup-headscale` can install for you).
 - Node >= 22.
+- Optional, on the **brain**: [qmd](https://github.com/tobi/qmd) for keyword, semantic and deep search — `npm install -g @tobilu/qmd`. Without it the brain falls back to its own BM25 search. Agents never need qmd.
 
 ## Roles
 
@@ -31,7 +32,7 @@ The brain role assumes the machine is joined to the tailnet as `tag:brain` with 
 | `/join-tailnet` | agent | Asks Tailscale or self-hosted, asks for the Headscale URL when self-hosted, then asks for the tagged pre-auth key, saves both, and joins |
 | `/setup-headscale` | brain only | Installs Headscale, writes its config, starts it, creates the user, writes the ACL, mints a `tag:brain` key, and offers to join this machine |
 | `/generate-preauth` | brain only | Rewrites the ACL from the live user list and mints a reusable, ephemeral `tag:agent` key for other machines |
-| `/brain status\|sync\|reconnect\|reset` | both | Shows role, brain, health, queue and cache age; refreshes the offline mirror on demand; rejoins; or deletes the saved config |
+| `/brain status\|sync\|reindex\|reconnect\|reset` | both | Shows role, brain, health, search engine, queue and cache age; refreshes the offline mirror on demand; reports the brain's index state; rejoins; or deletes the saved config |
 
 ### Quick start
 
@@ -64,6 +65,27 @@ On every other machine:
 `/generate-preauth` re-runs step 6, so a user added later becomes an allowed agent owner as soon as a new key is generated.
 
 **Caveats.** The generated config uses the newer keys (`prefixes.v4/v6`, `policy.mode`), so Headscale older than 0.26 is rejected instead of being misconfigured. On a non-Debian host the service is a background process started by this extension; it does not survive a reboot unless you install a unit for it. Plain `http://` on a non-private address is flagged, because pre-auth keys cross the network in cleartext.
+
+## Search
+
+Search runs on the brain, so one index serves every agent. When qmd is installed there, the brain indexes the memory directory as a collection (default name `pi-scale-memory`) and answers three modes:
+
+| `memory_search` mode | qmd command | What it does | Typical latency |
+|---|---|---|---|
+| `keyword` | `qmd search` | BM25 full-text, no model | instant |
+| `semantic` (default) | `qmd vsearch` | vector similarity, finds paraphrases | ~3s warm |
+| `deep` | `qmd query` | hybrid plus LLM reranking | ~5s warm, up to ~75s on the first call while models load |
+
+Setup is automatic: on startup the brain checks for qmd, creates the collection with path contexts, and re-indexes in the background. After every write it schedules a debounced `qmd update` plus a scoped `qmd embed`, and a search that arrives while the index is catching up waits briefly (default 5s, `QMD_INDEX_WAIT_MS`) so an agent can find what it just wrote.
+
+It degrades rather than breaks. The brain always reports which engine answered (`engine` in the response, and in `/brain status`):
+
+- qmd missing, or the collection is not ready → the built-in BM25 search, with a note saying so.
+- qmd returns nothing while the index is still behind a fresh write → BM25 for that query, note `qmd index is catching up`.
+- qmd errors (for example embeddings were never built) → BM25, with the qmd error attached.
+- An agent that is offline searches its cached mirror with BM25 and labels the result as cached; there is no local semantic index.
+
+To keep qmd out of the picture entirely, set `QMD_UPDATE=off` on the brain: the collection is still used for search if it exists, but nothing is indexed automatically.
 
 ## Offline caching
 
@@ -162,12 +184,24 @@ Saved per machine at `~/.pi/agent/pi-scale-memory/config.json` (mode 0600): role
 | `PI_SCALE_MEMORY_CACHE` | set to `0` to disable the agent-side offline mirror |
 | `PI_SCALE_MEMORY_CACHE_SYNC_MS` | mirror refresh interval while connected (default 60000) |
 
+Brain-side environment (set where `brain/server.mjs` runs):
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `QMD_COLLECTION` | `pi-scale-memory` | qmd collection name |
+| `QMD_UPDATE` | `background` | `background` re-indexes after writes; `manual`/`off` leave the index to you |
+| `QMD_SEARCH_MODE` | `semantic` | mode used when a request does not name one |
+| `QMD_SEARCH_TIMEOUT_MS` | per mode (30s/120s/240s) | override the qmd query timeout |
+| `QMD_INDEX_WAIT_MS` | `5000` | how long a search waits for a pending re-index |
+| `QMD_EMBED_TIMEOUT_MS` | `600000` | cap on a `qmd embed` run |
+
 ## Behavior
 
 - The memory snapshot is fetched from the brain at session start and injected into the system prompt on every turn. When the brain is unreachable, the cached copy is injected instead.
 - Appends go out immediately; if the brain is unreachable they are queued in memory and flushed every 30s. Queued writes are lost if pi exits first.
 - An LLM summary of the new conversation is stored in the daily log every 15 turns, before compaction, and on exit.
 - Agents refresh their offline mirror on connect and every 60s thereafter.
+- Search is served by the brain's qmd index when available, otherwise by BM25 over the same files; `memory_search` reports which engine answered.
 
 ## Development
 
@@ -177,7 +211,7 @@ npm test         # unit tests + a live brain-server round-trip over loopback
 npm run build    # tsc --noEmit
 ```
 
-`test/unit.ts` covers the generated Headscale config and ACL, the CLI output parsers, the client/server round-trip, the offline cache (mirroring, fallback reads and search, deletion propagation, and path sanitizing), and command registration. The tailnet paths — `tailscaled` startup, `tailscale up`, tag discovery, and the Headscale install flow — are not covered by tests; they need a real tailnet.
+`test/unit.ts` covers the generated Headscale config and ACL, the CLI output parsers, the client/server round-trip, the offline cache (mirroring, fallback reads and search, deletion propagation, and path sanitizing), the qmd plumbing, and command registration. When qmd is installed the suite also runs a real semantic search through the brain. It uses a throwaway collection name and removes it afterwards, so it does not touch any qmd index you already have; a machine without qmd or without the embedding model skips that one test instead of failing. The tailnet paths — `tailscaled` startup, `tailscale up`, tag discovery, and the Headscale install flow — are not covered by tests; they need a real tailnet.
 
 ## Security
 

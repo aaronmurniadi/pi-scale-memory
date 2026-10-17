@@ -2,6 +2,27 @@ import * as http from "node:http";
 import { socksHttp } from "./socks.js";
 import type { UserspaceTailnet } from "./tailnet.js";
 
+export interface SearchHit {
+	file: string;
+	score: number;
+	text: string;
+	line?: number | null;
+}
+
+export interface SearchResponse {
+	engine: string;
+	mode: string;
+	results: SearchHit[];
+	note?: string;
+}
+
+export interface BrainHealth {
+	ok: boolean;
+	role: string;
+	date: string;
+	search?: { engine: string; mode: string; collection: string; ready: boolean; indexing: boolean; update: string };
+}
+
 export interface WriteRequest {
 	path: string;
 	body: Record<string, unknown>;
@@ -144,7 +165,7 @@ export class BrainClient {
 		return json;
 	}
 
-	health() {
+	health(): Promise<BrainHealth> {
 		return this.call("GET", "/v1/health");
 	}
 
@@ -164,10 +185,11 @@ export class BrainClient {
 		return this.call("GET", `/v1/read?${q}`);
 	}
 
-	async search(query: string, limit: number): Promise<any[]> {
+	async search(query: string, limit: number, mode?: string): Promise<SearchResponse> {
 		const q = new URLSearchParams({ q: query, limit: String(limit) });
+		if (mode) q.set("mode", mode);
 		const res = await this.call("GET", `/v1/search?${q}`);
-		return res.results ?? [];
+		return { engine: String(res.engine ?? "bm25"), mode: String(res.mode ?? "keyword"), results: res.results ?? [], note: res.note };
 	}
 
 	forget(body: Record<string, unknown>) {

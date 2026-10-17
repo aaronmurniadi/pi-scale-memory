@@ -168,6 +168,12 @@ export default function (pi: ExtensionAPI) {
 		return client;
 	}
 
+	function cacheLabel(res: { engine: string; source: string }): string {
+		if (res.source === "cache") return "(keyword search over the cached mirror; the brain's semantic index is not reachable)";
+		if (res.engine === "bm25") return "(keyword BM25 search — qmd is not installed on the brain)";
+		return "";
+	}
+
 	function offlineNote(takenAt: string | null): string {
 		if (takenAt) return `(brain unreachable — showing the cached copy taken ${takenAt}; it may be stale)`;
 		return "(brain unreachable — showing the cached copy; it may be stale)";
@@ -498,6 +504,22 @@ export default function (pi: ExtensionAPI) {
 				}
 				return;
 			}
+			if (sub === "reindex") {
+				if (!client) {
+					ctx.ui.notify(`${notConnected()} — the brain owns the search index.`, "warning");
+					return;
+				}
+				try {
+					const h = await client.health();
+					ctx.ui.notify(
+						`Brain search: engine=${h.search?.engine ?? "?"} mode=${h.search?.mode ?? "?"} collection=${h.search?.collection ?? "?"} indexing=${h.search?.indexing ?? "?"}`,
+						"info",
+					);
+				} catch (e) {
+					ctx.ui.notify(`Could not read brain search state: ${errMsg(e)}`, "error");
+				}
+				return;
+			}
 			if (sub === "reconnect") {
 				await disconnect();
 				await connect(ctx);
@@ -517,8 +539,14 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			let health = "ok";
+			let search = "unknown";
 			try {
-				await client.health();
+				const h = await client.health();
+				if (h.search) {
+					let suffix = "";
+					if (h.search.indexing) suffix = " (indexing)";
+					search = `${h.search.engine}/${h.search.mode}${suffix}`;
+				}
 			} catch (e) {
 				health = errMsg(e);
 			}
@@ -527,7 +555,7 @@ export default function (pi: ExtensionAPI) {
 			const meta = metaOf(cacheRoot);
 			if (meta) cacheInfo = `cache: ${meta.files} file(s) taken ${meta.takenAt}`;
 			ctx.ui.notify(
-				`Role: ${cfg.role ?? "unset"} | brain: ${client.brainName} (${where}) health=${health} queued=${client.pending} | ${cacheInfo} | node: ${tailnet.hostname || "n/a"}`,
+				`Role: ${cfg.role ?? "unset"} | brain: ${client.brainName} (${where}) health=${health} search=${search} queued=${client.pending} | ${cacheInfo} | node: ${tailnet.hostname || "n/a"}`,
 				"info",
 			);
 		},
@@ -735,20 +763,45 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "memory_search",
 		label: "Memory Search",
-		description:
-			"Search all shared memory on the brain (MEMORY.md, SCRATCHPAD.md, daily logs) using BM25 keyword ranking. Supports #tags and [[links]] as terms.",
+		description: [
+			"Search all shared memory on the brain (MEMORY.md, SCRATCHPAD.md, daily logs).",
+			"qmd powers the search when the brain has it installed:",
+			"- mode 'keyword': BM25 full-text, fastest.",
+			"- mode 'semantic' (default): vector similarity, finds paraphrases.",
+			"- mode 'deep': hybrid plus LLM reranking, best quality but slower.",
+			"Supports #tags and [[links]] as terms. If the brain is unreachable, the local",
+			"cached copy is searched with BM25 instead and the result says so.",
+		].join("\n"),
 		parameters: Type.Object({
 			query: Type.String({ description: "Search query" }),
 			limit: Type.Optional(Type.Number({ description: "Max results (default 5, max 20)" })),
+			mode: Type.Optional(
+				StringEnum(["keyword", "semantic", "deep"] as const, {
+					description: "Search mode. Default: the brain's configured mode.",
+				}),
+			),
 		}),
 		async execute(_id, params) {
-			const res = await searchWithFallback(offlineCapableClient(), cacheRoot, params.query, params.limit ?? 5);
-			const results = res.value as { file: string; score: number; text: string }[];
-			let out = "";
-			if (results.length === 0) out = "No matches.";
-			else out = results.map((r, i) => `### ${i + 1}. ${r.file} (score ${r.score})\n${r.text}`).join("\n\n");
-			if (res.source === "cache") out = `${offlineNote(res.takenAt)}\n\n${out}`;
-			return textResult(out, { source: res.source, takenAt: res.takenAt, count: results.length });
+			const res = await searchWithFallback(
+				offlineCapableClient(),
+				cacheRoot,
+				params.query,
+				params.limit ?? 5,
+				params.mode,
+			);
+			const lines: string[] = [];
+			if (res.source === "cache") lines.push(offlineNote(res.takenAt));
+			if (res.engine !== "qmd") lines.push(cacheLabel(res));
+			if (res.note) lines.push(`(brain note: ${res.note})`);
+			if (res.results.length === 0) lines.push("No matches.");
+			else lines.push(res.results.map((r, i) => `### ${i + 1}. ${r.file} (score ${r.score})\n${r.text}`).join("\n\n"));
+			return textResult(lines.join("\n\n"), {
+				source: res.source,
+				takenAt: res.takenAt,
+				engine: res.engine,
+				mode: res.mode,
+				count: res.results.length,
+			});
 		},
 	});
 
