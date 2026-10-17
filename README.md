@@ -1,6 +1,6 @@
 # pi-scale-memory
 
-A pi extension that gives many pi agents one shared, remote memory (a "brain") over a private tailnet.
+A pi extension that gives many pi agents one shared, remote memory (a "brain") over a private tailnet. Agents keep a local mirror of that memory, so they can still read and search it while the brain is unreachable.
 
 Each agent runs its **own userspace `tailscaled`** (`--tun=userspace-networking`): no network interface, no route changes, only a local SOCKS5 proxy that this extension uses. It joins your tailnet as `tag:agent`, finds the machine tagged `tag:brain`, and reads/writes memory there.
 
@@ -18,7 +18,7 @@ Memory model and tools follow [pi-memory](https://github.com/jayzeng/pi-memory):
 
 | Role | What it does | Memory path |
 |---|---|---|
-| `agent` | Starts a userspace tailscaled, joins as `tag:agent`, discovers the brain by tag | over the tailnet SOCKS5 proxy |
+| `agent` | Starts a userspace tailscaled, joins as `tag:agent`, discovers the brain by tag, and mirrors the memory locally | live over the tailnet SOCKS5 proxy, cached copy when offline |
 | `brain` | Hosts the memory and can host Headscale | local brain server on `127.0.0.1` |
 
 The brain role assumes the machine is joined to the tailnet as `tag:brain` with the **system** tailscale; its own pi process talks to a brain server on loopback, so it never needs a second tailscaled.
@@ -31,7 +31,7 @@ The brain role assumes the machine is joined to the tailnet as `tag:brain` with 
 | `/join-tailnet` | agent | Asks Tailscale or self-hosted, asks for the Headscale URL when self-hosted, then asks for the tagged pre-auth key, saves both, and joins |
 | `/setup-headscale` | brain only | Installs Headscale, writes its config, starts it, creates the user, writes the ACL, mints a `tag:brain` key, and offers to join this machine |
 | `/generate-preauth` | brain only | Rewrites the ACL from the live user list and mints a reusable, ephemeral `tag:agent` key for other machines |
-| `/brain status\|reconnect\|reset` | both | Shows role, brain, health and queued writes; rejoins; or deletes the saved config |
+| `/brain status\|sync\|reconnect\|reset` | both | Shows role, brain, health, queue and cache age; refreshes the offline mirror on demand; rejoins; or deletes the saved config |
 
 ### Quick start
 
@@ -64,6 +64,19 @@ On every other machine:
 `/generate-preauth` re-runs step 6, so a user added later becomes an allowed agent owner as soon as a new key is generated.
 
 **Caveats.** The generated config uses the newer keys (`prefixes.v4/v6`, `policy.mode`), so Headscale older than 0.26 is rejected instead of being misconfigured. On a non-Debian host the service is a background process started by this extension; it does not survive a reboot unless you install a unit for it. Plain `http://` on a non-private address is flagged, because pre-auth keys cross the network in cleartext.
+
+## Offline caching
+
+Agents mirror the brain so a dead network, a sleeping brain machine, or a laptop on a plane does not cost them their memory. The brain stays authoritative: the mirror is only consulted when a request to it fails.
+
+- **What is mirrored:** every memory file — `MEMORY.md`, `SCRATCHPAD.md`, and all of `daily/` — under `~/.pi/agent/pi-scale-memory/cache/`. Deletions propagate: if a note is forgotten on the brain, the next sync removes it locally too.
+- **When it syncs:** right after connecting, then every 60s while connected (`PI_SCALE_MEMORY_CACHE_SYNC_MS`). `/brain sync` forces one; `/brain status` shows how many files were mirrored and when.
+- **Offline reads:** `memory_read`, `memory_search`, and the session-start memory block all fall back to the mirror. Results say so, e.g. `(brain unreachable — showing the cached copy taken 2026-10-18 09:12; it may be stale)`.
+- **Offline writes:** queued in memory and sent when the brain returns; they appear in the mirror after the next successful sync. A write that is still queued when pi exits is lost.
+- **Same ranking offline:** the mirror reuses the brain's own context builder and BM25 search (`brain/memory.mjs`), so an offline answer is ranked and trimmed exactly like an online one.
+- **Disable it:** `/self-tag brain` never caches, and `PI_SCALE_MEMORY_CACHE=0` (or `"cache": false` in `config.json`) turns it off for agents.
+
+Nothing outside the memory layout is ever written into the cache: a snapshot entry that is not `MEMORY.md`, `SCRATCHPAD.md`, or `daily/YYYY-MM-DD.md` is ignored.
 
 ## Manual tailnet setup
 
@@ -146,12 +159,15 @@ Saved per machine at `~/.pi/agent/pi-scale-memory/config.json` (mode 0600): role
 | `PI_SCALE_MEMORY_TOKEN` | bearer token, must match `BRAIN_TOKEN` |
 | `PI_SCALE_MEMORY_HEADSCALE_DIR` | force a user-layout Headscale config dir |
 | `PI_SCALE_MEMORY_SUMMARY_EVERY_TURNS` | turns between automatic daily-log summaries (0 disables) |
+| `PI_SCALE_MEMORY_CACHE` | set to `0` to disable the agent-side offline mirror |
+| `PI_SCALE_MEMORY_CACHE_SYNC_MS` | mirror refresh interval while connected (default 60000) |
 
 ## Behavior
 
-- The memory snapshot is fetched from the brain at session start and injected into the system prompt on every turn.
+- The memory snapshot is fetched from the brain at session start and injected into the system prompt on every turn. When the brain is unreachable, the cached copy is injected instead.
 - Appends go out immediately; if the brain is unreachable they are queued in memory and flushed every 30s. Queued writes are lost if pi exits first.
 - An LLM summary of the new conversation is stored in the daily log every 15 turns, before compaction, and on exit.
+- Agents refresh their offline mirror on connect and every 60s thereafter.
 
 ## Development
 
@@ -161,7 +177,7 @@ npm test         # unit tests + a live brain-server round-trip over loopback
 npm run build    # tsc --noEmit
 ```
 
-`test/unit.ts` covers the generated Headscale config and ACL, the CLI output parsers, the client/server round-trip, and command registration. The tailnet paths — `tailscaled` startup, `tailscale up`, tag discovery, and the Headscale install flow — are not covered by tests; they need a real tailnet.
+`test/unit.ts` covers the generated Headscale config and ACL, the CLI output parsers, the client/server round-trip, the offline cache (mirroring, fallback reads and search, deletion propagation, and path sanitizing), and command registration. The tailnet paths — `tailscaled` startup, `tailscale up`, tag discovery, and the Headscale install flow — are not covered by tests; they need a real tailnet.
 
 ## Security
 

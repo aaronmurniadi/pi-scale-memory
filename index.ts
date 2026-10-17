@@ -27,6 +27,15 @@ import {
 	type ExtensionContext,
 	serializeConversation,
 } from "@earendil-works/pi-coding-agent";
+import {
+	cacheDir,
+	contextWithFallback,
+	hasCache,
+	metaOf,
+	readWithFallback,
+	searchWithFallback,
+	syncCache,
+} from "./src/cache.js";
 import { BrainClient, localTransport, tailnetTransport } from "./src/client.js";
 import {
 	CONFIG_DIR,
@@ -43,6 +52,8 @@ import { tailscaleInstalled, UserspaceTailnet, type BrainPeer } from "./src/tail
 import type { Ui } from "./src/ui.js";
 
 const FLUSH_INTERVAL_MS = 30_000;
+/** How often an agent refreshes its offline mirror of the brain. */
+const CACHE_SYNC_MS = Number(process.env.PI_SCALE_MEMORY_CACHE_SYNC_MS ?? 60_000);
 const PERIODIC_EVERY_TURNS = Number(process.env.PI_SCALE_MEMORY_SUMMARY_EVERY_TURNS ?? 15);
 const SUMMARY_MIN_MESSAGES = 4;
 const SUMMARY_MAX_CHARS = 60_000;
@@ -117,6 +128,8 @@ export default function (pi: ExtensionAPI) {
 	let connecting: Promise<void> | null = null;
 	let lastError = "";
 	let localBrainStarted = false;
+	let lastCacheSync = 0;
+	const cacheRoot = cacheDir();
 
 	const agentId = `${os.hostname().split(".")[0]}`;
 
@@ -127,6 +140,50 @@ export default function (pi: ExtensionAPI) {
 	function notConnected(): string {
 		if (lastError) return `Brain not connected: ${lastError}`;
 		return "Brain not connected";
+	}
+
+	/** Agents mirror the brain so reads survive an offline brain. The brain itself never needs one. */
+	function cachingEnabled(cfg: Config): boolean {
+		if (cfg.role === "brain") return false;
+		return cfg.cache !== false;
+	}
+
+	async function syncCacheNow(ctx: ExtensionContext, cfg: Config, force = false): Promise<void> {
+		if (!client) return;
+		if (!cachingEnabled(cfg)) return;
+		if (!force && Date.now() - lastCacheSync < CACHE_SYNC_MS) return;
+		lastCacheSync = Date.now();
+		try {
+			const meta = await syncCache(client, cacheRoot);
+			status(ctx, `brain: ${client.brainName} (cache: ${meta.files} files)`);
+		} catch {
+			/* the mirror is best-effort; the brain stays authoritative */
+		}
+	}
+
+	/** Client for read paths that can fall back to the mirror, or null when offline. */
+	function offlineCapableClient(): BrainClient | null {
+		const cfg = loadConfig(false);
+		if (!cachingEnabled(cfg)) return requireClient();
+		return client;
+	}
+
+	function offlineNote(takenAt: string | null): string {
+		if (takenAt) return `(brain unreachable — showing the cached copy taken ${takenAt}; it may be stale)`;
+		return "(brain unreachable — showing the cached copy; it may be stale)";
+	}
+
+	async function useCachedSnapshot(ctx: ExtensionContext, cfg: Config): Promise<void> {
+		if (!cachingEnabled(cfg)) return;
+		if (!hasCache(cacheRoot)) return;
+		const cached = await contextWithFallback(null, cacheRoot);
+		snapshot = cached.value;
+		if (ctx.hasUI) {
+			ctx.ui.notify(
+				`pi-scale-memory: brain unreachable, using cached memory taken ${cached.takenAt ?? "earlier"}. Reads work; writes are queued.`,
+				"warning",
+			);
+		}
 	}
 
 	function requireClient(): BrainClient {
@@ -239,6 +296,7 @@ export default function (pi: ExtensionAPI) {
 			client = candidate;
 			snapshot = await client.context();
 			lastError = "";
+			await syncCacheNow(ctx, cfg, true);
 			status(ctx, `brain: ${client.brainName}`);
 			if (ctx.hasUI) ctx.ui.notify(`pi-scale-memory: connected to brain ${client.brainName}`, "info");
 		} catch (err) {
@@ -255,6 +313,7 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 		await connectAgent(ctx, cfg);
+		if (!snapshot && cachingEnabled(cfg)) await useCachedSnapshot(ctx, cfg);
 	}
 
 	async function disconnect(): Promise<void> {
@@ -350,6 +409,7 @@ export default function (pi: ExtensionAPI) {
 			} catch {
 				/* retry next tick */
 			}
+			await syncCacheNow(ctx, loadConfig());
 		}, FLUSH_INTERVAL_MS);
 		flushTimer.unref();
 	});
@@ -411,13 +471,31 @@ export default function (pi: ExtensionAPI) {
 
 	// --- /brain ---
 	pi.registerCommand("brain", {
-		description: "pi-scale-memory: status | reconnect | reset",
+		description: "pi-scale-memory: status | sync | reconnect | reset",
 		handler: async (args, ctx) => {
 			const sub = (args ?? "").trim().split(/\s+/)[0] || "status";
 			if (sub === "reset") {
 				await disconnect();
 				resetConfig();
 				ctx.ui.notify(`Config removed (${CONFIG_PATH}). Use /self-tag and /join-tailnet to set up again.`, "info");
+				return;
+			}
+			if (sub === "sync") {
+				const cfg = loadConfig(false);
+				if (!cachingEnabled(cfg)) {
+					ctx.ui.notify("Caching is off (brain role, or PI_SCALE_MEMORY_CACHE=0).", "info");
+					return;
+				}
+				if (!client) {
+					ctx.ui.notify(`${notConnected()} — nothing to sync from.`, "warning");
+					return;
+				}
+				try {
+					const meta = await syncCache(client, cacheRoot);
+					ctx.ui.notify(`Cache refreshed: ${meta.files} file(s) taken ${meta.takenAt} in ${cacheRoot}`, "info");
+				} catch (e) {
+					ctx.ui.notify(`Cache sync failed: ${errMsg(e)}`, "error");
+				}
 				return;
 			}
 			if (sub === "reconnect") {
@@ -427,6 +505,14 @@ export default function (pi: ExtensionAPI) {
 			}
 			const cfg = loadConfig(false);
 			if (!client) {
+				const meta = metaOf(cacheRoot);
+				if (meta) {
+					ctx.ui.notify(
+						`${notConnected()} (role: ${cfg.role ?? "unset"}) — offline, reading from the cache taken ${meta.takenAt}`,
+						"warning",
+					);
+					return;
+				}
 				ctx.ui.notify(`${notConnected()} (role: ${cfg.role ?? "unset"})`, "warning");
 				return;
 			}
@@ -437,8 +523,11 @@ export default function (pi: ExtensionAPI) {
 				health = errMsg(e);
 			}
 			const where = client.brainIp ?? "?";
+			let cacheInfo = "cache: none";
+			const meta = metaOf(cacheRoot);
+			if (meta) cacheInfo = `cache: ${meta.files} file(s) taken ${meta.takenAt}`;
 			ctx.ui.notify(
-				`Role: ${cfg.role ?? "unset"} | brain: ${client.brainName} (${where}) health=${health} queued=${client.pending} | node: ${tailnet.hostname || "n/a"}`,
+				`Role: ${cfg.role ?? "unset"} | brain: ${client.brainName} (${where}) health=${health} queued=${client.pending} | ${cacheInfo} | node: ${tailnet.hostname || "n/a"}`,
 				"info",
 			);
 		},
@@ -573,7 +662,12 @@ export default function (pi: ExtensionAPI) {
 				return textResult("Overwrote MEMORY.md on the brain.");
 			}
 			const res = await c.writeOrQueue({ path: "/v1/write", body });
-			if (res.queued) return textResult("Brain unreachable; write queued and will be sent automatically.", { queued: true });
+			if (res.queued) {
+				return textResult(
+					"Brain unreachable; write queued and will be sent automatically. It appears in the local cache after the next successful sync.",
+					{ queued: true },
+				);
+			}
 			return textResult(`Wrote to ${res.result?.file ?? params.target} on the brain.`);
 		},
 	});
@@ -593,14 +687,21 @@ export default function (pi: ExtensionAPI) {
 			date: Type.Optional(Type.String({ description: "YYYY-MM-DD for daily" })),
 		}),
 		async execute(_id, params) {
-			const res = await requireClient().read(params.target, params.date);
+			const res = await readWithFallback(offlineCapableClient(), cacheRoot, params.target, params.date);
+			let text = "";
 			if (params.target === "list") {
-				const files: string[] = res.files ?? [];
-				if (files.length === 0) return textResult("No daily logs.");
-				return textResult(files.join("\n"));
+				const raw = res.value.files;
+				let files: string[] = [];
+				if (Array.isArray(raw)) files = raw.map(String);
+				if (files.length === 0) text = "No daily logs.";
+				else text = files.join("\n");
+			} else if (!String(res.value.content ?? "").trim()) {
+				text = "(empty)";
+			} else {
+				text = String(res.value.content);
 			}
-			if (!res.content?.trim()) return textResult("(empty)");
-			return textResult(res.content);
+			if (res.source === "cache") text = `${offlineNote(res.takenAt)}\n\n${text}`;
+			return textResult(text, { source: res.source, takenAt: res.takenAt });
 		},
 	});
 
@@ -621,7 +722,7 @@ export default function (pi: ExtensionAPI) {
 			let items: { done: boolean; text: string }[];
 			if (params.action === "add") {
 				const res = await c.writeOrQueue({ path: "/v1/scratchpad", body });
-				if (res.queued) return textResult("Brain unreachable; item queued.", { queued: true });
+				if (res.queued) return textResult("Brain unreachable; item queued for the next sync.", { queued: true });
 				items = res.result?.items ?? [];
 			} else {
 				items = (await c.writeNow({ path: "/v1/scratchpad", body })).items ?? [];
@@ -641,10 +742,13 @@ export default function (pi: ExtensionAPI) {
 			limit: Type.Optional(Type.Number({ description: "Max results (default 5, max 20)" })),
 		}),
 		async execute(_id, params) {
-			const results = await requireClient().search(params.query, params.limit ?? 5);
-			if (results.length === 0) return textResult("No matches.");
-			const out = results.map((r, i) => `### ${i + 1}. ${r.file} (score ${r.score})\n${r.text}`);
-			return textResult(out.join("\n\n"), { count: results.length });
+			const res = await searchWithFallback(offlineCapableClient(), cacheRoot, params.query, params.limit ?? 5);
+			const results = res.value as { file: string; score: number; text: string }[];
+			let out = "";
+			if (results.length === 0) out = "No matches.";
+			else out = results.map((r, i) => `### ${i + 1}. ${r.file} (score ${r.score})\n${r.text}`).join("\n\n");
+			if (res.source === "cache") out = `${offlineNote(res.takenAt)}\n\n${out}`;
+			return textResult(out, { source: res.source, takenAt: res.takenAt, count: results.length });
 		},
 	});
 

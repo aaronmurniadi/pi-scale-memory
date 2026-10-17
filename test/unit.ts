@@ -10,6 +10,16 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { parse as parseYaml } from "yaml";
+import {
+	cacheDir,
+	contextWithFallback,
+	hasCache,
+	metaOf,
+	readFromCache,
+	readWithFallback,
+	searchWithFallback,
+	syncCache,
+} from "../src/cache.js";
 import { BrainClient, localTransport } from "../src/client.js";
 import {
 	checksumFor,
@@ -243,6 +253,11 @@ await checkAsync("write/read/search/scratchpad/forget round-trip", async () => {
 		const cleared = await client.writeNow({ path: "/v1/scratchpad", body: { action: "clear_done" } });
 		assert.equal(cleared.items.length, 0);
 
+		const snap = await client.snapshot();
+		assert.ok(snap.takenAt.length > 0);
+		assert.match(snap.files["MEMORY.md"], /chose #postgres/);
+		assert.equal(Object.keys(snap.files).filter((f) => f.startsWith("daily/")).length, 1);
+
 		const forgot = await client.forget({ match: "postgres" });
 		assert.equal(forgot.removed, 1);
 		assert.ok(fs.existsSync(path.join(dir, "recovery", `${forgot.recoveryId}.json`)));
@@ -266,6 +281,105 @@ await checkAsync("a write to a dead brain is queued, not lost", async () => {
 	const res = await client.writeOrQueue({ path: "/v1/write", body: { target: "daily", content: "queued note" } });
 	assert.equal(res.queued, true);
 	assert.equal(client.pending, 1);
+});
+
+console.log("agent offline cache");
+await checkAsync("mirrors the brain, then serves reads while offline", async () => {
+	const brainDir = fs.mkdtempSync(path.join(os.tmpdir(), "psm-brainsrc-"));
+	const port = await freePort();
+	const child = await startBrain(brainDir, port);
+	const cache = cacheDir(fs.mkdtempSync(path.join(os.tmpdir(), "psm-cache-")));
+	const live = new BrainClient({
+		host: "127.0.0.1",
+		port,
+		token: "",
+		agentId: "test-agent",
+		transport: localTransport(),
+	});
+	const dead = new BrainClient({
+		host: "127.0.0.1",
+		port: 1,
+		token: "",
+		agentId: "test-agent",
+		transport: localTransport(),
+	});
+	try {
+		await live.writeNow({ path: "/v1/write", body: { target: "long_term", content: "cache me #alpha", agent: "a" } });
+		await live.writeNow({ path: "/v1/write", body: { target: "daily", content: "today note #beta", agent: "a" } });
+		await live.writeNow({ path: "/v1/scratchpad", body: { action: "add", text: "cache todo" } });
+
+		assert.equal(hasCache(cache), false);
+		const meta = await syncCache(live, cache);
+		assert.equal(meta.files, 3, "MEMORY.md, SCRATCHPAD.md and one daily log");
+		assert.ok(meta.takenAt.length > 0);
+		assert.equal(metaOf(cache)?.files, 3);
+		assert.equal(hasCache(cache), true);
+		assert.ok(fs.existsSync(path.join(cache, "daily")));
+
+		// offline: reads and search come from the mirror
+		const offlineRead = await readWithFallback(dead, cache, "long_term");
+		assert.equal(offlineRead.source, "cache");
+		assert.match(String((offlineRead.value as { content: string }).content), /cache me #alpha/);
+
+		const offlineSearch = await searchWithFallback(dead, cache, "#alpha", 5);
+		assert.equal(offlineSearch.source, "cache");
+		assert.equal((offlineSearch.value[0] as { file: string }).file, "MEMORY.md");
+
+		const offlineContext = await contextWithFallback(dead, cache);
+		assert.equal(offlineContext.source, "cache");
+		assert.match(offlineContext.value, /cache me #alpha/);
+		assert.match(offlineContext.value, /cache todo/);
+
+		// a live brain still wins over the mirror
+		const onlineRead = await readWithFallback(live, cache, "long_term");
+		assert.equal(onlineRead.source, "brain");
+		const onlineSearch = await searchWithFallback(live, cache, "#alpha", 5);
+		assert.equal(onlineSearch.source, "brain");
+		assert.equal((await contextWithFallback(live, cache)).source, "brain");
+
+		// never synced and offline: the fallback must not invent an empty answer
+		const empty = cacheDir(fs.mkdtempSync(path.join(os.tmpdir(), "psm-cache-empty-")));
+		await assert.rejects(() => readWithFallback(dead, empty, "long_term"));
+
+		// deletions on the brain propagate
+		await live.forget({ match: "cache me" });
+		await syncCache(live, cache);
+		assert.equal(await readFromCache(cache, "long_term").content, "");
+
+		// a cache dir with no meta.json counts as "no cache"
+		fs.rmSync(path.join(cache, "meta.json"), { force: true });
+		assert.equal(hasCache(cache), false);
+	} finally {
+		child.kill("SIGKILL");
+		fs.rmSync(brainDir, { recursive: true, force: true });
+		fs.rmSync(cache, { recursive: true, force: true });
+	}
+});
+
+await checkAsync("cache sync ignores paths outside the memory layout", async () => {
+	const cache = cacheDir(fs.mkdtempSync(path.join(os.tmpdir(), "psm-cache-evil-")));
+	const fake = {
+		brainName: "fake-brain",
+		snapshot: async () => ({
+			takenAt: "2026-10-18 09:00:00",
+			files: {
+				"MEMORY.md": "legit\n",
+				"../../escape.md": "nope\n",
+				"daily/2026-10-18.md": "ok\n",
+				"daily/not-a-date.md": "nope\n",
+			},
+		}),
+	} as unknown as BrainClient;
+	try {
+		const meta = await syncCache(fake, cache);
+		assert.equal(meta.files, 2);
+		assert.ok(fs.existsSync(path.join(cache, "MEMORY.md")));
+		assert.ok(fs.existsSync(path.join(cache, "daily", "2026-10-18.md")));
+		assert.ok(!fs.existsSync(path.join(cache, "not-a-date.md")));
+		assert.ok(!fs.existsSync(path.join(path.dirname(cache), "escape.md")));
+	} finally {
+		fs.rmSync(cache, { recursive: true, force: true });
+	}
 });
 
 console.log("extension registration");

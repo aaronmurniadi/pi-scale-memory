@@ -153,6 +153,11 @@ export class BrainClient {
 		return res.context ?? "";
 	}
 
+	/** Full memory tree, for the agent-side offline mirror. */
+	snapshot(): Promise<{ takenAt: string; files: Record<string, string> }> {
+		return this.call("GET", "/v1/snapshot");
+	}
+
 	async read(target: string, date?: string): Promise<any> {
 		const q = new URLSearchParams({ target });
 		if (date) q.set("date", date);

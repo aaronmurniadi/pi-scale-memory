@@ -26,6 +26,8 @@ export interface Config {
 	brainPort: number;
 	/** Optional bearer token, must match BRAIN_TOKEN on the brain server. */
 	brainToken?: string;
+	/** Mirror brain memory locally so reads work offline (agents only). Default true. */
+	cache?: boolean;
 	headscale?: HeadscaleConfig;
 }
 
@@ -45,6 +47,7 @@ export function loadConfig(applyEnv = true): Config {
 	if (env.PI_SCALE_MEMORY_AUTHKEY) cfg.authKey = env.PI_SCALE_MEMORY_AUTHKEY;
 	if (env.PI_SCALE_MEMORY_PORT) cfg.brainPort = Number(env.PI_SCALE_MEMORY_PORT);
 	if (env.PI_SCALE_MEMORY_TOKEN) cfg.brainToken = env.PI_SCALE_MEMORY_TOKEN;
+	if (env.PI_SCALE_MEMORY_CACHE === "0" || env.PI_SCALE_MEMORY_CACHE === "false") cfg.cache = false;
 	return cfg;
 }
 
