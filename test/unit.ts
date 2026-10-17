@@ -37,7 +37,14 @@ import {
 	relativeFile,
 	stripAnsi,
 } from "../brain/qmd.mjs";
-import { missingTagWarning, parseSystemStatus } from "../src/tailnet.js";
+import {
+	displayFlags,
+	mergeUpArgs,
+	missingTagWarning,
+	parseSuggestedUpArgs,
+	parseSystemStatus,
+	requiresExplicitFlags,
+} from "../src/tailnet.js";
 import { findPackageSource, inspectInstall } from "../src/update.js";
 import { parseDurationSeconds } from "../index.js";
 
@@ -136,6 +143,43 @@ check("parseSystemStatus and missingTagWarning agree on the tag", () => {
 	const other = parseSystemStatus(JSON.stringify({ BackendState: "Running", Self: { Tags: ["tag:agent"] } }));
 	assert.match(String(missingTagWarning(other, "tag:brain")), /reports tags: tag:agent/);
 	assert.match(String(missingTagWarning(null, "tag:brain")), /Could not read tailscale status/);
+});
+
+console.log("joining with existing settings");
+const NON_DEFAULT_ERROR = [
+	"Error: changing settings via 'tailscale up' requires mentioning all",
+	"non-default flags. To proceed, either re-run your command with --reset or",
+	"use the command below to explicitly mention the current value of all",
+	"non-default settings:",
+	"",
+	"\ttailscale up --accept-routes --ssh --hostname=brain",
+	"",
+].join("\n");
+
+check("the non-default settings error is recognised and its suggestion parsed", () => {
+	assert.equal(requiresExplicitFlags(NON_DEFAULT_ERROR), true);
+	assert.equal(requiresExplicitFlags("Error: something else"), false);
+	assert.deepEqual(parseSuggestedUpArgs(NON_DEFAULT_ERROR), ["--accept-routes", "--ssh", "--hostname=brain"]);
+	assert.equal(parseSuggestedUpArgs("tailscale up\n"), null);
+	assert.equal(parseSuggestedUpArgs("no suggestion here"), null);
+});
+check("the retry keeps the device's settings and adds ours", () => {
+	const merged = mergeUpArgs(["--accept-routes", "--ssh", "--advertise-tags=tag:dws"], "tskey-auth-x", ["tag:brain"]);
+	assert.equal(merged[0], "up");
+	assert.ok(merged.includes("--auth-key=tskey-auth-x"));
+	assert.ok(merged.includes("--accept-routes"), "an existing setting must not be dropped");
+	assert.ok(merged.includes("--ssh"));
+	const tags = merged.filter((a) => a.startsWith("--advertise-tags="));
+	assert.equal(tags.length, 1, "tags must be merged into one flag");
+	assert.equal(tags[0], "--advertise-tags=tag:dws,tag:brain");
+});
+check("an echoed auth key is replaced, not duplicated, and never displayed", () => {
+	const merged = mergeUpArgs(["up", "--auth-key=old", "--advertise-tags=tag:brain"], "new-key", ["tag:brain"]);
+	const keys = merged.filter((a) => a.startsWith("--auth-key="));
+	assert.deepEqual(keys, ["--auth-key=new-key"]);
+	assert.equal(merged.filter((a) => a === "up").length, 1);
+	assert.deepEqual(displayFlags(["--auth-key=secret", "--ssh", "-x", "--accept-routes"]), ["--ssh", "--accept-routes"]);
+	assert.ok(!displayFlags(["--auth-key=secret"]).join(" ").includes("secret"));
 });
 
 console.log("tailscale api keys");

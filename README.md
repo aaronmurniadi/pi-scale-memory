@@ -80,6 +80,34 @@ In the tailnet policy file (admin console → Access controls):
 }
 ```
 
+## Troubleshooting
+
+**`tailscale up` refuses with "requires mentioning all non-default flags".**
+Tailscale prints this when the device already has settings that the new command
+would silently revert. `/join-tailnet-brain` handles it: it parses the suggested
+command out of the error, re-runs it with your key and tag added and every
+existing setting kept, and tells you which settings it preserved. If the
+suggestion is unusable it asks before doing anything drastic:
+
+```
+Retry with --reset? That clears this device's other Tailscale settings
+(exit node, routes, SSH, hostname) and rejoins with tag:brain only.
+```
+
+To do it by hand, either name your current settings yourself (see
+`tailscale debug prefs`) or accept the reset:
+
+```bash
+tailscale up --auth-key=<key> --advertise-tags=tag:brain --reset
+```
+
+**An agent joined but found no brain.** The brain must be online with
+`tag:brain`; run `/join-tailnet-brain` there and `/brain reconnect` on the agent.
+Check the ACL lets `tag:agent` reach `tag:brain:8787`.
+
+**`memory_search` says the engine is bm25.** qmd is not installed on the brain,
+or its index is still catching up. See [Search](#search).
+
 ## Search
 
 Search runs on the brain, so one index serves every agent. With qmd installed there, the brain indexes the memory directory as a collection (default `pi-scale-memory`) and answers three modes:

@@ -58,6 +58,7 @@ import {
 	BRAIN_TAG,
 	failureText,
 	joinSystem,
+	requiresExplicitFlags,
 	missingTagWarning,
 	systemStatus,
 	tailscaleInstalled,
@@ -648,10 +649,27 @@ export default function (pi: ExtensionAPI) {
 			}
 			const key = await askPreauthKey(ctx, BRAIN_TAG);
 			if (!key) return;
-			const joined = await joinSystem(key, [BRAIN_TAG]);
+			let joined = await joinSystem(key, [BRAIN_TAG]);
+			if (!joined.ok && requiresExplicitFlags(joined.stderr)) {
+				// joinSystem already retried with the device's own settings named
+				// explicitly, so reaching here means that suggestion was not usable.
+				const reset = await ctx.ui.confirm(
+					"Tailscale refuses to change these settings",
+					[
+						failureText(joined),
+						"",
+						`Retry with --reset? That clears this device's other Tailscale settings (exit node, routes, SSH, hostname) and rejoins with ${BRAIN_TAG} only.`,
+					].join("\n"),
+				);
+				if (!reset) return;
+				joined = await joinSystem(key, [BRAIN_TAG], { reset: true });
+			}
 			if (!joined.ok) {
 				ctx.ui.notify(`tailscale up failed:\n${failureText(joined)}`, "error");
 				return;
+			}
+			if (joined.preservedFlags && joined.preservedFlags.length > 0) {
+				ctx.ui.notify(`Kept this device's existing Tailscale settings: ${joined.preservedFlags.join(" ")}`, "info");
 			}
 			status = await waitFor(async () => {
 				const current = await systemStatus();

@@ -151,21 +151,124 @@ function attempt(args: string[]): Promise<RunResult> {
 	});
 }
 
+export interface JoinResult extends RunResult {
+	/** Non-default settings carried over from this device's existing prefs. */
+	preservedFlags?: string[];
+	usedReset?: boolean;
+}
+
+/**
+ * Tailscale refuses to change a setting while the device already has non-default
+ * ones, and prints the command to use instead:
+ *
+ *   changing settings via 'tailscale up' requires mentioning all non-default
+ *   flags ... use the command below to explicitly mention the current value of
+ *   all non-default settings:
+ *       tailscale up --accept-routes --ssh
+ */
+export function requiresExplicitFlags(stderr: string): boolean {
+	return /non-default|explicitly mention/i.test(stderr);
+}
+
+/** Pull the suggested `tailscale up ...` argument list out of that error. */
+export function parseSuggestedUpArgs(stderr: string): string[] | null {
+	for (const line of stderr.split(/\r?\n/)) {
+		const text = line.trim();
+		if (!text.startsWith("tailscale up")) continue;
+		const args = text.split(/\s+/).slice(2);
+		if (args.length === 0) return null;
+		return args;
+	}
+	return null;
+}
+
+function tagValues(args: string[]): string[] {
+	const tags: string[] = [];
+	for (const arg of args) {
+		if (!arg.startsWith("--advertise-tags=")) continue;
+		for (const tag of arg.slice("--advertise-tags=".length).split(",")) {
+			if (tag.trim()) tags.push(tag.trim());
+		}
+	}
+	return tags;
+}
+
+/** Flags safe to show the user: never the pre-auth key. */
+export function displayFlags(args: string[]): string[] {
+	const out: string[] = [];
+	for (const arg of args) {
+		if (arg.startsWith("--auth-key=")) continue;
+		if (arg.startsWith("--authkey=")) continue;
+		if (!arg.startsWith("--")) continue;
+		out.push(arg);
+	}
+	return out;
+}
+
+/**
+ * Rebuild the suggested command with our key and tag, keeping every other
+ * non-default setting the device already had (routes, SSH, exit node, hostname).
+ */
+export function mergeUpArgs(suggested: string[], authKey: string, tags: string[]): string[] {
+	const merged: string[] = ["up"];
+	const kept: string[] = [];
+	for (const arg of suggested) {
+		if (arg === "up") continue;
+		if (arg.startsWith("--auth-key=") || arg.startsWith("--authkey=")) continue;
+		if (arg.startsWith("--advertise-tags=")) continue;
+		if (arg === "--reset") continue;
+		kept.push(arg);
+	}
+
+	const allTags: string[] = [];
+	for (const tag of [...tagValues(suggested), ...tags]) {
+		if (!allTags.includes(tag)) allTags.push(tag);
+	}
+
+	merged.push(`--auth-key=${authKey}`);
+	if (allTags.length > 0) merged.push(`--advertise-tags=${allTags.join(",")}`);
+	merged.push(...kept);
+	return merged;
+}
+
 /**
  * Join the system tailscale.
  *
- * A pre-auth key that already carries its tags does not need `--advertise-tags`,
- * and asking for a tag the key cannot grant is an error, so that case is retried
- * without the flag rather than failing the join.
+ * Three failure modes are handled rather than surfaced raw:
+ *   - a device that already has non-default settings: retried with those
+ *     settings named explicitly, so nothing the user configured is lost;
+ *   - a pre-auth key that already carries its tag and cannot grant it: retried
+ *     without `--advertise-tags`;
+ *   - a missing tag on the key: reported, since succeeding without the tag would
+ *     leave agents unable to find this brain.
  */
-export async function joinSystem(authKey: string, tags: string[] = []): Promise<RunResult> {
+export async function joinSystem(
+	authKey: string,
+	tags: string[] = [],
+	opts: { reset?: boolean } = {},
+): Promise<JoinResult> {
 	const base = ["up", `--auth-key=${authKey}`];
 	const withTags = [...base];
 	for (const tag of tags) withTags.push(`--advertise-tags=${tag}`);
+	if (opts.reset) withTags.push("--reset");
 
 	let result = await attempt(withTags);
-	if (!result.ok && tags.length > 0 && /tag|owns|permission/i.test(result.stderr)) {
-		result = await attempt(base);
+	if (result.ok) return result;
+
+	if (requiresExplicitFlags(result.stderr)) {
+		const suggested = parseSuggestedUpArgs(result.stderr);
+		if (suggested) {
+			const merged = mergeUpArgs(suggested, authKey, tags);
+			const retried = await attempt(merged);
+			if (retried.ok) {
+				return { ...retried, preservedFlags: displayFlags(suggested) };
+			}
+			return retried;
+		}
+	}
+
+	if (tags.length > 0 && /tag|owns|permission/i.test(result.stderr)) {
+		return attempt(base);
 	}
 	return result;
 }
