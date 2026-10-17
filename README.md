@@ -18,6 +18,46 @@ Memory model and tools follow [pi-memory](https://github.com/jayzeng/pi-memory):
 - Create a **reusable** pre-auth key tagged `tag:agent` for agents (ephemeral recommended; agent nodes are ephemeral in-memory nodes, one per pi process).
 - Join the brain machine with tag `tag:brain` (`tailscale up --advertise-tags=tag:brain`, or a pre-auth key tagged `tag:brain`).
 
+### Sample Headscale ACL
+
+Headscale policy file (HuJSON), e.g. `/etc/headscale/acl.hujson` referenced by `policy.path` in the Headscale config. Replace `aaron@` with your Headscale user (recent versions use the `name@` form):
+
+```jsonc
+{
+  // Who may apply the tags (pre-auth keys and --advertise-tags)
+  "tagOwners": {
+    "tag:agent": ["aaron@"],
+    "tag:brain": ["aaron@"]
+  },
+
+  "acls": [
+    // Agents may only reach the brain's memory API, nothing else.
+    {
+      "action": "accept",
+      "src": ["tag:agent"],
+      "dst": ["tag:brain:8787"]
+    }
+    // Agents cannot reach each other or other nodes. Replies to the
+    // connections above are allowed automatically (stateful).
+  ]
+}
+```
+
+Create the keys and reload the policy:
+
+```bash
+# reusable + ephemeral key for agents
+headscale preauthkeys create --user <user-id> --reusable --ephemeral --expiration 90d --tags tag:agent
+
+# key for the brain machine (one-off, not ephemeral)
+headscale preauthkeys create --user <user-id> --expiration 1h --tags tag:brain
+tailscale up --login-server https://headscale.example.com --auth-key <brain key>
+
+headscale policy reload   # or restart headscale, depending on version
+```
+
+Give agents the first key when the extension asks for it.
+
 ## 2. Run the brain (on the `tag:brain` machine)
 
 ```bash
