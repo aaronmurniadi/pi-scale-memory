@@ -100,11 +100,19 @@ In the tailnet policy file (admin console → Access controls):
 
 ## Troubleshooting
 
-**"requested tag [tag:brain] are invalid or not permitted".** A tag only exists
-once it is declared in `tagOwners`, and the key's identity must be allowed to
-apply it. Declare it (see the setup above) and make sure the key was created with
-the tag selected. The extension prints these two steps with your tag filled in
-whenever Tailscale rejects one.
+**"requested tag [tag:brain] are invalid or not permitted".** The tag must be
+declared in `tagOwners`, *and* the identity behind your key must be allowed to
+apply it — a tag being in use somewhere in the tailnet does not mean your key can
+use it. Either declare it and add yourself as an owner (see the setup above), or
+create the key with the tag selected so the key carries it. The extension prints
+both steps, with your tag filled in, whenever Tailscale rejects one.
+
+**More than one device is tagged `tag:brain`.** Agents pick any online device
+with that tag, so the memory must be served by the machine you intend. The
+extension warns when it sees another `tag:brain` device at join time, and when an
+agent finds more than one. A shortcut to a single brain: give the machine that
+runs the memory server the tag, and remove it from machines that only happen to
+have it.
 
 **"requires mentioning all non-default flags".** Your join was talking to the
 *host's* Tailscale daemon, not the extension's own node — that is what happens

@@ -34,7 +34,15 @@ import {
 	stripAnsi,
 } from "../brain/qmd.mjs";
 import { ensureBrainNode, nodeStatus, stopBrainNode } from "../src/tailnet-node.js";
-import { brainNodeHostname, parseNodeStatus, serveArgs, tagPermissionHelp, tagRejected, upArgs } from "../src/tailnet-node.js";
+import {
+	brainNodeHostname,
+	parseNodeStatus,
+	parseTaggedPeers,
+	serveArgs,
+	tagPermissionHelp,
+	tagRejected,
+	upArgs,
+} from "../src/tailnet-node.js";
 import { findPackageSource, inspectInstall } from "../src/update.js";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -144,6 +152,21 @@ check("parseNodeStatus reads the fields the brain needs", () => {
 	assert.equal(status.ip, "100.101.102.103", "the IPv4 address is the one agents use");
 	assert.equal(parseNodeStatus("not json"), null);
 	assert.equal(parseNodeStatus("{}")?.backendState, "Unknown");
+});
+check("other tag:brain devices are detected", () => {
+	const raw = JSON.stringify({
+		Self: { HostName: "pi-brain-mac", Tags: ["tag:brain"] },
+		Peer: {
+			a: { HostName: "old-brain", Tags: ["tag:brain"], Online: true },
+			b: { HostName: "some-agent", Tags: ["tag:agent"], Online: true },
+			c: { HostName: "zz-brain", Tags: ["tag:brain"], Online: false },
+			d: { HostName: "no-tags", Online: true },
+		},
+	});
+	assert.deepEqual(parseTaggedPeers(raw, "tag:brain"), ["old-brain", "zz-brain"]);
+	assert.deepEqual(parseTaggedPeers(raw, "tag:agent"), ["some-agent"]);
+	assert.deepEqual(parseTaggedPeers("not json", "tag:brain"), []);
+	assert.deepEqual(parseTaggedPeers("{}", "tag:brain"), []);
 });
 check("up keeps the node's own settings and never accepts routes or DNS", () => {
 	const args = upArgs("tskey-auth-x", "pi-brain-mac");

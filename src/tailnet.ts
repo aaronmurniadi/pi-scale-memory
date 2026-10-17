@@ -172,14 +172,15 @@ export class UserspaceTailnet {
 		}
 	}
 
-	async findBrain(): Promise<BrainPeer | null> {
+	/** Every online peer carrying tag:brain, best candidate first. */
+	async brains(): Promise<BrainPeer[]> {
 		const st = await run("tailscale", [`--socket=${this.socket}`, "status", "--json"], { timeoutMs: 15000 });
-		if (!st.ok) return null;
+		if (!st.ok) return [];
 		let json: any;
 		try {
 			json = JSON.parse(st.stdout);
 		} catch {
-			return null;
+			return [];
 		}
 		const peers: BrainPeer[] = [];
 		for (const peer of Object.values<any>(json.Peer ?? {})) {
@@ -197,6 +198,11 @@ export class UserspaceTailnet {
 			peers.push({ name: String(peer.HostName ?? peer.DNSName ?? ip), ip, online: peer.Online === true });
 		}
 		peers.sort((a, b) => Number(b.online) - Number(a.online));
+		return peers;
+	}
+
+	async findBrain(): Promise<BrainPeer | null> {
+		const peers = await this.brains();
 		return peers[0] ?? null;
 	}
 

@@ -77,6 +77,23 @@ export function parseNodeStatus(raw: string): BrainNodeStatus | null {
 	};
 }
 
+/** Other devices already carrying the tag, from a `status --json` payload. */
+export function parseTaggedPeers(raw: string, tag: string): string[] {
+	let json: any;
+	try {
+		json = JSON.parse(raw);
+	} catch {
+		return [];
+	}
+	const names: string[] = [];
+	for (const peer of Object.values<any>(json?.Peer ?? {})) {
+		const tags: string[] = Array.isArray(peer?.Tags) ? peer.Tags.map(String) : [];
+		if (!tags.includes(tag)) continue;
+		names.push(String(peer?.HostName ?? peer?.DNSName ?? "unknown"));
+	}
+	return names.sort();
+}
+
 export function upArgs(authKey: string, hostname: string): string[] {
 	return [
 		"up",
@@ -136,10 +153,25 @@ function nodeCli(args: string[], timeoutMs = 60000): Promise<RunResult> {
 	return run("tailscale", [`--socket=${brainNodePaths().socket}`, ...args], { timeoutMs });
 }
 
-export async function nodeStatus(): Promise<BrainNodeStatus | null> {
+async function nodeStatusRaw(): Promise<string> {
 	const res = await nodeCli(["status", "--json"], 20000);
-	if (!res.stdout.trim()) return null;
-	return parseNodeStatus(res.stdout);
+	return res.stdout;
+}
+
+export async function nodeStatus(): Promise<BrainNodeStatus | null> {
+	const raw = await nodeStatusRaw();
+	if (!raw.trim()) return null;
+	return parseNodeStatus(raw);
+}
+
+/** Devices already tagged tag:brain, other than this node. */
+export async function otherBrainDevices(): Promise<string[]> {
+	const raw = await nodeStatusRaw();
+	if (!raw.trim()) return [];
+	const others = parseTaggedPeers(raw, BRAIN_TAG);
+	const self = parseNodeStatus(raw);
+	if (!self || !self.hostname) return others;
+	return others.filter((name) => name !== self.hostname);
 }
 
 function spawnNode(): number | null {
@@ -169,6 +201,8 @@ export interface EnsureNodeResult {
 	status?: BrainNodeStatus;
 	joined: boolean;
 	served: boolean;
+	/** Other devices already tagged tag:brain, which agents could pick instead of this one. */
+	otherBrains?: string[];
 }
 
 /**
@@ -253,7 +287,14 @@ export async function ensureBrainNode(opts: {
 		};
 	}
 
-	return { ok: true, detail: `${status.hostname || "brain"} at ${status.ip || status.dnsName}`, status, joined, served: true };
+	return {
+		ok: true,
+		detail: `${status.hostname || "brain"} at ${status.ip || status.dnsName}`,
+		status,
+		joined,
+		served: true,
+		otherBrains: await otherBrainDevices(),
+	};
 }
 
 export async function stopBrainNode(): Promise<{ stopped: boolean; detail: string }> {

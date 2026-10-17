@@ -289,6 +289,13 @@ export default function (pi: ExtensionAPI) {
 			});
 			status(ctx, "brain: searching…");
 			if (!(await candidate.discover())) throw new Error("no online machine tagged tag:brain");
+			const found = await tailnet.brains();
+			if (found.length > 1) {
+				ctx.ui.notify(
+					`${found.length} devices are tagged ${BRAIN_TAG} (${found.map((b) => b.name).join(", ")}); using ${found[0].name}. Agents should only see one.`,
+					"warning",
+				);
+			}
 			await candidate.health();
 			client = candidate;
 			snapshot = await client.context();
