@@ -89,6 +89,44 @@ export function upArgs(authKey: string, hostname: string): string[] {
 	];
 }
 
+/**
+ * Tailscale's answer when a tag may not be applied by whoever authenticated:
+ * "backend error: requested tag [tag:brain] are invalid or not permitted".
+ * It means the tag is not an exact match for the key's own tags, and the key's
+ * owner is not a tag owner for it either.
+ */
+export function tagRejected(stderr: string): boolean {
+	return /requested tag|invalid or not permitted/i.test(stderr);
+}
+
+/**
+ * A tag has to be declared in the tailnet policy before anything can use it, and
+ * the key's identity has to be allowed to apply it. Both ways out are spelled out
+ * because which one is easier depends on whether you already have the tag.
+ */
+export function tagPermissionHelp(tag: string): string {
+	return [
+		`Tailscale refused ${tag} for this pre-auth key.`,
+		"",
+		"A tag only exists once it is declared, and only some identities may apply it.",
+		"",
+		"1. Declare it in the tailnet policy file (admin console -> Access controls):",
+		"",
+		'     "tagOwners": {',
+		`       "${tag}": ["autogroup:member"]`,
+		"     }",
+		"",
+		"   Narrow autogroup:member to a user or group if you like. Owners, Admins and",
+		"   Network admins may apply any declared tag.",
+		"",
+		`2. Then confirm the key itself carries ${tag}. A key created in the admin console`,
+		`   with ${tag} selected tags the device by itself, which Tailscale allows without`,
+		"   consulting tagOwners at all.",
+		"",
+		"Re-run /join-tailnet-brain afterwards.",
+	].join("\n");
+}
+
 /** Publish 127.0.0.1:<port> to the tailnet on the same port. */
 export function serveArgs(port: number): string[] {
 	return ["serve", "--bg", `--tcp=${port}`, `tcp://127.0.0.1:${port}`];
@@ -180,13 +218,9 @@ export async function ensureBrainNode(opts: {
 			up = await nodeCli([...upArgs(opts.authKey, hostname), "--reset"], 120000);
 		}
 		if (!up.ok) {
-			return {
-				ok: false,
-				detail: `tailscale up failed: ${up.stderr.trim().split("\n").slice(-3).join(" ")}`,
-				status: status ?? undefined,
-				joined: false,
-				served: false,
-			};
+			let detail = `tailscale up failed: ${up.stderr.trim().split("\n").slice(-3).join(" ")}`;
+			if (tagRejected(up.stderr)) detail = tagPermissionHelp(BRAIN_TAG);
+			return { ok: false, detail, status: status ?? undefined, joined: false, served: false };
 		}
 		joined = true;
 		status = await waitFor(async () => {

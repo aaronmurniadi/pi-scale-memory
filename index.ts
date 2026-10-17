@@ -13,7 +13,6 @@
  *   /self-tag               — set this pi agent's role (brain or agent)
  *   /join-tailnet-brain     — join this machine as the tag:brain device
  *   /join-tailnet-agent     — join this machine as a tag:agent device
- *   /generate-preauth       — brain only: mint a tag:agent key via the Tailscale API
  *   /brain                  — status | sync | reindex | reconnect | reset
  *   /update-pi-scale-memory — update the extension itself, then reload
  */
@@ -50,7 +49,6 @@ import {
 	saveConfig,
 	updateConfig,
 } from "./src/config.js";
-import { createAuthKey } from "./src/apikeys.js";
 import { brainLogPath, ensureBrainServer, stopBrainServer } from "./src/brain-server.js";
 import { inspectInstall, runUpdate } from "./src/update.js";
 import { AGENT_TAG, BRAIN_TAG, tailscaleInstalled, UserspaceTailnet, type BrainPeer } from "./src/tailnet.js";
@@ -71,22 +69,6 @@ const EXT_DIR = path.dirname(fileURLToPath(import.meta.url));
 function errMsg(e: unknown): string {
 	if (e instanceof Error) return e.message;
 	return String(e);
-}
-
-/** "90d" / "24h" / "30m" / "45s" -> seconds. Bare numbers are seconds. */
-export function parseDurationSeconds(text: string): number | null {
-	const match = text.trim().match(/^(\d+)\s*([smhdw])?$/i);
-	if (!match) return null;
-	const value = Number(match[1]);
-	if (!Number.isFinite(value) || value <= 0) return null;
-	let unit = "s";
-	if (match[2]) unit = match[2].toLowerCase();
-	let factor = 1;
-	if (unit === "m") factor = 60;
-	else if (unit === "h") factor = 3600;
-	else if (unit === "d") factor = 86400;
-	else if (unit === "w") factor = 604800;
-	return value * factor;
 }
 
 function mark(done: boolean): string {
@@ -600,7 +582,7 @@ export default function (pi: ExtensionAPI) {
 			await connect(ctx);
 			if (role === "brain") {
 				ctx.ui.notify(
-					"This pi agent is the brain: memory is served locally. Next: /generate-preauth for agent keys, and make sure the ACL lets tag:agent reach tag:brain:8787.",
+					"This pi agent is the brain: memory is served locally. Next: /join-tailnet-brain, then create a tag:agent key in the Tailscale admin console for the agents.",
 					"info",
 				);
 				return;
@@ -619,7 +601,10 @@ export default function (pi: ExtensionAPI) {
 			if (!source) return null;
 			if (source.startsWith("Use the stored")) return stored;
 		}
-		const entered = await ctx.ui.input(`Tailscale pre-auth key tagged ${tag}`, "tskey-auth-...");
+		const entered = await ctx.ui.input(
+			`Pre-auth key for ${tag} (create it in the Tailscale admin console with that tag selected)`,
+			"tskey-auth-...",
+		);
 		if (!entered?.trim()) return null;
 		return entered.trim();
 	}
@@ -691,7 +676,7 @@ export default function (pi: ExtensionAPI) {
 				`This machine is the brain, reachable on the tailnet as ${node.detail}.`,
 				`The memory API is published to the tailnet on port ${cfg.brainPort} (proxied to 127.0.0.1).`,
 				"",
-				"Next: /generate-preauth for keys the agents can join with,",
+				`Next: create a ${AGENT_TAG} pre-auth key in the Tailscale admin console for the agents,`,
 				`and make sure the ACL lets ${AGENT_TAG} reach ${BRAIN_TAG}:${cfg.brainPort}.`,
 			].join("\n"),
 			"info",
@@ -711,82 +696,6 @@ export default function (pi: ExtensionAPI) {
 		description: "Join the tailnet as the tag:brain device that hosts the memory",
 		handler: async (_args, ctx) => {
 			await joinAsBrain(ctx);
-		},
-	});
-
-	// --- /generate-preauth (brain only) ---
-	pi.registerCommand("generate-preauth", {
-		description: "Brain only: mint a tag:agent auth key through the Tailscale API",
-		handler: async (_args, ctx) => {
-			const cfg = loadConfig(false);
-			if (cfg.role !== "brain") {
-				ctx.ui.notify("Only a brain mints agent keys. Run /self-tag brain first.", "error");
-				return;
-			}
-			if (!ctx.hasUI) {
-				ctx.ui.notify("Interactive setup requires the terminal UI.", "error");
-				return;
-			}
-
-			let apiToken = cfg.tailscaleApiToken ?? "";
-			if (!apiToken) {
-				const entered = await ctx.ui.input("Tailscale API access token (scope auth_keys)", "tskey-api-...");
-				if (!entered?.trim()) {
-					ctx.ui.notify(
-						
-"Create one at https://login.tailscale.com/admin/settings/keys (auth_keys scope), or create the agent key by hand in the admin console.",
-
-						"warning",
-					);
-					return;
-				}
-				apiToken = entered.trim();
-			}
-
-			const expiry = await ctx.ui.input("Key expiry (e.g. 90d, 24h, 1h)", "90d");
-			if (!expiry?.trim()) return;
-			const seconds = parseDurationSeconds(expiry.trim());
-			if (seconds === null) {
-				ctx.ui.notify(`Could not read "${expiry.trim()}" as a duration. Try 30d, 24h or 1h.`, "error");
-				return;
-			}
-
-			const scope = await ctx.ui.select("Key scope", [
-				"Reusable + ephemeral (recommended: one key for many agents)",
-				"Single-use (one machine, then expired)",
-			]);
-			if (!scope) return;
-			let reusable = true;
-			let ephemeral = true;
-			if (scope.startsWith("Single-use")) {
-				reusable = false;
-				ephemeral = false;
-			}
-
-			try {
-				const created = await createAuthKey({
-					apiToken,
-					tags: [AGENT_TAG],
-					reusable,
-					ephemeral,
-					preauthorized: true,
-					expirySeconds: seconds,
-				});
-				updateConfig({ tailscaleApiToken: apiToken });
-				ctx.ui.notify(
-					[
-						`Tailscale auth key for agents (${AGENT_TAG}):`,
-						"",
-						created.key,
-						"",
-						`Expires ${created.expires}. reusable=${created.reusable}, ephemeral=${created.ephemeral}.`,
-						"On each agent: /join-tailnet-agent → join the tailnet, then paste this key.",
-					].join("\n"),
-					"info",
-				);
-			} catch (err) {
-				ctx.ui.notify(`Could not create the key: ${errMsg(err)}`, "error");
-			}
 		},
 	});
 

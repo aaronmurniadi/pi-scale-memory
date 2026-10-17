@@ -16,8 +16,6 @@ export interface Config {
 	brainToken?: string;
 	/** Mirror brain memory locally so reads work offline (agents only). Default true. */
 	cache?: boolean;
-	/** Tailscale API access token (tskey-api-...) used by /generate-preauth. */
-	tailscaleApiToken?: string;
 }
 
 const DIR = path.join(os.homedir(), ".pi", "agent", "pi-scale-memory");
@@ -36,7 +34,6 @@ export function loadConfig(applyEnv = true): Config {
 	if (env.PI_SCALE_MEMORY_AUTHKEY) cfg.authKey = env.PI_SCALE_MEMORY_AUTHKEY;
 	if (env.PI_SCALE_MEMORY_PORT) cfg.brainPort = Number(env.PI_SCALE_MEMORY_PORT);
 	if (env.PI_SCALE_MEMORY_TOKEN) cfg.brainToken = env.PI_SCALE_MEMORY_TOKEN;
-	if (env.PI_SCALE_MEMORY_TAILSCALE_API_TOKEN) cfg.tailscaleApiToken = env.PI_SCALE_MEMORY_TAILSCALE_API_TOKEN;
 	if (env.PI_SCALE_MEMORY_CACHE === "0" || env.PI_SCALE_MEMORY_CACHE === "false") cfg.cache = false;
 	return cfg;
 }

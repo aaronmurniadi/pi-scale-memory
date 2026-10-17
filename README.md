@@ -11,7 +11,7 @@ Memory model and tools follow [pi-memory](https://github.com/jayzeng/pi-memory):
 ## Requirements
 
 - **Tailscale** on every machine (`tailscale` and `tailscaled` on `PATH`). No root access is needed.
-- Tagged pre-auth keys: one for the brain (`tag:brain`), reusable ones for agents (`tag:agent`).
+- Tagged pre-auth keys, created in the Tailscale admin console: one for the brain (`tag:brain`), reusable ones for agents (`tag:agent`). Select the tag when creating the key so the key itself carries it.
 - Node >= 22.
 - Optional, on the **brain**: [qmd](https://github.com/tobi/qmd) (`npm install -g @tobilu/qmd`) for semantic and deep search. Agents never need qmd.
 
@@ -32,18 +32,30 @@ Nothing is published to the internet: the memory API is reachable only from the 
 |---|---|---|
 | `/join-tailnet-brain` | brain | Starts this machine's own userspace Tailscale node, joins it with a `tag:brain` pre-auth key, publishes the memory port to the tailnet, and sets the role to `brain` |
 | `/join-tailnet-agent` | agent | Joins with a `tag:agent` pre-auth key on a private userspace tailscaled, then finds the brain by tag |
-| `/generate-preauth` | brain only | Mints a `tag:agent` auth key through the Tailscale API (needs an API token with the `auth_keys` scope) |
 | `/self-tag [brain\|agent]` | both | Sets the role on its own, without joining |
 | `/brain status\|sync\|reindex\|reconnect\|reset` | both | Shows role, brain, health, search engine, queue and cache age; refreshes the offline mirror; reports the brain's index; rejoins; deletes the saved config |
 | `/update-pi-scale-memory` | both | Updates the extension (git pull, or `pi update`) and reloads it |
 
 ### Quick start
 
-On the machine that will hold the memory:
+First, in the Tailscale admin console (Access controls), declare the tags and let
+agents reach the brain:
+
+```jsonc
+"tagOwners": {
+  "tag:agent": ["autogroup:member"],
+  "tag:brain": ["autogroup:member"]
+},
+"acls": [
+  { "action": "accept", "src": ["tag:agent"], "dst": ["tag:brain:8787"] }
+]
+```
+
+Then create the pre-auth keys on the same console (Settings -> Keys, with the tag
+selected). On the machine that will hold the memory:
 
 ```
-/join-tailnet-brain  # paste a tag:brain pre-auth key
-/generate-preauth    # prints a tag:agent key for the other machines
+/join-tailnet-brain  # paste the tag:brain key
 ```
 
 On every other machine:
@@ -87,6 +99,12 @@ In the tailnet policy file (admin console → Access controls):
 ```
 
 ## Troubleshooting
+
+**"requested tag [tag:brain] are invalid or not permitted".** A tag only exists
+once it is declared in `tagOwners`, and the key's identity must be allowed to
+apply it. Declare it (see the setup above) and make sure the key was created with
+the tag selected. The extension prints these two steps with your tag filled in
+whenever Tailscale rejects one.
 
 **"requires mentioning all non-default flags".** Your join was talking to the
 *host's* Tailscale daemon, not the extension's own node — that is what happens
@@ -180,7 +198,6 @@ Saved per machine at `~/.pi/agent/pi-scale-memory/config.json` (mode 0600): role
 | `PI_SCALE_MEMORY_CONFIG_DIR` | where config, cache, brain log and pid file live |
 | `PI_SCALE_MEMORY_CACHE` | `0` disables the agent-side offline mirror |
 | `PI_SCALE_MEMORY_CACHE_SYNC_MS` | mirror refresh interval while connected (default 60000) |
-| `PI_SCALE_MEMORY_TAILSCALE_API_TOKEN` | Tailscale API token used by `/generate-preauth` |
 | `PI_SCALE_MEMORY_SUMMARY_EVERY_TURNS` | turns between automatic daily-log summaries (0 disables) |
 
 Brain-side environment (where `brain/server.mjs` runs):
@@ -227,7 +244,7 @@ npm test         # unit tests + live brain-server and cache round-trips over loo
 npm run build    # tsc --noEmit
 ```
 
-`test/unit.ts` covers the Tailscale status and tag helpers, the Tailscale API key request shape, duration parsing, self-update detection, the qmd plumbing, the brain server lifecycle (including token enforcement and conflict detection), the offline cache, and command registration. When qmd is installed it also runs a real semantic search through the brain using a throwaway collection that it removes afterwards, so it does not disturb any qmd index you already have.
+`test/unit.ts` covers the brain node's naming, status and serve helpers, the tag-rejection guidance, self-update detection, the qmd plumbing, the brain server lifecycle (including token enforcement and conflict detection), the offline cache, and command registration. When qmd is installed it also runs a real semantic search through the brain using a throwaway collection that it removes afterwards, so it does not disturb any qmd index you already have.
 
 The suite also starts a real userspace `tailscaled` and asserts it is a separate, unjoined node while the host's own daemon keeps its state, node id and peers. What is **not** covered: an actual successful join, tag assignment, tag discovery, serve proxying, and the Tailscale API calls — those need a live tailnet and a pre-auth key.
 

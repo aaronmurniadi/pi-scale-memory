@@ -10,11 +10,6 @@ import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import {
-	authKeyBody,
-	authKeyPath,
-	parseCreatedKey,
-} from "../src/apikeys.js";
 import { ensureBrainServer, stopBrainServer } from "../src/brain-server.js";
 import {
 	cacheDir,
@@ -39,9 +34,8 @@ import {
 	stripAnsi,
 } from "../brain/qmd.mjs";
 import { ensureBrainNode, nodeStatus, stopBrainNode } from "../src/tailnet-node.js";
-import { brainNodeHostname, parseNodeStatus, serveArgs, upArgs } from "../src/tailnet-node.js";
+import { brainNodeHostname, parseNodeStatus, serveArgs, tagPermissionHelp, tagRejected, upArgs } from "../src/tailnet-node.js";
 import { findPackageSource, inspectInstall } from "../src/update.js";
-import { parseDurationSeconds } from "../index.js";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.join(HERE, "..");
@@ -160,59 +154,22 @@ check("up keeps the node's own settings and never accepts routes or DNS", () => 
 	assert.ok(args.includes("--accept-routes=false"));
 	assert.equal(args[0], "up");
 });
+check("a rejected tag is recognised and explained", () => {
+	// The exact message a key without the tag produces.
+	assert.equal(tagRejected("backend error: requested tag [tag:brain] are invalid or not permitted"), true);
+	assert.equal(tagRejected("requested tags [tag:a tag:b] are invalid or not permitted"), true);
+	assert.equal(tagRejected("Failed to connect to local tailscaled"), false);
+
+	const help = tagPermissionHelp("tag:brain");
+	assert.match(help, /refused tag:brain/);
+	assert.match(help, /tagOwners/, "declaring the tag is the primary fix");
+	assert.match(help, /admin console/, "it should say where to do it");
+	assert.match(help, /"tagOwners"/);
+	assert.match(help, /"tag:brain": \["autogroup:member"\]/);
+	assert.match(help, /Access controls/);
+});
 check("serve publishes the memory port to the tailnet over loopback", () => {
 	assert.deepEqual(serveArgs(8787), ["serve", "--bg", "--tcp=8787", "tcp://127.0.0.1:8787"]);
-});
-
-console.log("tailscale api keys");
-check("authKeyBody matches the documented request shape", () => {
-	const body = authKeyBody({
-		apiToken: "tskey-api-x",
-		tags: ["tag:agent"],
-		reusable: true,
-		ephemeral: true,
-		preauthorized: true,
-		expirySeconds: 7776000,
-	}) as any;
-	assert.deepEqual(body.capabilities.devices.create, {
-		reusable: true,
-		ephemeral: true,
-		preauthorized: true,
-		tags: ["tag:agent"],
-	});
-	assert.equal(body.expirySeconds, 7776000);
-});
-check("authKeyPath addresses the token's own tailnet by default", () => {
-	assert.equal(authKeyPath("-"), "/api/v2/tailnet/-/keys");
-	assert.equal(authKeyPath("example.com"), "/api/v2/tailnet/example.com/keys");
-	assert.equal(authKeyPath("a b"), "/api/v2/tailnet/a%20b/keys");
-});
-check("parseCreatedKey reads the created key", () => {
-	const parsed = parseCreatedKey(
-		JSON.stringify({
-			id: "k1",
-			key: "tskey-auth-abc",
-			expires: "2026-01-01T00:00:00Z",
-			capabilities: { devices: { create: { reusable: true, ephemeral: false, tags: ["tag:agent"] } } },
-		}),
-	);
-	assert.equal(parsed.key, "tskey-auth-abc");
-	assert.equal(parsed.reusable, true);
-	assert.equal(parsed.ephemeral, false);
-	assert.deepEqual(parsed.tags, ["tag:agent"]);
-});
-
-console.log("durations");
-check("parseDurationSeconds understands the units used by the API", () => {
-	assert.equal(parseDurationSeconds("90d"), 7776000);
-	assert.equal(parseDurationSeconds("24h"), 86400);
-	assert.equal(parseDurationSeconds("30m"), 1800);
-	assert.equal(parseDurationSeconds("45s"), 45);
-	assert.equal(parseDurationSeconds("2w"), 1209600);
-	assert.equal(parseDurationSeconds("300"), 300);
-	assert.equal(parseDurationSeconds("soon"), null);
-	assert.equal(parseDurationSeconds("0d"), null);
-	assert.equal(parseDurationSeconds("-5h"), null);
 });
 
 console.log("self-update");
@@ -629,7 +586,6 @@ await checkAsync("the extension registers its commands and tools", async () => {
 	mod.default(stub as never);
 	assert.deepEqual(commands.sort(), [
 		"brain",
-		"generate-preauth",
 		"join-tailnet-agent",
 		"join-tailnet-brain",
 		"self-tag",
