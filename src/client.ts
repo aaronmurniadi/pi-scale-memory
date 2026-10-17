@@ -1,67 +1,137 @@
+import * as http from "node:http";
 import { socksHttp } from "./socks.js";
 import type { UserspaceTailnet } from "./tailnet.js";
 
 export interface WriteRequest {
-	path: "/v1/write" | "/v1/scratchpad";
+	path: string;
 	body: Record<string, unknown>;
 }
 
-/** HTTP client for the brain server, routed through the userspace tailnet SOCKS5 proxy. */
+export interface TransportRequest {
+	method: "GET" | "POST";
+	path: string;
+	headers: Record<string, string>;
+	body?: string;
+}
+
+/** Moves one HTTP request to the brain, either over loopback or through the tailnet SOCKS5 proxy. */
+export interface BrainTransport {
+	(host: string, port: number, req: TransportRequest): Promise<{ status: number; body: string }>;
+}
+
+export function localTransport(): BrainTransport {
+	return (host, port, req) =>
+		new Promise((resolve, reject) => {
+			const request = http.request(
+				{ host, port, method: req.method, path: req.path, headers: req.headers, timeout: 15000 },
+				(res) => {
+					const chunks: Buffer[] = [];
+					res.on("data", (c) => chunks.push(c));
+					res.on("end", () => resolve({ status: res.statusCode ?? 0, body: Buffer.concat(chunks).toString("utf-8") }));
+				},
+			);
+			request.on("timeout", () => request.destroy(new Error("request timed out")));
+			request.on("error", reject);
+			if (req.body !== undefined) request.write(req.body);
+			request.end();
+		});
+}
+
+export function tailnetTransport(tailnet: UserspaceTailnet): BrainTransport {
+	return (host, port, req) =>
+		socksHttp({
+			proxyPort: tailnet.socksPort,
+			host,
+			port,
+			method: req.method,
+			path: req.path,
+			headers: req.headers,
+			body: req.body,
+		});
+}
+
+export interface BrainClientOptions {
+	/** Fixed host (local brain) or empty when the host is discovered through resolveHost. */
+	host: string;
+	port: number;
+	token: string;
+	agentId: string;
+	transport: BrainTransport;
+	/** Tailnet mode: look the brain up by tag. Omit for a fixed host. */
+	resolveHost?: () => Promise<string | null>;
+}
+
 export class BrainClient {
-	brainIp: string | null = null;
-	brainName = "";
-	private outbox: WriteRequest[] = [];
+	private host: string;
+	private name = "";
 
-	constructor(
-		private tailnet: UserspaceTailnet,
-		private port: number,
-		private token: string,
-		readonly agentId: string,
-	) {}
+	constructor(private opts: BrainClientOptions) {
+		this.host = opts.host;
+	}
 
-	get pending(): number {
-		return this.outbox.length;
+	get agentId(): string {
+		return this.opts.agentId;
+	}
+
+	get brainIp(): string | null {
+		if (!this.host) return null;
+		return this.host;
+	}
+
+	get brainName(): string {
+		if (this.name) return this.name;
+		if (this.host) return this.host;
+		return "unknown";
 	}
 
 	get connected(): boolean {
-		return this.brainIp !== null;
+		if (!this.opts.resolveHost) return true;
+		return this.host.length > 0;
 	}
 
-	/** Look the brain up by tag, retrying while the tailnet netmap syncs. */
+	/** Tailnet mode: resolve (or re-resolve) the brain by tag. */
 	async discover(waitMs = 30000): Promise<boolean> {
+		if (!this.opts.resolveHost) return true;
 		const deadline = Date.now() + waitMs;
-		do {
-			const peer = await this.tailnet.findBrain();
-			if (peer?.online) {
-				this.brainIp = peer.ip;
-				this.brainName = peer.name;
+		for (;;) {
+			const host = await this.opts.resolveHost();
+			if (host) {
+				this.host = host;
 				return true;
 			}
+			if (Date.now() >= deadline) break;
 			await new Promise((r) => setTimeout(r, 2000));
-		} while (Date.now() < deadline);
-		this.brainIp = null;
+		}
+		this.host = "";
 		return false;
 	}
 
+	setName(name: string): void {
+		this.name = name;
+	}
+
+	private async hostFor(): Promise<string> {
+		if (this.host) return this.host;
+		if (!this.opts.resolveHost) throw new Error("brain host is not set");
+		const host = await this.opts.resolveHost();
+		if (!host) throw new Error("brain not found on tailnet (tag:brain)");
+		this.host = host;
+		return host;
+	}
+
 	private async call(method: "GET" | "POST", path: string, body?: unknown): Promise<any> {
-		if (!this.brainIp && !(await this.discover(6000))) throw new Error("brain not found on tailnet (tag:brain)");
+		const host = await this.hostFor();
 		const headers: Record<string, string> = { "content-type": "application/json" };
-		if (this.token) headers.authorization = `Bearer ${this.token}`;
+		if (this.opts.token) headers.authorization = `Bearer ${this.opts.token}`;
 		let payload: string | undefined;
 		if (body !== undefined) payload = JSON.stringify(body);
+
 		let res: { status: number; body: string };
 		try {
-			res = await socksHttp({
-				proxyPort: this.tailnet.socksPort,
-				host: this.brainIp as string,
-				port: this.port,
-				method,
-				path,
-				headers,
-				body: payload,
-			});
+			res = await this.opts.transport(host, this.opts.port, { method, path, headers, body: payload });
 		} catch (err) {
-			this.brainIp = null; // force re-discovery next time
+			// Tailnet mode: force re-discovery so a moved brain recovers on the next call.
+			if (this.opts.resolveHost) this.host = "";
 			throw err;
 		}
 		let json: any = {};
@@ -79,7 +149,8 @@ export class BrainClient {
 	}
 
 	async context(): Promise<string> {
-		return (await this.call("GET", "/v1/context")).context ?? "";
+		const res = await this.call("GET", "/v1/context");
+		return res.context ?? "";
 	}
 
 	async read(target: string, date?: string): Promise<any> {
@@ -90,14 +161,15 @@ export class BrainClient {
 
 	async search(query: string, limit: number): Promise<any[]> {
 		const q = new URLSearchParams({ q: query, limit: String(limit) });
-		return (await this.call("GET", `/v1/search?${q}`)).results ?? [];
+		const res = await this.call("GET", `/v1/search?${q}`);
+		return res.results ?? [];
 	}
 
 	forget(body: Record<string, unknown>) {
 		return this.call("POST", "/v1/forget", body);
 	}
 
-	/** Append-style write: sent now, or queued for the periodic flush if the brain is unreachable. */
+	/** Append-style write: sent now, or queued for the periodic flush when the brain is unreachable. */
 	async writeOrQueue(req: WriteRequest): Promise<{ queued: boolean; result?: any }> {
 		try {
 			return { queued: false, result: await this.call("POST", req.path, req.body) };
@@ -111,6 +183,10 @@ export class BrainClient {
 	/** Send a write that must not be silently queued (overwrite, list). */
 	writeNow(req: WriteRequest) {
 		return this.call("POST", req.path, req.body);
+	}
+
+	get pending(): number {
+		return this.outbox.length;
 	}
 
 	async flush(): Promise<number> {
@@ -127,4 +203,6 @@ export class BrainClient {
 		}
 		return sent;
 	}
+
+	private outbox: WriteRequest[] = [];
 }

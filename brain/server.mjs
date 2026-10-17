@@ -30,7 +30,12 @@ const pad2 = (n) => String(n).padStart(2, "0");
 const dateStr = (d) => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
 const today = () => dateStr(new Date());
 const yesterday = () => dateStr(new Date(Date.now() - 86400000));
-const stamp = () => new Date().toISOString().replace("T", " ").slice(0, 19);
+const stamp = () => {
+	const d = new Date();
+	const date = dateStr(d);
+	const time = `${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
+	return `${date} ${time}`;
+};
 const isDate = (s) => /^\d{4}-\d{2}-\d{2}$/.test(s || "");
 const dailyPath = (date) => path.join(DAILY_DIR, `${date}.md`);
 

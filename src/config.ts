@@ -2,14 +2,31 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
+export type Role = "brain" | "agent";
+
+/** Headscale details recorded by /setup-headscale. Brain role only. */
+export interface HeadscaleConfig {
+	configPath: string;
+	policyPath: string;
+	policyMode: "file" | "database";
+	serverUrl: string;
+	/** Headscale user that owns the agent pre-auth keys. */
+	user: string;
+	layout: "system" | "user";
+	installed: boolean;
+}
+
 export interface Config {
+	/** What this pi agent is: the memory host (brain) or a client (agent). */
+	role?: Role;
 	/** Empty/undefined = the Tailscale control plane. Otherwise a Headscale (or other) URL. */
 	loginServer?: string;
-	/** Tagged (tag:agent), reusable pre-auth key. */
+	/** Tagged (tag:agent) pre-auth key. */
 	authKey?: string;
 	brainPort: number;
 	/** Optional bearer token, must match BRAIN_TOKEN on the brain server. */
 	brainToken?: string;
+	headscale?: HeadscaleConfig;
 }
 
 const DIR = path.join(os.homedir(), ".pi", "agent", "pi-scale-memory");
@@ -36,8 +53,15 @@ export function saveConfig(cfg: Config): void {
 	fs.writeFileSync(FILE, JSON.stringify(cfg, null, 2), { mode: 0o600 });
 }
 
+export function updateConfig(patch: Partial<Config>): Config {
+	const cfg = { ...loadConfig(false), ...patch };
+	saveConfig(cfg);
+	return cfg;
+}
+
 export function resetConfig(): void {
 	fs.rmSync(FILE, { force: true });
 }
 
 export const CONFIG_PATH = FILE;
+export const CONFIG_DIR = DIR;
