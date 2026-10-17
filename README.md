@@ -4,14 +4,16 @@ A pi extension that gives many pi agents one shared memory (a "brain") over a pr
 
 **Every node here is a private userspace `tailscaled`.** Nothing in this extension ever calls the machine's own Tailscale: no `sudo`, no TUN device, no route or DNS changes, and no reading or writing of the host's Tailscale state. On a machine already signed in to another tailnet (a work one, say), pi joins its own separate node and leaves the host alone.
 
-The brain runs a detached userspace node tagged `tag:brain` and publishes its memory API to the tailnet with `tailscale serve --tcp`, which proxies tailnet traffic to `127.0.0.1`. Agents run a userspace node for the session tagged `tag:agent`, and reach the brain through its SOCKS5 proxy. Agents also keep a local mirror of the memory, so they can still read while the brain is unreachable.
+The brain runs a detached userspace node and publishes its memory API to the tailnet with `tailscale serve --tcp`, which proxies tailnet traffic to `127.0.0.1`. Agents run a userspace node for the session and reach the brain through its SOCKS5 proxy. Agents also keep a local mirror of the memory, so they can still read while the brain is unreachable.
+
+**Agents find the brain by asking, not by tag.** Each agent reads the peer list it already has from its own netmap and asks every peer on the memory port whether it is the brain. A peer answers by identifying itself in its `/v1/health` response (`service: pi-scale-memory`, `role: brain`), so no tag policy, no `tagOwners`, and no port scanning of anything outside your tailnet are involved. Tags remain useful as a *hint* only: a peer carrying `tag:brain` is probed first.
 
 Memory model and tools follow [pi-memory](https://github.com/jayzeng/pi-memory): `MEMORY.md`, `SCRATCHPAD.md`, `daily/YYYY-MM-DD.md`, tools `memory_write`, `memory_read`, `scratchpad`, `memory_search`, `memory_forget`, plus a memory snapshot injected into the system prompt. Differences: storage is remote and shared, the search index lives on the brain (qmd, with BM25 fallback), and agents cache the memory for offline use.
 
 ## Requirements
 
 - **Tailscale** on every machine (`tailscale` and `tailscaled` on `PATH`). No root access is needed.
-- Tagged pre-auth keys, created in the Tailscale admin console: one for the brain (`tag:brain`), reusable ones for agents (`tag:agent`). Select the tag when creating the key so the key itself carries it.
+- Pre-auth keys, created in the Tailscale admin console: one for the brain, reusable ones for agents. Tags are optional — see [Making it reachable](#making-it-reachable) if you want to use them.
 - Node >= 22.
 - Optional, on the **brain**: [qmd](https://github.com/tobi/qmd) (`npm install -g @tobilu/qmd`) for semantic and deep search. Agents never need qmd.
 
@@ -23,48 +25,36 @@ Nothing is published to the internet: the memory API is reachable only from the 
 
 | Role | What it does | Memory path |
 |---|---|---|
-| `brain` | Runs the memory server plus a detached userspace node tagged `tag:brain`, and publishes the API with `tailscale serve` | local server on `127.0.0.1`, proxied to the tailnet |
-| `agent` | Runs a session userspace node tagged `tag:agent` and discovers the brain by tag | the tailnet, plus a local mirror for offline reads |
+| `brain` | Runs the memory server plus a detached userspace node, and publishes the API with `tailscale serve` | local server on `127.0.0.1`, proxied to the tailnet |
+| `agent` | Runs a session userspace node, then asks its peers which one is the brain | the tailnet, plus a local mirror for offline reads |
 
 ## Commands
 
 | Command | Applies to | What it does |
 |---|---|---|
-| `/join-tailnet-brain` | brain | Starts this machine's own userspace Tailscale node, joins it with a `tag:brain` pre-auth key, publishes the memory port to the tailnet, and sets the role to `brain` |
-| `/join-tailnet-agent` | agent | Joins with a `tag:agent` pre-auth key on a private userspace tailscaled, then finds the brain by tag |
+| `/join-tailnet-brain` | brain | Starts this machine's own userspace Tailscale node, joins it with a pre-auth key, publishes the memory port to the tailnet, and sets the role to `brain` |
+| `/join-tailnet-agent` | agent | Joins with a pre-auth key on a private userspace tailscaled, then asks the tailnet which peer is the brain |
 | `/self-tag [brain\|agent]` | both | Sets the role on its own, without joining |
 | `/brain status\|sync\|reindex\|reconnect\|reset` | both | Shows role, brain, health, search engine, queue and cache age; refreshes the offline mirror; reports the brain's index; rejoins; deletes the saved config |
 | `/update-pi-scale-memory` | both | Updates the extension (git pull, or `pi update`) and reloads it |
 
 ### Quick start
 
-First, in the Tailscale admin console (Access controls), declare the tags and let
-agents reach the brain:
-
-```jsonc
-"tagOwners": {
-  "tag:agent": ["autogroup:member"],
-  "tag:brain": ["autogroup:member"]
-},
-"acls": [
-  { "action": "accept", "src": ["tag:agent"], "dst": ["tag:brain:8787"] }
-]
-```
-
-Then create the pre-auth keys on the same console (Settings -> Keys, with the tag
-selected). On the machine that will hold the memory:
+Create a pre-auth key in the Tailscale admin console (Settings -> Keys) for the
+brain, and one for the agents (reusable). Then, on the machine that will hold the
+memory:
 
 ```
-/join-tailnet-brain  # paste the tag:brain key
+/join-tailnet-brain  # paste the brain's key
 ```
 
 On every other machine:
 
 ```
-/join-tailnet-agent  # paste the tag:agent key
+/join-tailnet-agent  # paste an agent key
 ```
 
-That is the whole setup. The brain prints the node name and tailnet address it joined as, and agents report both the node name they registered as and the brain they found.
+That is the whole setup. The brain prints the node name and tailnet address it joined as, and agents report the node name they registered as plus the brain they found. No tag policy is needed: agents identify the brain by asking it. Two agents can share one pre-auth key if it is reusable.
 
 Two nodes appear in your tailnet: `pi-brain-<host>` for the brain and `pi-agent-<host>-<id>` per agent session. The host machines' own Tailscale devices are untouched and can be in a different tailnet entirely.
 
@@ -72,16 +62,39 @@ Two nodes appear in your tailnet: `pi-brain-<host>` for the brain and `pi-agent-
 
 Two things must hold, and the extension reports when either is missing:
 
-- the ACL must let `tag:agent` reach `tag:brain` on the brain's port (default 8787);
+- the ACL must let each agent reach the brain's node on the memory port (default 8787);
 - the brain's node must be joined and serving, which `/join-tailnet-brain` ensures. On later sessions the brain restarts that node itself from its saved state, so it is only needed once.
 
-An agent that joins successfully but finds nothing tagged `tag:brain` says exactly that and tells you to run `/join-tailnet-brain` on the brain, rather than pretending it connected.
+Because discovery no longer uses tags, the simplest ACL is to allow your own
+devices to reach that port:
+
+```jsonc
+"grants": [
+  { "src": ["autogroup:member"], "dst": ["autogroup:member"], "ip": ["8787"] }
+]
+```
+
+If you would rather restrict it by tag, that still works: give the brain's key
+`tag:brain` and the agents' keys `tag:agent`, declare them, and use the ACL below.
+Tagged peers are also probed first, so a tag policy makes discovery a single
+request.
+
+An agent that joins successfully but finds no brain reports how many peers it asked and on which port, and tells you to run `/join-tailnet-brain` on the brain, rather than pretending it connected. If more than one peer answers as a brain, it says so and names them, because that ambiguity would otherwise pick one silently.
+
+A single brain can also be pinned, which skips discovery entirely — useful on a
+tailnet with many peers:
+
+```bash
+PI_SCALE_MEMORY_BRAIN_HOST=100.64.0.5 pi
+```
 
 The brain's node is detached and survives pi exiting, so agents keep reaching the memory while no session is open on the brain machine. `/brain reset` stops it.
 
-### Sample Tailscale ACL
+### Optional: restricting access with tags
 
-In the tailnet policy file (admin console → Access controls):
+Tags are not needed for discovery. They are only useful if you want the ACL to
+name the brain precisely. In the tailnet policy file (admin console → Access
+controls):
 
 ```jsonc
 {
@@ -98,21 +111,24 @@ In the tailnet policy file (admin console → Access controls):
 }
 ```
 
+Then create each key with its tag selected. Note that a key's tags decide what it
+may apply: Tailscale honours a tag that exactly matches the key's own tags, or one
+owned by them, so a key carrying only `tag:brain` is the one to use for the brain.
+
 ## Troubleshooting
 
-**"requested tag [tag:brain] are invalid or not permitted".** The tag must be
-declared in `tagOwners`, *and* the identity behind your key must be allowed to
-apply it — a tag being in use somewhere in the tailnet does not mean your key can
-use it. Either declare it and add yourself as an owner (see the setup above), or
-create the key with the tag selected so the key carries it. The extension prints
-both steps, with your tag filled in, whenever Tailscale rejects one.
+**"requested tag [tag:brain] are invalid or not permitted".** Only relevant if you
+use tags. A tag must be declared in `tagOwners`, *and* the identity behind your key
+must be allowed to apply it — a tag being in use elsewhere in the tailnet does not
+mean your key can use it. The extension no longer advertises tags on the first
+attempt, so a key that carries its own tag works with no tag policy at all; if a
+tag is still refused, it prints the tags the node actually authenticated with and
+the two ways to fix it. Simplest of all: drop the tags and let agents discover the
+brain by asking it.
 
-**More than one device is tagged `tag:brain`.** Agents pick any online device
-with that tag, so the memory must be served by the machine you intend. The
-extension warns when it sees another `tag:brain` device at join time, and when an
-agent finds more than one. A shortcut to a single brain: give the machine that
-runs the memory server the tag, and remove it from machines that only happen to
-have it.
+**More than one peer answers as a brain.** An agent uses the first responder and
+warns, naming them. Stop the memory server on the machine you did not intend, or
+pin the right one with `PI_SCALE_MEMORY_BRAIN_HOST`.
 
 **"requires mentioning all non-default flags".** Your join was talking to the
 *host's* Tailscale daemon, not the extension's own node — that is what happens
@@ -123,9 +139,11 @@ appears inside `/join-tailnet-brain`, the node's own saved preferences are the
 only thing involved, and it retries with `--reset` on its own — that node exists
 solely for pi-scale-memory, so nothing of yours is affected.
 
-**An agent joined but found no brain.** The brain must be online with
-`tag:brain`; run `/join-tailnet-brain` there and `/brain reconnect` on the agent.
-Check the ACL lets `tag:agent` reach `tag:brain:8787`.
+**An agent joined but found no brain.** The brain's node must be up and serving;
+run `/join-tailnet-brain` there and `/brain reconnect` on the agent. The agent
+reports how many peers it asked on which port — if that count is 0, its own node
+sees no peers (check the key and the tailnet); if it is nonzero, check the ACL
+allows the port and that the brain is actually running.
 
 **`memory_search` says the engine is bm25.** qmd is not installed on the brain,
 or its index is still catching up. See [Search](#search).
@@ -252,7 +270,7 @@ npm test         # unit tests + live brain-server and cache round-trips over loo
 npm run build    # tsc --noEmit
 ```
 
-`test/unit.ts` covers the brain node's naming, status and serve helpers, the tag-rejection guidance, self-update detection, the qmd plumbing, the brain server lifecycle (including token enforcement and conflict detection), the offline cache, and command registration. When qmd is installed it also runs a real semantic search through the brain using a throwaway collection that it removes afterwards, so it does not disturb any qmd index you already have.
+`test/unit.ts` covers the brain node's naming, status and serve helpers, peer parsing, the discovery probe (ranking, ambiguity, a pinned host, an unresponsive peer), the tag-rejection guidance, self-update detection, the qmd plumbing, the brain server lifecycle (including token enforcement and conflict detection), the offline cache, and command registration. When qmd is installed it also runs a real semantic search through the brain using a throwaway collection that it removes afterwards, so it does not disturb any qmd index you already have.
 
 The suite also starts a real userspace `tailscaled` and asserts it is a separate, unjoined node while the host's own daemon keeps its state, node id and peers. What is **not** covered: an actual successful join, tag assignment, tag discovery, serve proxying, and the Tailscale API calls — those need a live tailnet and a pre-auth key.
 

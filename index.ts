@@ -51,7 +51,8 @@ import {
 } from "./src/config.js";
 import { brainLogPath, ensureBrainServer, stopBrainServer } from "./src/brain-server.js";
 import { inspectInstall, runUpdate } from "./src/update.js";
-import { AGENT_TAG, BRAIN_TAG, tailscaleInstalled, UserspaceTailnet, type BrainPeer } from "./src/tailnet.js";
+import { AGENT_TAG, BRAIN_TAG, tailscaleInstalled, UserspaceTailnet } from "./src/tailnet.js";
+import { findBrain, isBrainResponse } from "./src/discovery.js";
 import { brainNodePaths, brainNodeRunning, ensureBrainNode, nodeStatus, stopBrainNode } from "./src/tailnet-node.js";
 import type { Ui } from "./src/ui.js";
 
@@ -255,13 +256,52 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
-	// --- agent role: userspace tailscaled + brain discovery by tag ---
+	// --- agent role: userspace tailscaled + brain discovery by asking peers ---
 
-	async function discoverBrain(tailnetClient: UserspaceTailnet): Promise<string | null> {
-		const peer: BrainPeer | null = await tailnetClient.findBrain();
-		if (!peer) return null;
-		if (!peer.online) return null;
-		return peer.ip;
+	/**
+	 * Identify the brain by asking each peer whether it serves the memory API.
+	 * Tags are only a hint for probe order, so a tailnet with no tag policy works.
+	 */
+	async function discoverBrain(ctx: ExtensionContext, cfg: Config, announce = false): Promise<string | null> {
+		const peers = await tailnet.peers();
+		const found = await findBrain(
+			peers,
+			async (host, timeoutMs) => {
+				try {
+					const res = await tailnetTransport(tailnet)(host, cfg.brainPort, {
+						method: "GET",
+						path: "/v1/health",
+						headers: cfg.brainToken ? { authorization: `Bearer ${cfg.brainToken}` } : {},
+					});
+					return isBrainResponse(res.status, res.body);
+				} catch {
+					return false;
+				}
+			},
+			{
+				host: cfg.brainHost,
+				onProbe: (peer, isBrain) => {
+					if (isBrain && announce && ctx.hasUI) ctx.ui.notify(`pi-scale-memory: ${peer} answered as the brain`, "info");
+				},
+			},
+		);
+
+		if (found.pinnedFailed && ctx.hasUI) {
+			ctx.ui.notify(`pi-scale-memory: the pinned brain host did not answer; searched the tailnet instead.`, "warning");
+		}
+		if (found.brains.length > 1 && ctx.hasUI) {
+			ctx.ui.notify(
+				`${found.brains.length} peers answered as a brain (${found.brains.map((b) => b.name).join(", ")}); using ${found.brains[0].name}.`,
+				"warning",
+			);
+		}
+		if (!found.host && ctx.hasUI && found.probed > 0) {
+			ctx.ui.notify(
+				`pi-scale-memory: asked ${found.probed} peer(s) on port ${cfg.brainPort} and none answered as a brain. Is the brain running and reachable?`,
+				"warning",
+			);
+		}
+		return found.host;
 	}
 
 	async function connectAgent(ctx: ExtensionContext, cfg: Config): Promise<void> {
@@ -285,16 +325,11 @@ export default function (pi: ExtensionAPI) {
 				token: cfg.brainToken ?? "",
 				agentId,
 				transport: tailnetTransport(tailnet),
-				resolveHost: () => discoverBrain(tailnet),
+				resolveHost: () => discoverBrain(ctx, cfg),
 			});
-			status(ctx, "brain: searching…");
-			if (!(await candidate.discover())) throw new Error("no online machine tagged tag:brain");
-			const found = await tailnet.brains();
-			if (found.length > 1) {
-				ctx.ui.notify(
-					`${found.length} devices are tagged ${BRAIN_TAG} (${found.map((b) => b.name).join(", ")}); using ${found[0].name}. Agents should only see one.`,
-					"warning",
-				);
+			status(ctx, "brain: searching peers…");
+			if (!(await candidate.discover())) {
+				throw new Error(`no peer answered as a brain on port ${cfg.brainPort}`);
 			}
 			await candidate.health();
 			client = candidate;
@@ -620,8 +655,8 @@ export default function (pi: ExtensionAPI) {
 	async function joinAsAgent(ctx: ExtensionContext): Promise<void> {
 		const key = await askPreauthKey(ctx, AGENT_TAG);
 		if (!key) return;
-		updateConfig({ role: "agent", authKey: key });
-		ctx.ui.notify(`Saved. Joining the tailnet as ${AGENT_TAG}…`, "info");
+		const cfg = updateConfig({ role: "agent", authKey: key });
+		ctx.ui.notify("Saved. Joining the tailnet and looking for the brain…", "info");
 		await disconnect();
 		await connect(ctx);
 		if (client) {
@@ -632,7 +667,7 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 		ctx.ui.notify(
-			`Joined the tailnet, but no online device tagged ${BRAIN_TAG} was found. Run /join-tailnet-brain on the machine that will host the memory, then /brain reconnect here.`,
+			`Joined the tailnet, but no peer answered as a brain on port ${cfg.brainPort}. Run /join-tailnet-brain on the machine that will host the memory, then /brain reconnect here.`,
 			"warning",
 		);
 	}

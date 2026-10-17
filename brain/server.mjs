@@ -59,6 +59,8 @@ const PORT = Number(process.env.BRAIN_PORT || 8787);
 const HOST = process.env.BRAIN_HOST || "127.0.0.1";
 const TOKEN = process.env.BRAIN_TOKEN || "";
 const MAX_BODY = 2 * 1024 * 1024;
+/** Identifies this API: agents probe peers for it instead of trusting a tag. */
+const SERVICE = "pi-scale-memory";
 const SEARCH_MODE = normalizeMode(process.env.QMD_SEARCH_MODE);
 /** How long a search waits for an in-flight re-index so it sees the latest write. */
 const INDEX_WAIT_MS = Number(process.env.QMD_INDEX_WAIT_MS ?? 5_000);
@@ -252,7 +254,9 @@ const server = http.createServer(async (req, res) => {
 		if (route === "GET /v1/health") {
 			return send(200, {
 				ok: true,
+				service: SERVICE,
 				role: "brain",
+				host: os.hostname(),
 				date: todayStr(),
 				search: { ...searchState, indexing: isIndexing(), update: updateMode() },
 			});

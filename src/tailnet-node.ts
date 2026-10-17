@@ -178,16 +178,6 @@ export async function nodeStatus(): Promise<BrainNodeStatus | null> {
 	return parseNodeStatus(raw);
 }
 
-/** Devices already tagged tag:brain, other than this node. */
-export async function otherBrainDevices(): Promise<string[]> {
-	const raw = await nodeStatusRaw();
-	if (!raw.trim()) return [];
-	const others = parseTaggedPeers(raw, BRAIN_TAG);
-	const self = parseNodeStatus(raw);
-	if (!self || !self.hostname) return others;
-	return others.filter((name) => name !== self.hostname);
-}
-
 function spawnNode(): number | null {
 	const paths = brainNodePaths();
 	fs.mkdirSync(path.dirname(paths.state), { recursive: true });
@@ -215,8 +205,8 @@ export interface EnsureNodeResult {
 	status?: BrainNodeStatus;
 	joined: boolean;
 	served: boolean;
-	/** Other devices already tagged tag:brain, which agents could pick instead of this one. */
-	otherBrains?: string[];
+	/** Tags the key happened to carry, reported for context. */
+	tags?: string[];
 }
 
 /**
@@ -246,13 +236,15 @@ export async function ensureBrainNode(opts: {
 
 	let status = await nodeStatus();
 	let joined = false;
-	const needsJoin = !status || status.backendState !== "Running" || !status.tags.includes(BRAIN_TAG);
+	// Tags are optional now: agents identify the brain by asking it. A missing
+	// tag is no longer a reason to join again.
+	const needsJoin = !status || status.backendState !== "Running";
 
 	if (needsJoin) {
 		if (!opts.authKey) {
 			return {
 				ok: false,
-				detail: `the brain's tailscale node is not joined as ${BRAIN_TAG} yet; run /join-tailnet-brain with a pre-auth key`,
+				detail: "this machine's tailscale node is not joined yet; run /join-tailnet-brain with a pre-auth key",
 				status: status ?? undefined,
 				joined: false,
 				served: false,
@@ -284,34 +276,11 @@ export async function ensureBrainNode(opts: {
 			return Boolean(current && current.backendState === "Running");
 		}, 30000).then(async () => nodeStatus());
 
-		if (status && status.backendState === "Running" && !status.tags.includes(BRAIN_TAG)) {
-			const observed = status.tags;
-			up = await join(true);
-			if (!up.ok) {
-				let detail = `tailscale up failed: ${up.stderr.trim().split("\n").slice(-3).join(" ")}`;
-				if (tagRejected(up.stderr)) detail = tagPermissionHelp(BRAIN_TAG, observed);
-				return { ok: false, detail, status, joined: true, served: false };
-			}
-			status = await waitFor(async () => {
-				const current = await nodeStatus();
-				return Boolean(current && current.tags.includes(BRAIN_TAG));
-			}, 30000).then(async () => nodeStatus());
-		}
 	}
 
 	if (!status || status.backendState !== "Running") {
 		return { ok: false, detail: "the brain's tailscale node is not running yet", status: status ?? undefined, joined, served: false };
 	}
-	if (!status.tags.includes(BRAIN_TAG)) {
-		return {
-			ok: false,
-			detail: `this device reports tags: ${status.tags.length ? status.tags.join(", ") : "none"}; expected ${BRAIN_TAG} — the pre-auth key must be tagged ${BRAIN_TAG}`,
-			status,
-			joined,
-			served: false,
-		};
-	}
-
 	const served = await nodeCli(serveArgs(opts.port), 60000);
 	if (!served.ok && !/already|configured/i.test(served.stderr)) {
 		return {
@@ -329,7 +298,7 @@ export async function ensureBrainNode(opts: {
 		status,
 		joined,
 		served: true,
-		otherBrains: await otherBrainDevices(),
+		tags: status.tags,
 	};
 }
 

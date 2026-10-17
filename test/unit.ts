@@ -22,7 +22,7 @@ import {
 	syncCache,
 } from "../src/cache.js";
 import { BrainClient, localTransport } from "../src/client.js";
-import { run, tailscaleInstalled } from "../src/tailnet.js";
+import { parsePeers, run, tailscaleInstalled } from "../src/tailnet.js";
 import {
 	clampLimit,
 	normalizeHits,
@@ -37,12 +37,13 @@ import { ensureBrainNode, nodeStatus, stopBrainNode } from "../src/tailnet-node.
 import {
 	brainNodeHostname,
 	parseNodeStatus,
-	parseTaggedPeers,
 	serveArgs,
 	tagPermissionHelp,
 	tagRejected,
 	upArgs,
 } from "../src/tailnet-node.js";
+import { findBrain, isBrainResponse, rankCandidates } from "../src/discovery.js";
+import type { BrainPeer } from "../src/tailnet.js";
 import { findPackageSource, inspectInstall } from "../src/update.js";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -153,20 +154,118 @@ check("parseNodeStatus reads the fields the brain needs", () => {
 	assert.equal(parseNodeStatus("not json"), null);
 	assert.equal(parseNodeStatus("{}")?.backendState, "Unknown");
 });
-check("other tag:brain devices are detected", () => {
+check("peers are read without relying on tags", () => {
 	const raw = JSON.stringify({
-		Self: { HostName: "pi-brain-mac", Tags: ["tag:brain"] },
+		Self: { HostName: "me" },
 		Peer: {
-			a: { HostName: "old-brain", Tags: ["tag:brain"], Online: true },
-			b: { HostName: "some-agent", Tags: ["tag:agent"], Online: true },
-			c: { HostName: "zz-brain", Tags: ["tag:brain"], Online: false },
-			d: { HostName: "no-tags", Online: true },
+			a: { HostName: "brain-1", Tags: ["tag:brain"], Online: true, TailscaleIPs: ["100.64.0.5"] },
+			b: { HostName: "agent-2", Online: true, TailscaleIPs: ["fd7a::1", "100.64.0.6"] },
+			c: { HostName: "offline-box", Online: false, TailscaleIPs: ["100.64.0.7"] },
+			d: { HostName: "no-ips" },
 		},
 	});
-	assert.deepEqual(parseTaggedPeers(raw, "tag:brain"), ["old-brain", "zz-brain"]);
-	assert.deepEqual(parseTaggedPeers(raw, "tag:agent"), ["some-agent"]);
-	assert.deepEqual(parseTaggedPeers("not json", "tag:brain"), []);
-	assert.deepEqual(parseTaggedPeers("{}", "tag:brain"), []);
+	const peers = parsePeers(raw);
+	assert.equal(peers.length, 3, "peers without an address are skipped");
+	assert.deepEqual(peers[0], { name: "brain-1", ip: "100.64.0.5", online: true, tags: ["tag:brain"] });
+	assert.equal(peers[1].ip, "100.64.0.6", "the IPv4 address is preferred");
+	assert.deepEqual(peers[1].tags, [], "a peer without tags is still a candidate");
+	assert.equal(peers[2].online, false);
+	assert.deepEqual(parsePeers("not json"), []);
+	assert.deepEqual(parsePeers("{}"), []);
+});
+
+console.log("finding the brain by asking it");
+check("only this extension's brain is accepted", () => {
+	assert.equal(isBrainResponse(200, JSON.stringify({ ok: true, service: "pi-scale-memory", role: "brain" })), true);
+	assert.equal(isBrainResponse(200, JSON.stringify({ ok: true, role: "brain" })), false, "service must match");
+	assert.equal(isBrainResponse(200, JSON.stringify({ ok: true, service: "pi-scale-memory" })), false, "role must match");
+	assert.equal(isBrainResponse(200, JSON.stringify({ service: "something-else", role: "brain" })), false);
+	assert.equal(isBrainResponse(401, JSON.stringify({ error: "unauthorized" })), false, "a token-protected brain cannot be identified without the token");
+	assert.equal(isBrainResponse(200, "not json"), false);
+	assert.equal(isBrainResponse(200, ""), false);
+});
+check("candidates are ranked tag-hint first, then online", () => {
+	const peers: BrainPeer[] = [
+		{ name: "offline-plain", ip: "1", online: false, tags: [] },
+		{ name: "online-plain", ip: "2", online: true, tags: [] },
+		{ name: "offline-tagged", ip: "3", online: false, tags: ["tag:brain"] },
+		{ name: "online-tagged", ip: "4", online: true, tags: ["tag:brain"] },
+	];
+	assert.deepEqual(rankCandidates(peers).map((p) => p.name), [
+		"online-tagged",
+		"offline-tagged",
+		"online-plain",
+		"offline-plain",
+	]);
+	assert.deepEqual(rankCandidates([]), []);
+});
+await checkAsync("every peer is asked, and the answering one wins", async () => {
+	const peers: BrainPeer[] = [
+		{ name: "a", ip: "10.0.0.1", online: true, tags: [] },
+		{ name: "b", ip: "10.0.0.2", online: true, tags: [] },
+		{ name: "c", ip: "10.0.0.3", online: true, tags: [] },
+	];
+	const asked: string[] = [];
+	const found = await findBrain(peers, async (host) => {
+		asked.push(host);
+		return host === "10.0.0.2";
+	});
+	assert.equal(found.host, "10.0.0.2");
+	assert.equal(found.probed, 3, "all peers are asked, not just until the first answer");
+	assert.deepEqual(asked.sort(), ["10.0.0.1", "10.0.0.2", "10.0.0.3"]);
+	assert.equal(found.brains.length, 1);
+});
+await checkAsync("no responder, and several responders, are both reported", async () => {
+	const peers: BrainPeer[] = [
+		{ name: "a", ip: "10.0.0.1", online: true, tags: [] },
+		{ name: "b", ip: "10.0.0.2", online: true, tags: [] },
+	];
+	const none = await findBrain(peers, async () => false);
+	assert.equal(none.host, null);
+	assert.equal(none.probed, 2);
+	assert.deepEqual(none.brains, []);
+
+	const both = await findBrain(peers, async () => true);
+	assert.equal(both.brains.length, 2, "ambiguity must be visible to the caller");
+	assert.equal(both.host, "10.0.0.1");
+});
+await checkAsync("a pinned host is tried first and falls back to the scan", async () => {
+	const peers: BrainPeer[] = [{ name: "a", ip: "10.0.0.1", online: true, tags: [] }];
+	const asked: string[] = [];
+	const pinned = await findBrain(
+		peers,
+		async (host) => {
+			asked.push(host);
+			return true;
+		},
+		{ host: "10.9.9.9" },
+	);
+	assert.equal(pinned.host, "10.9.9.9");
+	assert.deepEqual(asked, ["10.9.9.9"], "a pinned host must not trigger a full scan");
+
+	asked.length = 0;
+	const fallback = await findBrain(
+		peers,
+		async (host) => {
+			asked.push(host);
+			return host === "10.0.0.1";
+		},
+		{ host: "10.9.9.9" },
+	);
+	assert.equal(fallback.host, "10.0.0.1");
+	assert.equal(fallback.pinnedFailed, true, "the caller needs to know the pin was wrong");
+	assert.deepEqual(asked, ["10.9.9.9", "10.0.0.1"]);
+});
+await checkAsync("a peer that throws does not sink the search", async () => {
+	const peers: BrainPeer[] = [
+		{ name: "broken", ip: "10.0.0.1", online: true, tags: [] },
+		{ name: "good", ip: "10.0.0.2", online: true, tags: [] },
+	];
+	const found = await findBrain(peers, async (host) => {
+		if (host === "10.0.0.1") return false;
+		return true;
+	});
+	assert.equal(found.host, "10.0.0.2");
 });
 check("the first join attempt lets the key's own tags apply", () => {
 	const plain = upArgs("tskey-auth-x", "pi-brain-mac");

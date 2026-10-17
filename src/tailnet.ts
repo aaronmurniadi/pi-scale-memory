@@ -106,6 +106,37 @@ export interface BrainPeer {
 	name: string;
 	ip: string;
 	online: boolean;
+	tags: string[];
+}
+
+/** Every peer in the netmap, from a `tailscale status --json` payload. */
+export function parsePeers(raw: string): BrainPeer[] {
+	let json: any;
+	try {
+		json = JSON.parse(raw);
+	} catch {
+		return [];
+	}
+	const peers: BrainPeer[] = [];
+	for (const peer of Object.values<any>(json?.Peer ?? {})) {
+		const ips: string[] = Array.isArray(peer?.TailscaleIPs) ? peer.TailscaleIPs.map(String) : [];
+		let ip = "";
+		for (const candidate of ips) {
+			if (!candidate.includes(":")) {
+				ip = candidate;
+				break;
+			}
+		}
+		if (!ip && ips.length > 0) ip = ips[0];
+		if (!ip) continue;
+		peers.push({
+			name: String(peer?.HostName ?? peer?.DNSName ?? ip),
+			ip,
+			online: peer?.Online === true,
+			tags: Array.isArray(peer?.Tags) ? peer.Tags.map(String) : [],
+		});
+	}
+	return peers;
 }
 
 export interface TailnetStartOptions {
@@ -172,38 +203,11 @@ export class UserspaceTailnet {
 		}
 	}
 
-	/** Every online peer carrying tag:brain, best candidate first. */
-	async brains(): Promise<BrainPeer[]> {
+	/** Every peer this node can see. */
+	async peers(): Promise<BrainPeer[]> {
 		const st = await run("tailscale", [`--socket=${this.socket}`, "status", "--json"], { timeoutMs: 15000 });
 		if (!st.ok) return [];
-		let json: any;
-		try {
-			json = JSON.parse(st.stdout);
-		} catch {
-			return [];
-		}
-		const peers: BrainPeer[] = [];
-		for (const peer of Object.values<any>(json.Peer ?? {})) {
-			const tags: string[] = peer.Tags ?? [];
-			if (!tags.includes(BRAIN_TAG)) continue;
-			const ips: string[] = peer.TailscaleIPs ?? [];
-			let ip = ips[0] ?? "";
-			for (const candidate of ips) {
-				if (!candidate.includes(":")) {
-					ip = candidate;
-					break;
-				}
-			}
-			if (!ip) continue;
-			peers.push({ name: String(peer.HostName ?? peer.DNSName ?? ip), ip, online: peer.Online === true });
-		}
-		peers.sort((a, b) => Number(b.online) - Number(a.online));
-		return peers;
-	}
-
-	async findBrain(): Promise<BrainPeer | null> {
-		const peers = await this.brains();
-		return peers[0] ?? null;
+		return parsePeers(st.stdout);
 	}
 
 	async stop(): Promise<void> {
