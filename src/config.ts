@@ -12,14 +12,10 @@ export interface Config {
 	/** Tagged (tag:agent) pre-auth key used to join the tailnet. */
 	authKey?: string;
 	brainPort: number;
-	/** Bearer token, must match BRAIN_TOKEN on the brain server. Required when funneled. */
+	/** Optional bearer token, must match BRAIN_TOKEN on the brain server. */
 	brainToken?: string;
 	/** Mirror brain memory locally so reads work offline (agents only). Default true. */
 	cache?: boolean;
-	/** Brain role: the public Funnel URL published by /setup-funnel. */
-	funnelUrl?: string;
-	/** Agent role: reach the brain at this URL (public HTTPS) instead of tag discovery. */
-	brainUrl?: string;
 	/** Tailscale API access token (tskey-api-...) used by /generate-preauth. */
 	tailscaleApiToken?: string;
 }
@@ -40,10 +36,6 @@ export function loadConfig(applyEnv = true): Config {
 	if (env.PI_SCALE_MEMORY_AUTHKEY) cfg.authKey = env.PI_SCALE_MEMORY_AUTHKEY;
 	if (env.PI_SCALE_MEMORY_PORT) cfg.brainPort = Number(env.PI_SCALE_MEMORY_PORT);
 	if (env.PI_SCALE_MEMORY_TOKEN) cfg.brainToken = env.PI_SCALE_MEMORY_TOKEN;
-	if (env.PI_SCALE_MEMORY_BRAIN_URL) {
-		cfg.brainUrl = env.PI_SCALE_MEMORY_BRAIN_URL;
-		cfg.role = "agent";
-	}
 	if (env.PI_SCALE_MEMORY_TAILSCALE_API_TOKEN) cfg.tailscaleApiToken = env.PI_SCALE_MEMORY_TAILSCALE_API_TOKEN;
 	if (env.PI_SCALE_MEMORY_CACHE === "0" || env.PI_SCALE_MEMORY_CACHE === "false") cfg.cache = false;
 	return cfg;

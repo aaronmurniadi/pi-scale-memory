@@ -1,4 +1,4 @@
-/** Lifecycle of the local brain server process (the brain role and /setup-funnel). */
+/** Lifecycle of the local brain server process (the brain role). */
 import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as http from "node:http";

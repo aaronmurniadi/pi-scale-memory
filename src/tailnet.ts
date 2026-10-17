@@ -2,8 +2,8 @@
  * Tailscale plumbing.
  *
  * Two distinct roles use this module:
- *   - the brain joins the tailnet with the **system** tailscale and publishes its
- *     memory API through Funnel (see src/funnel.ts);
+ *   - the brain joins the tailnet with the **system** tailscale as tag:brain, so
+ *     its memory API is reachable at its tailnet address;
  *   - agents each run a private **userspace** tailscaled (no TUN device, no route
  *     changes, SOCKS5 proxy only) so joining a tailnet never disturbs the
  *     machine's own system tailscale.
@@ -17,9 +17,6 @@ import * as path from "node:path";
 
 export const AGENT_TAG = "tag:agent";
 export const BRAIN_TAG = "tag:brain";
-/** Funnel only serves names in the tailnet's own *.ts.net domain. */
-export const FUNNEL_DNS_SUFFIX = ".ts.net";
-export const FUNNEL_PORTS = [443, 8443, 10000];
 
 export interface RunResult {
 	ok: boolean;
@@ -107,7 +104,7 @@ export async function waitFor(check: () => Promise<boolean>, timeoutMs: number):
 }
 
 // ---------------------------------------------------------------------------
-// System node status and Funnel
+// System node status (the brain side)
 // ---------------------------------------------------------------------------
 
 export interface SystemStatus {
@@ -143,32 +140,6 @@ export async function systemStatus(): Promise<SystemStatus | null> {
 	const r = await ts(["status", "--json"], 20000);
 	if (!r.ok && !r.stdout.trim()) return null;
 	return parseSystemStatus(r.stdout);
-}
-
-export function funnelUrl(dnsName: string, publicPort: number): string {
-	let base = dnsName.trim();
-	if (base.endsWith(".")) base = base.slice(0, -1);
-	if (publicPort === 443) return `https://${base}`;
-	return `https://${base}:${publicPort}`;
-}
-
-export function funnelDnsWarning(dnsName: string): string | null {
-	if (!dnsName) return "Tailscale reports no MagicDNS name for this device; Funnel needs one.";
-	if (dnsName.endsWith(FUNNEL_DNS_SUFFIX)) return null;
-	return `This tailnet uses the MagicDNS domain "${dnsName}", but Funnel can only serve names ending in ${FUNNEL_DNS_SUFFIX}. Use a tailnet with the standard Tailscale domain.`;
-}
-
-/** Publish a local port to the internet. `--bg` keeps it running across reboots. */
-export async function enableFunnel(localPort: number, publicPort: number): Promise<RunResult> {
-	return ts(["funnel", "--bg", `--https=${publicPort}`, String(localPort)], 120000);
-}
-
-export async function funnelStatus(): Promise<RunResult> {
-	return ts(["funnel", "status"], 20000);
-}
-
-export async function resetFunnel(): Promise<RunResult> {
-	return ts(["funnel", "reset"], 20000);
 }
 
 function attempt(args: string[]): Promise<RunResult> {

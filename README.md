@@ -1,43 +1,37 @@
 # pi-scale-memory
 
-A pi extension that gives many pi agents one shared memory (a "brain"). The brain publishes its API through **Tailscale Funnel** and hands you the URL; agents each run their own **userspace** `tailscaled`, so joining a tailnet never touches the machine's system Tailscale, and they keep a local mirror of the memory so they can still read while the brain is unreachable.
+A pi extension that gives many pi agents one shared memory (a "brain") over a private tailnet.
+
+The brain joins the tailnet with the machine's own Tailscale as `tag:brain`, so its memory API is reachable at its tailnet address. Agents join with a pre-auth key as `tag:agent`, each running its own **userspace** `tailscaled` (no TUN device, no route changes, SOCKS5 proxy only) so joining a tailnet never touches the machine's system Tailscale. Agents also keep a local mirror of the memory, so they can still read while the brain is unreachable.
 
 Memory model and tools follow [pi-memory](https://github.com/jayzeng/pi-memory): `MEMORY.md`, `SCRATCHPAD.md`, `daily/YYYY-MM-DD.md`, tools `memory_write`, `memory_read`, `scratchpad`, `memory_search`, `memory_forget`, plus a memory snapshot injected into the system prompt. Differences: storage is remote and shared, the search index lives on the brain (qmd, with BM25 fallback), and agents cache the memory for offline use.
 
-## Why Tailscale and not Headscale
-
-Funnel is a hard requirement here: it is what gives the brain a stable public HTTPS URL without port forwarding or DNS work. Headscale cannot provide it. From the Headscale maintainer, on [issue #1040](https://github.com/juanfont/headscale/issues/1040):
-
-> We cannot really implement Tailscale's Funnel per se as it is not a public infrastructure like DERP. The way it works is roughly by setting up a connection between your node and the Tailscale Funnel ingress *via* your tailnet. This means that the tailnet must be hosted on tailscale.com.
-
-Headscale also cannot serve `tailscale serve` yet ([#1921](https://github.com/juanfont/headscale/issues/1921)), which is the other way to expose a service on a node. So this extension targets the Tailscale control plane. Agents still never need your system Tailscale: they run their own userspace instance.
-
 ## Requirements
 
-- **Tailscale** on every machine (`tailscale` and `tailscaled` on `PATH`), v1.38.3 or later.
-- A tailnet whose MagicDNS domain is the standard `<tailnet>.ts.net` — Funnel cannot serve custom domains.
-- HTTPS and the `funnel` node attribute enabled for the tailnet. `tailscale funnel` walks you through approving this the first time.
+- **Tailscale** on every machine (`tailscale` and `tailscaled` on `PATH`).
+- Tagged pre-auth keys: one for the brain (`tag:brain`), reusable ones for agents (`tag:agent`).
 - Node >= 22.
 - Optional, on the **brain**: [qmd](https://github.com/tobi/qmd) (`npm install -g @tobilu/qmd`) for semantic and deep search. Agents never need qmd.
 
+Nothing is published to the internet: the memory API is reachable only from the tailnet, and the ACL is what decides who can reach it.
+
 ## Roles
 
-`/self-tag` sets what this pi agent is:
+`/self-tag` sets what this pi agent is, and the join commands set it too:
 
 | Role | What it does | Memory path |
 |---|---|---|
-| `brain` | Runs the memory server, is tagged `tag:brain`, and publishes it with Funnel | local server on `127.0.0.1`, public through Funnel |
-| `agent` | Runs a private userspace tailscaled tagged `tag:agent`, or talks to the public URL | Funnel URL or the tailnet, plus a local mirror |
+| `brain` | Runs the memory server, tagged `tag:brain` on the machine's own Tailscale | local server on `127.0.0.1`, reachable by agents at its tailnet address |
+| `agent` | Runs a private userspace tailscaled tagged `tag:agent`, discovers the brain by tag | the tailnet, plus a local mirror for offline reads |
 
 ## Commands
 
 | Command | Applies to | What it does |
 |---|---|---|
-| `/self-tag [brain\|agent]` | both | Sets this agent's role, saves it, and reconnects |
-| `/setup-funnel` | brain only | Starts the brain server with a token, joins Tailscale as `tag:brain`, publishes the memory API through Funnel, verifies the public URL, and prints it with the token |
+| `/join-tailnet-brain` | brain | Joins this machine with a `tag:brain` pre-auth key, verifies the tag stuck, sets the role to `brain`, and starts the memory server |
+| `/join-tailnet-agent` | agent | Joins with a `tag:agent` pre-auth key on a private userspace tailscaled, then finds the brain by tag |
 | `/generate-preauth` | brain only | Mints a `tag:agent` auth key through the Tailscale API (needs an API token with the `auth_keys` scope) |
-| `/join-tailnet-agent` | agent | Joins the tailnet with a `tag:agent` key and discovers the brain by tag, or points at a public brain URL with its token |
-| `/join-tailnet-brain` | brain | Joins this machine with a `tag:brain` key, verifies the tag stuck, and switches the role to `brain` |
+| `/self-tag [brain\|agent]` | both | Sets the role on its own, without joining |
 | `/brain status\|sync\|reindex\|reconnect\|reset` | both | Shows role, brain, health, search engine, queue and cache age; refreshes the offline mirror; reports the brain's index; rejoins; deletes the saved config |
 | `/update-pi-scale-memory` | both | Updates the extension (git pull, or `pi update`) and reloads it |
 
@@ -46,30 +40,45 @@ Headscale also cannot serve `tailscale serve` yet ([#1921](https://github.com/ju
 On the machine that will hold the memory:
 
 ```
-/join-tailnet-brain  # join with a tag:brain key (sets the role to brain)
-/setup-funnel        # prints the public URL and the brain token
+/join-tailnet-brain  # paste a tag:brain pre-auth key
 /generate-preauth    # prints a tag:agent key for the other machines
 ```
 
 On every other machine:
 
 ```
-/join-tailnet-agent          # "Join the tailnet as tag:agent" + the key
-/join-tailnet-agent          # or "Use a public brain URL" + URL + token (no tailnet needed)
+/join-tailnet-agent  # paste the tag:agent key
 ```
 
-`/setup-funnel` and `/generate-preauth` refuse to run unless the role is `brain`; `/join-tailnet-brain` sets it for you, or use `/self-tag brain`. Joining the tailnet as `tag:brain` does not publish anything on its own — that is what `/setup-funnel` does.
+That is the whole setup. The brain prints its node name when it joins, and agents report both the node name they registered as and the brain they found.
 
-## What `/setup-funnel` does
+### Making it reachable
 
-1. Generates a brain token if none exists. A publicly reachable memory API must never be anonymous, so this is not optional.
-2. (Re)starts the local brain server with that token, and warns if something else is already listening on the port with a different token rather than silently adopting it.
-3. Ensures Tailscale is up. If the machine is not running, it asks for a `tag:brain` pre-auth key and joins. It warns when the tailnet's MagicDNS domain is not `*.ts.net`, since Funnel cannot serve those.
-4. Asks which public port to use (443, 8443 or 10000 — Funnel's only options) and runs `tailscale funnel --bg --https=<port> <brainPort>`. `--bg` keeps the funnel running across reboots.
-5. Computes `https://<machine>.<tailnet>.ts.net` and **verifies it from the outside** by calling `/v1/health` through the public URL with the token before reporting success.
-6. Saves the URL and token and prints both.
+Two things must hold, and the extension reports when either is missing:
 
-The first Funnel use triggers an approval step in Tailscale: the CLI prints a URL to approve Funnel for the tailnet (which enables HTTPS certificates and adds the `funnel` node attribute). Until that is approved, the funnel command fails and the error is shown verbatim.
+- the ACL must let `tag:agent` reach `tag:brain` on the brain's port (default 8787);
+- the brain machine must have its own Tailscale up, which `/join-tailnet-brain` ensures.
+
+An agent that joins successfully but finds nothing tagged `tag:brain` says exactly that and tells you to run `/join-tailnet-brain` on the brain, rather than pretending it connected.
+
+### Sample Tailscale ACL
+
+In the tailnet policy file (admin console → Access controls):
+
+```jsonc
+{
+  // tag owners may be a user email, a group, an autogroup, or another tag
+  "tagOwners": {
+    "tag:agent": ["autogroup:member"],
+    "tag:brain": ["autogroup:member"]
+  },
+
+  "acls": [
+    // agents may only reach the brain's memory API, nothing else
+    { "action": "accept", "src": ["tag:agent"], "dst": ["tag:brain:8787"] }
+  ]
+}
+```
 
 ## Search
 
@@ -107,52 +116,23 @@ Nothing outside the memory layout is ever written into the cache: a snapshot ent
 
 ## Manual setup
 
-Run the brain server yourself if you prefer not to let `/setup-funnel` manage it:
+Run the brain server yourself if you prefer not to let the brain role manage it:
 
 ```bash
-BRAIN_DIR=~/.pi-scale-brain BRAIN_PORT=8787 BRAIN_TOKEN=$(openssl rand -hex 32) node brain/server.mjs
-tailscale funnel --bg --https=443 8787      # publishes https://<machine>.<tailnet>.ts.net
-tailscale funnel status                     # shows what is published
+BRAIN_DIR=~/.pi-scale-brain BRAIN_PORT=8787 node brain/server.mjs
 ```
 
-Then on each agent set the URL and token (or use `/join-tailnet-agent`).
-
-### Tailscale ACL
-
-Optional. Needed only when agents reach the brain **over the tailnet** (tag discovery) rather than through the public URL, and it is what makes `tag:agent` and `tag:brain` assignable:
-
-```jsonc
-{
-  // tag owners may be a user email, a group, an autogroup, or another tag
-  "tagOwners": {
-    "tag:agent": ["autogroup:member"],
-    "tag:brain": ["autogroup:member"]
-  },
-
-  "acls": [
-    // agents may only reach the brain's memory API
-    { "action": "accept", "src": ["tag:agent"], "dst": ["tag:brain:8787"] }
-  ],
-
-  // lets a device tagged tag:brain publish a Funnel (the CLI adds this for you)
-  "nodeAttrs": [
-    { "target": ["tag:brain"], "attr": ["funnel"] }
-  ]
-}
-```
-
-Note that `autogroup:member` is exactly what Headscale rejects in `tagOwners` — Tailscale accepts it, Headscale does not.
+It binds `0.0.0.0:8787` by default, so any tailnet peer the ACL allows can reach it at its tailnet address. Set `BRAIN_HOST=127.0.0.1` to keep it local, and `BRAIN_TOKEN` if you want a shared secret on top of the ACL (agents then need `PI_SCALE_MEMORY_TOKEN` or `brainToken` in their config).
 
 ## Configuration
 
-Saved per machine at `~/.pi/agent/pi-scale-memory/config.json` (mode 0600): role, the pre-auth key, the brain port, the brain token, the public brain URL, and the last Funnel URL. Environment overrides:
+Saved per machine at `~/.pi/agent/pi-scale-memory/config.json` (mode 0600): role, the pre-auth key, the brain port, and an optional brain token. Environment overrides:
 
 | Variable | Meaning |
 |---|---|
-| `PI_SCALE_MEMORY_BRAIN_URL` | public brain URL; also forces the agent role |
-| `PI_SCALE_MEMORY_TOKEN` | brain token, must match `BRAIN_TOKEN` on the brain server |
 | `PI_SCALE_MEMORY_AUTHKEY` | tailnet pre-auth key |
-| `PI_SCALE_MEMORY_LOGIN_SERVER` | Tailscale login server override |
+| `PI_SCALE_MEMORY_TOKEN` | brain token, must match `BRAIN_TOKEN` on the brain server |
+| `PI_SCALE_MEMORY_LOGIN_SERVER` | control server override (unset = Tailscale) |
 | `PI_SCALE_MEMORY_PORT` | brain API port (default 8787) |
 | `PI_SCALE_MEMORY_CONFIG_DIR` | where config, cache, brain log and pid file live |
 | `PI_SCALE_MEMORY_CACHE` | `0` disables the agent-side offline mirror |
@@ -164,12 +144,19 @@ Brain-side environment (where `brain/server.mjs` runs):
 
 | Variable | Default | Meaning |
 |---|---|---|
+| `BRAIN_DIR` | `~/.pi-scale-brain` | memory directory |
+| `BRAIN_HOST` | `0.0.0.0` | listen address |
+| `BRAIN_TOKEN` | unset | require `Authorization: Bearer <token>` |
 | `QMD_COLLECTION` | `pi-scale-memory` | qmd collection name |
 | `QMD_UPDATE` | `background` | `background` re-indexes after writes; `manual`/`off` leave the index to you |
 | `QMD_SEARCH_MODE` | `semantic` | mode used when a request does not name one |
 | `QMD_SEARCH_TIMEOUT_MS` | per mode (30s/120s/240s) | qmd query timeout override |
 | `QMD_INDEX_WAIT_MS` | `5000` | how long a search waits for a pending re-index |
 | `QMD_EMBED_TIMEOUT_MS` | `600000` | cap on a `qmd embed` run |
+
+### Control plane
+
+This extension targets Tailscale. It has not been tested against Headscale; `PI_SCALE_MEMORY_LOGIN_SERVER` is honoured if you want to point the agent-side client at another control server, but nothing in the setup flow installs or configures one.
 
 ## Updating
 
@@ -197,10 +184,10 @@ npm test         # unit tests + live brain-server and cache round-trips over loo
 npm run build    # tsc --noEmit
 ```
 
-`test/unit.ts` covers the Tailscale status/funnel-URL helpers, the Tailscale API key request shape, duration parsing, self-update detection, the qmd plumbing, the brain server lifecycle (including token enforcement and conflict detection), the offline cache, and command registration. When qmd is installed it also runs a real semantic search through the brain using a throwaway collection that it removes afterwards, so it does not disturb any qmd index you already have.
+`test/unit.ts` covers the Tailscale status and tag helpers, the Tailscale API key request shape, duration parsing, self-update detection, the qmd plumbing, the brain server lifecycle (including token enforcement and conflict detection), the offline cache, and command registration. When qmd is installed it also runs a real semantic search through the brain using a throwaway collection that it removes afterwards, so it does not disturb any qmd index you already have.
 
-**Not covered by tests:** anything requiring a real tailnet — `tailscaled` startup, `tailscale up`, tag discovery, Funnel publishing, and the Tailscale API calls. Those need a live tailnet.
+**Not covered by tests:** anything requiring a real tailnet — `tailscaled` startup, `tailscale up`, tag assignment, tag discovery, and the Tailscale API calls. Those need a live tailnet.
 
 ## Security
 
-A funneled brain is reachable by anyone who has the URL, so the token is what protects it — treat it like a password, and prefer agents on the tailnet with an ACL over a public URL when you can. Keep the brain token, the pre-auth key and the Tailscale API token out of the repository; they live only in `config.json` (0600) on each machine.
+The ACL is the gate: an agent can only reach the brain if the policy allows `tag:agent` → `tag:brain:8787`. Keep the pre-auth keys and the Tailscale API token out of the repository; they live in `config.json` (0600) on each machine. If you want a second layer, set `BRAIN_TOKEN` on the brain and the matching `PI_SCALE_MEMORY_TOKEN` on the agents.

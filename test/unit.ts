@@ -26,7 +26,7 @@ import {
 	searchWithFallback,
 	syncCache,
 } from "../src/cache.js";
-import { BrainClient, localTransport, parseBrainUrl, publicTransport } from "../src/client.js";
+import { BrainClient, localTransport } from "../src/client.js";
 import {
 	clampLimit,
 	normalizeHits,
@@ -37,12 +37,7 @@ import {
 	relativeFile,
 	stripAnsi,
 } from "../brain/qmd.mjs";
-import {
-	funnelDnsWarning,
-	funnelUrl,
-	missingTagWarning,
-	parseSystemStatus,
-} from "../src/tailnet.js";
+import { missingTagWarning, parseSystemStatus } from "../src/tailnet.js";
 import { findPackageSource, inspectInstall } from "../src/update.js";
 import { parseDurationSeconds } from "../index.js";
 
@@ -126,35 +121,8 @@ async function startBrain(dir: string, port: number, collection: string) {
 }
 
 console.log("tailscale helpers");
-check("parseSystemStatus reads the fields the funnel needs", () => {
-	const status = parseSystemStatus(
-		JSON.stringify({
-			BackendState: "Running",
-			CurrentTailnet: { Name: "example.com" },
-			Self: { DNSName: "brain.tail1a2b.ts.net.", HostName: "brain", Tags: ["tag:brain"] },
-		}),
-	);
-	assert.ok(status);
-	assert.equal(status.dnsName, "brain.tail1a2b.ts.net", "the trailing dot must go");
-	assert.equal(status.backendState, "Running");
-	assert.deepEqual(status.tags, ["tag:brain"]);
-	assert.equal(status.tailnetName, "example.com");
+check("parseSystemStatus and missingTagWarning agree on the tag", () => {
 	assert.equal(parseSystemStatus("not json"), null);
-	assert.equal(parseSystemStatus("{}")?.backendState, "Unknown");
-});
-check("funnelUrl omits :443 and keeps other ports", () => {
-	assert.equal(funnelUrl("brain.tail1a2b.ts.net", 443), "https://brain.tail1a2b.ts.net");
-	assert.equal(funnelUrl("brain.tail1a2b.ts.net.", 443), "https://brain.tail1a2b.ts.net");
-	assert.equal(funnelUrl("brain.tail1a2b.ts.net", 8443), "https://brain.tail1a2b.ts.net:8443");
-	assert.equal(funnelUrl("brain.tail1a2b.ts.net", 10000), "https://brain.tail1a2b.ts.net:10000");
-});
-check("funnelDnsWarning only accepts the tailnet ts.net domain", () => {
-	assert.equal(funnelDnsWarning("brain.tail1a2b.ts.net"), null);
-	assert.match(String(funnelDnsWarning("nv00016680.substrait.local")), /can only serve names ending in \.ts\.net/);
-	assert.match(String(funnelDnsWarning("")), /no MagicDNS name/);
-});
-
-check("missingTagWarning reports a tag that did not stick", () => {
 	const tagged = parseSystemStatus(
 		JSON.stringify({ BackendState: "Running", Self: { DNSName: "b.tail.ts.net.", Tags: ["tag:brain"] } }),
 	);
@@ -168,19 +136,6 @@ check("missingTagWarning reports a tag that did not stick", () => {
 	const other = parseSystemStatus(JSON.stringify({ BackendState: "Running", Self: { Tags: ["tag:agent"] } }));
 	assert.match(String(missingTagWarning(other, "tag:brain")), /reports tags: tag:agent/);
 	assert.match(String(missingTagWarning(null, "tag:brain")), /Could not read tailscale status/);
-});
-
-console.log("brain url transport");
-check("parseBrainUrl requires https and defaults to 443", () => {
-	assert.deepEqual(parseBrainUrl("https://brain.tail1a2b.ts.net"), { host: "brain.tail1a2b.ts.net", port: 443 });
-	assert.deepEqual(parseBrainUrl("https://brain.tail1a2b.ts.net:8443"), { host: "brain.tail1a2b.ts.net", port: 8443 });
-	assert.deepEqual(parseBrainUrl(" https://brain.tail1a2b.ts.net/ "), { host: "brain.tail1a2b.ts.net", port: 443 });
-	assert.throws(() => parseBrainUrl("http://brain.example.com"));
-	assert.throws(() => parseBrainUrl("brain.tail1a2b.ts.net"));
-});
-check("the public transport exists and is distinct from the local one", () => {
-	assert.equal(typeof publicTransport(), "function");
-	assert.notEqual(publicTransport(), localTransport());
 });
 
 console.log("tailscale api keys");
@@ -605,7 +560,6 @@ await checkAsync("the extension registers its commands and tools", async () => {
 		"join-tailnet-agent",
 		"join-tailnet-brain",
 		"self-tag",
-		"setup-funnel",
 		"update-pi-scale-memory",
 	]);
 	assert.deepEqual(tools.sort(), [

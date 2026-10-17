@@ -2,19 +2,18 @@
  * pi-scale-memory — one shared memory for many pi agents, over Tailscale.
  *
  * Roles (/self-tag):
- *   brain — runs the memory server on loopback, is tagged tag:brain, and publishes
- *           it to the internet with Tailscale Funnel (/setup-funnel).
+ *   brain — runs the memory server and is tagged tag:brain, so agents reach it at
+ *           its tailnet address.
  *   agent — uses its own userspace tailscaled (no TUN device, no route changes,
- *           SOCKS5 proxy only) so joining a tailnet leaves the machine's system
- *           Tailscale alone. It either discovers the brain by tag or talks to the
- *           public Funnel URL, and mirrors the memory for offline reads.
+ *           SOCKS5 proxy only) so joining the tailnet leaves the machine's system
+ *           Tailscale alone. It discovers the brain by tag and mirrors the memory
+ *           for offline reads.
  *
  * Commands:
  *   /self-tag               — set this pi agent's role (brain or agent)
- *   /setup-funnel           — brain only: token, join, publish, print the URL
- *   /generate-preauth       — brain only: mint a tag:agent key via the Tailscale API
  *   /join-tailnet-brain     — join this machine as the tag:brain device
- *   /join-tailnet-agent     — join as a tag:agent device, or use a public brain URL
+ *   /join-tailnet-agent     — join this machine as a tag:agent device
+ *   /generate-preauth       — brain only: mint a tag:agent key via the Tailscale API
  *   /brain                  — status | sync | reindex | reconnect | reset
  *   /update-pi-scale-memory — update the extension itself, then reload
  */
@@ -40,7 +39,7 @@ import {
 	searchWithFallback,
 	syncCache,
 } from "./src/cache.js";
-import { BrainClient, localTransport, parseBrainUrl, publicTransport, tailnetTransport } from "./src/client.js";
+import { BrainClient, localTransport, tailnetTransport } from "./src/client.js";
 import {
 	CONFIG_DIR,
 	CONFIG_PATH,
@@ -53,7 +52,6 @@ import {
 } from "./src/config.js";
 import { createAuthKey } from "./src/apikeys.js";
 import { brainLogPath, ensureBrainServer, stopBrainServer } from "./src/brain-server.js";
-import { runFunnelSetup } from "./src/funnel.js";
 import { inspectInstall, runUpdate } from "./src/update.js";
 import {
 	AGENT_TAG,
@@ -258,9 +256,7 @@ export default function (pi: ExtensionAPI) {
 			await client.health();
 			snapshot = await client.context();
 			lastError = "";
-			let where = `local server on port ${cfg.brainPort}`;
-			if (cfg.funnelUrl) where += `, public at ${cfg.funnelUrl}`;
-			status(ctx, `brain: ${where}`);
+			status(ctx, `brain: local server on port ${cfg.brainPort}`);
 			if (ctx.hasUI) ctx.ui.notify(`pi-scale-memory: brain role, using the local brain server (log: ${brainLogPath()})`, "info");
 		} catch (err) {
 			lastError = errMsg(err);
@@ -278,36 +274,7 @@ export default function (pi: ExtensionAPI) {
 		return peer.ip;
 	}
 
-	/** Agent mode without a tailnet: talk straight to the public Funnel URL. */
-	async function connectPublic(ctx: ExtensionContext, cfg: Config, url: string): Promise<void> {
-		status(ctx, "brain: public url…");
-		try {
-			const target = parseBrainUrl(url);
-			const candidate = new BrainClient({
-				host: target.host,
-				port: target.port,
-				token: cfg.brainToken ?? "",
-				agentId,
-				transport: publicTransport(),
-			});
-			await candidate.health();
-			client = candidate;
-			snapshot = await candidate.context();
-			lastError = "";
-			status(ctx, `brain: ${target.host}`);
-			if (ctx.ui && ctx.hasUI) ctx.ui.notify(`pi-scale-memory: connected to the brain at ${url}`, "info");
-		} catch (err) {
-			lastError = errMsg(err);
-			status(ctx, "brain: offline");
-			if (ctx.hasUI) ctx.ui.notify(`pi-scale-memory: ${lastError}`, "warning");
-		}
-	}
-
 	async function connectAgent(ctx: ExtensionContext, cfg: Config): Promise<void> {
-		if (cfg.brainUrl) {
-			await connectPublic(ctx, cfg, cfg.brainUrl);
-			return;
-		}
 		if (!(await tailscaleInstalled())) {
 			lastError = "tailscale/tailscaled not found in PATH";
 			if (ctx.hasUI) ctx.ui.notify("pi-scale-memory: install Tailscale (tailscale + tailscaled) first.", "error");
@@ -316,7 +283,7 @@ export default function (pi: ExtensionAPI) {
 		if (!cfg.authKey && !cfg.loginServer) {
 			lastError = "not joined yet";
 			status(ctx, "brain: not joined");
-			if (ctx.hasUI) ctx.ui.notify("pi-scale-memory: run /join-tailnet-agent to join a tailnet or use a public brain URL.", "warning");
+			if (ctx.hasUI) ctx.ui.notify("pi-scale-memory: run /join-tailnet-agent to join the tailnet.", "warning");
 			return;
 		}
 		status(ctx, "brain: joining tailnet…");
@@ -625,25 +592,6 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	// --- /setup-funnel (brain only) ---
-	pi.registerCommand("setup-funnel", {
-		description: "Brain only: publish the memory API through Tailscale Funnel and print its URL",
-		handler: async (_args, ctx) => {
-			const cfg = loadConfig(false);
-			if (cfg.role !== "brain") {
-				ctx.ui.notify("Only a brain publishes a funnel. Run /self-tag brain first.", "error");
-				return;
-			}
-			if (!ctx.hasUI) {
-				ctx.ui.notify("Interactive setup requires the terminal UI.", "error");
-				return;
-			}
-			await runFunnelSetup(uiFrom(ctx), EXT_DIR, cfg);
-			await disconnect();
-			await connect(ctx);
-		},
-	});
-
 	// --- joining helpers (shared by the two role-specific join commands) ---
 
 	async function askPreauthKey(ctx: ExtensionContext, tag: string): Promise<string | null> {
@@ -662,7 +610,7 @@ export default function (pi: ExtensionAPI) {
 	async function joinAsAgent(ctx: ExtensionContext): Promise<void> {
 		const key = await askPreauthKey(ctx, AGENT_TAG);
 		if (!key) return;
-		updateConfig({ role: "agent", authKey: key, brainUrl: undefined });
+		updateConfig({ role: "agent", authKey: key });
 		ctx.ui.notify(`Saved. Joining the tailnet as ${AGENT_TAG}…`, "info");
 		await disconnect();
 		await connect(ctx);
@@ -674,39 +622,9 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 		ctx.ui.notify(
-			`Joined the tailnet, but no online device tagged ${BRAIN_TAG} was found. Publish the brain with /setup-funnel (or tag a machine ${BRAIN_TAG}), then run /brain reconnect.`,
+			`Joined the tailnet, but no online device tagged ${BRAIN_TAG} was found. Run /join-tailnet-brain on the machine that will host the memory, then /brain reconnect here.`,
 			"warning",
 		);
-	}
-
-	/** Agent device without a tailnet: talk straight to the public Funnel URL. */
-	async function joinAsPublicAgent(ctx: ExtensionContext): Promise<void> {
-		const stored = loadConfig(false);
-		const answer = await ctx.ui.input("Brain URL", stored.brainUrl ?? stored.funnelUrl ?? "https://brain.tailnet.ts.net");
-		if (!answer?.trim()) return;
-		let target: { host: string; port: number };
-		try {
-			target = parseBrainUrl(answer.trim());
-		} catch (err) {
-			ctx.ui.notify(errMsg(err), "error");
-			return;
-		}
-		let token = stored.brainToken ?? "";
-		if (!token) {
-			const entered = await ctx.ui.input("Brain token", "printed by /setup-funnel on the brain");
-			if (!entered?.trim()) return;
-			token = entered.trim();
-		}
-		updateConfig({
-			role: "agent",
-			brainUrl: answer.trim().replace(/\/+$/, ""),
-			brainToken: token,
-			authKey: undefined,
-			loginServer: undefined,
-		});
-		ctx.ui.notify(`Saved. Connecting to ${target.host}:${target.port}…`, "info");
-		await disconnect();
-		await connect(ctx);
 	}
 
 	/** Brain device: the machine's own tailscale, tag:brain, hosting the memory. */
@@ -748,14 +666,14 @@ export default function (pi: ExtensionAPI) {
 			else ctx.ui.notify(`Joined the tailnet as ${BRAIN_TAG}.`, "info");
 		}
 
-		updateConfig({ role: "brain", authKey: undefined, brainUrl: undefined });
+		updateConfig({ role: "brain", authKey: undefined });
 		await disconnect();
 		await connect(ctx);
 		ctx.ui.notify(
 			[
-				"This machine is the brain.",
-				"Next: /setup-funnel to give its memory API a public URL (and a token),",
-				"then /generate-preauth for keys the agents can join with.",
+				"This machine is the brain and its memory API is on the tailnet.",
+				"Next: /generate-preauth for keys the agents can join with,",
+				`and make sure the ACL lets ${AGENT_TAG} reach ${BRAIN_TAG}:8787.`,
 			].join("\n"),
 			"info",
 		);
@@ -763,17 +681,8 @@ export default function (pi: ExtensionAPI) {
 
 	// --- /join-tailnet-agent ---
 	pi.registerCommand("join-tailnet-agent", {
-		description: "Join the tailnet as a tag:agent device, or point at a public brain URL",
+		description: `Join the tailnet as a ${AGENT_TAG} device with a pre-auth key`,
 		handler: async (_args, ctx) => {
-			const mode = await ctx.ui.select("How should this agent reach the brain?", [
-				`Join the tailnet as ${AGENT_TAG} (discover the brain by tag)`,
-				"Use a public brain URL (Funnel)",
-			]);
-			if (!mode) return;
-			if (mode.startsWith("Use a public")) {
-				await joinAsPublicAgent(ctx);
-				return;
-			}
 			await joinAsAgent(ctx);
 		},
 	});
