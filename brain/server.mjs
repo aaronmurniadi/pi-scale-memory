@@ -2,9 +2,9 @@
 /**
  * pi-scale-memory brain server.
  *
- * Run this on the machine tagged `tag:brain`. Agents find it through the tailnet
- * tag and talk to this HTTP API; each agent also mirrors the memory files into a
- * local cache so it can keep reading while offline.
+ * Run this on the machine that hosts the memory. Agents find it by asking peers on
+ * the memory port whether they are the brain, and mirror the memory files into a
+ * local cache so they can keep reading while offline.
  *
  * Storage layout (see brain/memory.mjs): MEMORY.md, SCRATCHPAD.md, daily/*.md
  *

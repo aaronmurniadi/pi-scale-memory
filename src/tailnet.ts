@@ -15,9 +15,6 @@ import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 
-export const AGENT_TAG = "tag:agent";
-export const BRAIN_TAG = "tag:brain";
-
 export interface RunResult {
 	ok: boolean;
 	code: number | null;
@@ -106,7 +103,6 @@ export interface BrainPeer {
 	name: string;
 	ip: string;
 	online: boolean;
-	tags: string[];
 }
 
 /** Every peer in the netmap, from a `tailscale status --json` payload. */
@@ -133,10 +129,31 @@ export function parsePeers(raw: string): BrainPeer[] {
 			name: String(peer?.HostName ?? peer?.DNSName ?? ip),
 			ip,
 			online: peer?.Online === true,
-			tags: Array.isArray(peer?.Tags) ? peer.Tags.map(String) : [],
 		});
 	}
 	return peers;
+}
+
+/**
+ * Joining arguments for an agent's node.
+ *
+ * No `--advertise-tags`: the agent does not need a tag to be discovered, since
+ * the brain identifies itself when asked. Advertising one would make the join
+ * depend on tagOwners and on what the key may apply, which is exactly the
+ * dependency this design avoids. A key that carries its own tags still applies
+ * them, because that needs no permission of its own.
+ */
+export function agentUpArgs(hostname: string, authKey: string, loginServer?: string): string[] {
+	const args = [
+		"up",
+		`--auth-key=${authKey}`,
+		`--hostname=${hostname}`,
+		"--accept-dns=false",
+		"--accept-routes=false",
+		"--timeout=60s",
+	];
+	if (loginServer) args.push(`--login-server=${loginServer}`);
+	return args;
 }
 
 export interface TailnetStartOptions {
@@ -185,17 +202,7 @@ export class UserspaceTailnet {
 			throw new Error("tailscaled socket did not appear");
 		}
 
-		const args = [
-			`--socket=${this.socket}`,
-			"up",
-			`--auth-key=${opts.authKey}`,
-			`--hostname=${this.hostname}`,
-			`--advertise-tags=${AGENT_TAG}`,
-			"--accept-dns=false",
-			"--accept-routes=false",
-			"--timeout=60s",
-		];
-		if (opts.loginServer) args.push(`--login-server=${opts.loginServer}`);
+		const args = [`--socket=${this.socket}`, ...agentUpArgs(this.hostname, opts.authKey, opts.loginServer)];
 		const up = await run("tailscale", args, { timeoutMs: 90000 });
 		if (!up.ok) {
 			await this.stop();

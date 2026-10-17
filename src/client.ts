@@ -135,7 +135,7 @@ export class BrainClient {
 		if (this.host) return this.host;
 		if (!this.opts.resolveHost) throw new Error("brain host is not set");
 		const host = await this.opts.resolveHost();
-		if (!host) throw new Error("brain not found on tailnet (tag:brain)");
+		if (!host) throw new Error("no peer answered as the brain");
 		this.host = host;
 		return host;
 	}

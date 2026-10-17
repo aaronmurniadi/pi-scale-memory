@@ -22,7 +22,7 @@ import {
 	syncCache,
 } from "../src/cache.js";
 import { BrainClient, localTransport } from "../src/client.js";
-import { parsePeers, run, tailscaleInstalled } from "../src/tailnet.js";
+import { agentUpArgs, parsePeers, run, tailscaleInstalled } from "../src/tailnet.js";
 import {
 	clampLimit,
 	normalizeHits,
@@ -38,8 +38,8 @@ import {
 	brainNodeHostname,
 	parseNodeStatus,
 	serveArgs,
-	tagPermissionHelp,
 	tagRejected,
+	tagRejectedHelp,
 	upArgs,
 } from "../src/tailnet-node.js";
 import { findBrain, isBrainResponse, rankCandidates } from "../src/discovery.js";
@@ -166,9 +166,9 @@ check("peers are read without relying on tags", () => {
 	});
 	const peers = parsePeers(raw);
 	assert.equal(peers.length, 3, "peers without an address are skipped");
-	assert.deepEqual(peers[0], { name: "brain-1", ip: "100.64.0.5", online: true, tags: ["tag:brain"] });
+	assert.deepEqual(peers[0], { name: "brain-1", ip: "100.64.0.5", online: true });
 	assert.equal(peers[1].ip, "100.64.0.6", "the IPv4 address is preferred");
-	assert.deepEqual(peers[1].tags, [], "a peer without tags is still a candidate");
+	assert.equal(peers[1].online, true);
 	assert.equal(peers[2].online, false);
 	assert.deepEqual(parsePeers("not json"), []);
 	assert.deepEqual(parsePeers("{}"), []);
@@ -184,26 +184,27 @@ check("only this extension's brain is accepted", () => {
 	assert.equal(isBrainResponse(200, "not json"), false);
 	assert.equal(isBrainResponse(200, ""), false);
 });
-check("candidates are ranked tag-hint first, then online", () => {
+check("candidates are ranked online first, tags play no part", () => {
 	const peers: BrainPeer[] = [
-		{ name: "offline-plain", ip: "1", online: false, tags: [] },
-		{ name: "online-plain", ip: "2", online: true, tags: [] },
-		{ name: "offline-tagged", ip: "3", online: false, tags: ["tag:brain"] },
-		{ name: "online-tagged", ip: "4", online: true, tags: ["tag:brain"] },
+		{ name: "offline-plain", ip: "1", online: false },
+		{ name: "online-b", ip: "2", online: true },
+		{ name: "offline-tagged", ip: "3", online: false },
+		{ name: "online-a", ip: "4", online: true },
 	];
 	assert.deepEqual(rankCandidates(peers).map((p) => p.name), [
-		"online-tagged",
-		"offline-tagged",
-		"online-plain",
+		"online-a",
+		"online-b",
 		"offline-plain",
+		"offline-tagged",
 	]);
 	assert.deepEqual(rankCandidates([]), []);
+	assert.deepEqual(rankCandidates(structuredClone(peers)).map((p) => p.name), rankCandidates(peers).map((p) => p.name));
 });
 await checkAsync("every peer is asked, and the answering one wins", async () => {
 	const peers: BrainPeer[] = [
-		{ name: "a", ip: "10.0.0.1", online: true, tags: [] },
-		{ name: "b", ip: "10.0.0.2", online: true, tags: [] },
-		{ name: "c", ip: "10.0.0.3", online: true, tags: [] },
+		{ name: "a", ip: "10.0.0.1", online: true },
+		{ name: "b", ip: "10.0.0.2", online: true },
+		{ name: "c", ip: "10.0.0.3", online: true },
 	];
 	const asked: string[] = [];
 	const found = await findBrain(peers, async (host) => {
@@ -217,8 +218,8 @@ await checkAsync("every peer is asked, and the answering one wins", async () => 
 });
 await checkAsync("no responder, and several responders, are both reported", async () => {
 	const peers: BrainPeer[] = [
-		{ name: "a", ip: "10.0.0.1", online: true, tags: [] },
-		{ name: "b", ip: "10.0.0.2", online: true, tags: [] },
+		{ name: "a", ip: "10.0.0.1", online: true },
+		{ name: "b", ip: "10.0.0.2", online: true },
 	];
 	const none = await findBrain(peers, async () => false);
 	assert.equal(none.host, null);
@@ -230,7 +231,7 @@ await checkAsync("no responder, and several responders, are both reported", asyn
 	assert.equal(both.host, "10.0.0.1");
 });
 await checkAsync("a pinned host is tried first and falls back to the scan", async () => {
-	const peers: BrainPeer[] = [{ name: "a", ip: "10.0.0.1", online: true, tags: [] }];
+	const peers: BrainPeer[] = [{ name: "a", ip: "10.0.0.1", online: true }];
 	const asked: string[] = [];
 	const pinned = await findBrain(
 		peers,
@@ -258,8 +259,8 @@ await checkAsync("a pinned host is tried first and falls back to the scan", asyn
 });
 await checkAsync("a peer that throws does not sink the search", async () => {
 	const peers: BrainPeer[] = [
-		{ name: "broken", ip: "10.0.0.1", online: true, tags: [] },
-		{ name: "good", ip: "10.0.0.2", online: true, tags: [] },
+		{ name: "broken", ip: "10.0.0.1", online: true },
+		{ name: "good", ip: "10.0.0.2", online: true },
 	];
 	const found = await findBrain(peers, async (host) => {
 		if (host === "10.0.0.1") return false;
@@ -267,42 +268,38 @@ await checkAsync("a peer that throws does not sink the search", async () => {
 	});
 	assert.equal(found.host, "10.0.0.2");
 });
-check("the first join attempt lets the key's own tags apply", () => {
-	const plain = upArgs("tskey-auth-x", "pi-brain-mac");
-	assert.equal(plain[0], "up");
-	assert.ok(plain.includes("--auth-key=tskey-auth-x"));
-	assert.ok(plain.includes("--hostname=pi-brain-mac"));
-	assert.ok(plain.includes("--accept-dns=false"), "the host's DNS must not be touched");
-	assert.ok(plain.includes("--accept-routes=false"));
-	assert.ok(
-		!plain.includes("--advertise-tags=tag:brain"),
-		"a key that already carries the tag must not need tagOwners",
-	);
+check("no join path advertises a tag", () => {
+	const brain = upArgs("tskey-auth-x", "pi-brain-mac");
+	assert.equal(brain[0], "up");
+	assert.ok(brain.includes("--auth-key=tskey-auth-x"));
+	assert.ok(brain.includes("--hostname=pi-brain-mac"));
+	assert.ok(brain.includes("--accept-dns=false"), "the host's DNS must not be touched");
+	assert.ok(brain.includes("--accept-routes=false"));
+	assert.ok(!brain.some((a: string) => a.startsWith("--advertise-tags")), "the brain must not ask for a tag");
 
-	const advertised = upArgs("tskey-auth-x", "pi-brain-mac", true);
-	assert.ok(advertised.includes("--advertise-tags=tag:brain"), "the fallback advertises it");
-	assert.equal(advertised.filter((a: string) => a.startsWith("--advertise-tags=")).length, 1);
+	const agent = agentUpArgs("pi-agent-mac-abc123", "tskey-auth-y");
+	assert.equal(agent[0], "up");
+	assert.ok(agent.includes("--auth-key=tskey-auth-y"));
+	assert.ok(agent.includes("--hostname=pi-agent-mac-abc123"));
+	assert.ok(!agent.some((a: string) => a.startsWith("--advertise-tags")), "the agent must not ask for a tag");
+
+	const withServer = agentUpArgs("pi-agent-mac", "tskey-auth-y", "https://headscale.example.com");
+	assert.ok(withServer.includes("--login-server=https://headscale.example.com"));
+	assert.ok(!agentUpArgs("pi-agent-mac", "k").some((a: string) => a.startsWith("--login-server")), "no login server by default");
 });
 check("a rejected tag is recognised and explained", () => {
-	// The exact message a key without the tag produces.
+	// The exact message a key carrying a tag the tailnet will not accept produces.
 	assert.equal(tagRejected("backend error: requested tag [tag:brain] are invalid or not permitted"), true);
 	assert.equal(tagRejected("requested tags [tag:a tag:b] are invalid or not permitted"), true);
 	assert.equal(tagRejected("Failed to connect to local tailscaled"), false);
 
-	const help = tagPermissionHelp("tag:brain", ["tag:agent"]);
-	assert.match(help, /authenticated with: tag:agent/, "it should name the tags the key actually applied");
-	assert.match(help, /"tag:brain": \["tag:agent"\]/, "and offer ownership by those tags");
-	assert.match(help, /no other tag/, "the simplest fix is a key carrying only the wanted tag");
-	assert.match(help, /refused tag:brain/);
-	assert.match(help, /tagOwners/, "declaring the tag is the primary fix");
+	const help = tagRejectedHelp(["tag:agent"]);
+	assert.match(help, /does not use tags/, "it should say this extension needs no tags");
+	assert.match(help, /key with no tags/, "the simplest fix is a key carrying no tag");
+	assert.match(help, /applied: tag:agent/, "it should name the tags the key carried");
+	assert.match(help, /tagOwners/, "the alternative is permitting the tag");
 	assert.match(help, /admin console/, "it should say where to do it");
-	assert.match(help, /"tagOwners"/);
-	assert.match(help, /Access controls/);
-
-	// Without observed tags the advice falls back to declaring the tag for members.
-	const bare = tagPermissionHelp("tag:brain");
-	assert.match(bare, /"tag:brain": \["autogroup:member"\]/);
-	assert.ok(!bare.includes("authenticated with"));
+	assert.ok(!tagRejectedHelp().includes("applied:"), "nothing observed, nothing claimed");
 });
 check("serve publishes the memory port to the tailnet over loopback", () => {
 	assert.deepEqual(serveArgs(8787), ["serve", "--bg", "--tcp=8787", "tcp://127.0.0.1:8787"]);

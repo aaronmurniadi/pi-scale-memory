@@ -9,7 +9,7 @@ export interface Config {
 	role?: Role;
 	/** Tailscale login server override. Empty = the Tailscale control plane. */
 	loginServer?: string;
-	/** Tagged (tag:agent) pre-auth key used to join the tailnet. */
+	/** Pre-auth key used to join the tailnet. Tags are not required. */
 	authKey?: string;
 	brainPort: number;
 	/** Optional bearer token, must match BRAIN_TOKEN on the brain server. */

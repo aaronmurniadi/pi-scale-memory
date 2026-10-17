@@ -2,17 +2,17 @@
  * pi-scale-memory — one shared memory for many pi agents, over Tailscale.
  *
  * Roles (/self-tag):
- *   brain — runs the memory server and is tagged tag:brain, so agents reach it at
- *           its tailnet address.
+ *   brain — runs the memory server on its own tailnet node and publishes it with
+ *           `tailscale serve`.
  *   agent — uses its own userspace tailscaled (no TUN device, no route changes,
  *           SOCKS5 proxy only) so joining the tailnet leaves the machine's system
- *           Tailscale alone. It discovers the brain by tag and mirrors the memory
- *           for offline reads.
+ *           Tailscale alone. It asks each peer which one is the brain, and mirrors
+ *           the memory for offline reads.
  *
  * Commands:
  *   /self-tag               — set this pi agent's role (brain or agent)
- *   /join-tailnet-brain     — join this machine as the tag:brain device
- *   /join-tailnet-agent     — join this machine as a tag:agent device
+ *   /join-tailnet-brain     — join this machine and host the memory here
+ *   /join-tailnet-agent     — join this machine as an agent
  *   /brain                  — status | sync | reindex | reconnect | reset
  *   /update-pi-scale-memory — update the extension itself, then reload
  */
@@ -51,7 +51,7 @@ import {
 } from "./src/config.js";
 import { brainLogPath, ensureBrainServer, stopBrainServer } from "./src/brain-server.js";
 import { inspectInstall, runUpdate } from "./src/update.js";
-import { AGENT_TAG, BRAIN_TAG, tailscaleInstalled, UserspaceTailnet } from "./src/tailnet.js";
+import { tailscaleInstalled, UserspaceTailnet } from "./src/tailnet.js";
 import { findBrain, isBrainResponse } from "./src/discovery.js";
 import { brainNodePaths, brainNodeRunning, ensureBrainNode, nodeStatus, stopBrainNode } from "./src/tailnet-node.js";
 import type { Ui } from "./src/ui.js";
@@ -624,36 +624,36 @@ export default function (pi: ExtensionAPI) {
 			await connect(ctx);
 			if (role === "brain") {
 				ctx.ui.notify(
-					"This pi agent is the brain: memory is served locally. Next: /join-tailnet-brain, then create a tag:agent key in the Tailscale admin console for the agents.",
+					"This pi agent is the brain: memory is served locally. Next: /join-tailnet-brain, then create a reusable pre-auth key in the Tailscale admin console for the agents.",
 					"info",
 				);
 				return;
 			}
-			ctx.ui.notify("This pi agent is an agent: memory comes from the machine tagged tag:brain. Next: /join-tailnet-agent.", "info");
+			ctx.ui.notify("This pi agent is an agent: it asks the tailnet which peer is the brain. Next: /join-tailnet-agent.", "info");
 			if (current === "brain") ctx.ui.notify("Note: the local brain server keeps running if you started it.", "info");
 		},
 	});
 
 	// --- joining helpers (shared by the two role-specific join commands) ---
 
-	async function askPreauthKey(ctx: ExtensionContext, tag: string): Promise<string | null> {
+	async function askPreauthKey(ctx: ExtensionContext, forWhom: string): Promise<string | null> {
 		const stored = loadConfig(false).authKey;
 		if (stored) {
-			const source = await ctx.ui.select(`Pre-auth key for ${tag}`, ["Use the stored key", "Enter a new key"]);
+			const source = await ctx.ui.select(`Pre-auth key for ${forWhom}`, ["Use the stored key", "Enter a new key"]);
 			if (!source) return null;
 			if (source.startsWith("Use the stored")) return stored;
 		}
 		const entered = await ctx.ui.input(
-			`Pre-auth key for ${tag} (create it in the Tailscale admin console with that tag selected)`,
+			`Pre-auth key for ${forWhom} (create one in the Tailscale admin console; tags optional)`,
 			"tskey-auth-...",
 		);
 		if (!entered?.trim()) return null;
 		return entered.trim();
 	}
 
-	/** Agent device: userspace tailscaled, tag:agent, then find the brain by tag. */
+	/** Agent device: userspace tailscaled, then ask the tailnet which peer is the brain. */
 	async function joinAsAgent(ctx: ExtensionContext): Promise<void> {
-		const key = await askPreauthKey(ctx, AGENT_TAG);
+		const key = await askPreauthKey(ctx, "this agent");
 		if (!key) return;
 		const cfg = updateConfig({ role: "agent", authKey: key });
 		ctx.ui.notify("Saved. Joining the tailnet and looking for the brain…", "info");
@@ -672,20 +672,19 @@ export default function (pi: ExtensionAPI) {
 		);
 	}
 
-	/** Brain device: our own userspace tailscaled, tag:brain, hosting the memory. */
+	/** Brain device: our own userspace tailscaled, hosting the memory. */
 	async function joinAsBrain(ctx: ExtensionContext): Promise<void> {
 		if (!(await tailscaleInstalled())) {
 			ctx.ui.notify("Tailscale is required (tailscale + tailscaled on PATH).", "error");
 			return;
 		}
 		const cfg = loadConfig(false);
-		let status = await nodeStatus();
-		let alreadyTagged = false;
-		if (status) alreadyTagged = status.tags.includes(BRAIN_TAG);
-
-		if (alreadyTagged) {
+		const status = await nodeStatus();
+		if (status && status.backendState === "Running") {
+			let tags = "no tags";
+			if (status.tags.length > 0) tags = `tags: ${status.tags.join(", ")}`;
 			ctx.ui.notify(
-				`This brain already has its own tailnet node (${status?.hostname || "?"} at ${status?.ip || status?.dnsName || "?"}).`,
+				`This brain already has its own tailnet node (${status.hostname || "?"} at ${status.ip || status.dnsName || "?"}, ${tags}).`,
 				"info",
 			);
 		}
@@ -697,7 +696,7 @@ export default function (pi: ExtensionAPI) {
 			"info",
 		);
 
-		const key = await askPreauthKey(ctx, BRAIN_TAG);
+		const key = await askPreauthKey(ctx, "this brain");
 		if (!key) return;
 
 		const node = await ensureBrainNode({
@@ -718,8 +717,8 @@ export default function (pi: ExtensionAPI) {
 				`This machine is the brain, reachable on the tailnet as ${node.detail}.`,
 				`The memory API is published to the tailnet on port ${cfg.brainPort} (proxied to 127.0.0.1).`,
 				"",
-				`Next: create a ${AGENT_TAG} pre-auth key in the Tailscale admin console for the agents,`,
-				`and make sure the ACL lets ${AGENT_TAG} reach ${BRAIN_TAG}:${cfg.brainPort}.`,
+				"Next: create a reusable pre-auth key in the Tailscale admin console for the agents,",
+				`and make sure the ACL lets them reach this brain on port ${cfg.brainPort}.`,
 			].join("\n"),
 			"info",
 		);
@@ -727,7 +726,7 @@ export default function (pi: ExtensionAPI) {
 
 	// --- /join-tailnet-agent ---
 	pi.registerCommand("join-tailnet-agent", {
-		description: `Join the tailnet as a ${AGENT_TAG} device with a pre-auth key`,
+		description: "Join the tailnet as an agent device with a pre-auth key",
 		handler: async (_args, ctx) => {
 			await joinAsAgent(ctx);
 		},
@@ -735,7 +734,7 @@ export default function (pi: ExtensionAPI) {
 
 	// --- /join-tailnet-brain ---
 	pi.registerCommand("join-tailnet-brain", {
-		description: "Join the tailnet as the tag:brain device that hosts the memory",
+		description: "Join the tailnet on this machine and host the memory",
 		handler: async (_args, ctx) => {
 			await joinAsBrain(ctx);
 		},

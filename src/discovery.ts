@@ -6,10 +6,9 @@
  * whether it is a brain. The brain identifies itself in its own /v1/health
  * response, which is a positive answer instead of an inference from a tag.
  *
- * Tags are still useful as a *hint*: a peer carrying tag:brain is probed first,
- * so a tailnet that does use tags resolves in one request.
+ * No tags are involved at any point.
  */
-import { BRAIN_TAG, type BrainPeer } from "./tailnet.js";
+import type { BrainPeer } from "./tailnet.js";
 
 export const BRAIN_SERVICE = "pi-scale-memory";
 
@@ -26,18 +25,16 @@ export function isBrainResponse(status: number, body: string): boolean {
 }
 
 /**
- * Probe order: peers carrying the tag first, then online peers, then the rest.
- * Offline peers are still tried last rather than dropped, because the netmap's
- * online flag can lag behind reality.
+ * Probe order: online peers first, then the rest. Offline peers are tried last
+ * rather than dropped, because the netmap's online flag lags behind reality.
+ * Names break ties so the order is stable between runs.
  */
 export function rankCandidates(peers: BrainPeer[]): BrainPeer[] {
-	const score = (peer: BrainPeer): number => {
-		let value = 0;
-		if (peer.tags.includes(BRAIN_TAG)) value += 4;
-		if (peer.online) value += 2;
-		return value;
-	};
-	return [...peers].sort((a, b) => score(b) - score(a));
+	return [...peers].sort((a, b) => {
+		const byOnline = Number(b.online) - Number(a.online);
+		if (byOnline !== 0) return byOnline;
+		return a.name.localeCompare(b.name);
+	});
 }
 
 async function mapWithLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
