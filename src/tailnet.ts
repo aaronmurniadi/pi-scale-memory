@@ -1,3 +1,13 @@
+/**
+ * Tailscale plumbing.
+ *
+ * Two distinct roles use this module:
+ *   - the brain joins the tailnet with the **system** tailscale and publishes its
+ *     memory API through Funnel (see src/funnel.ts);
+ *   - agents each run a private **userspace** tailscaled (no TUN device, no route
+ *     changes, SOCKS5 proxy only) so joining a tailnet never disturbs the
+ *     machine's own system tailscale.
+ */
 import { type ChildProcess, execFile, spawn } from "node:child_process";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
@@ -7,27 +17,72 @@ import * as path from "node:path";
 
 export const AGENT_TAG = "tag:agent";
 export const BRAIN_TAG = "tag:brain";
+/** Funnel only serves names in the tailnet's own *.ts.net domain. */
+export const FUNNEL_DNS_SUFFIX = ".ts.net";
+export const FUNNEL_PORTS = [443, 8443, 10000];
 
-export interface BrainPeer {
-	name: string;
-	ip: string;
-	online: boolean;
+export interface RunResult {
+	ok: boolean;
+	code: number | null;
+	stdout: string;
+	stderr: string;
+	missing: boolean;
 }
 
-function run(file: string, args: string[], timeoutMs = 30000): Promise<{ ok: boolean; stdout: string; stderr: string }> {
+export interface RunOptions {
+	timeoutMs?: number;
+	sudo?: boolean;
+}
+
+function exitCodeOf(err: NodeJS.ErrnoException | null): { code: number | null; missing: boolean } {
+	if (!err) return { code: 0, missing: false };
+	const raw = err.code;
+	if (typeof raw === "number") return { code: raw, missing: false };
+	if (raw === "ENOENT") return { code: 127, missing: true };
+	return { code: null, missing: false };
+}
+
+export function run(file: string, args: string[], opts: RunOptions = {}): Promise<RunResult> {
+	let cmd = file;
+	let cmdArgs = args;
+	if (opts.sudo) {
+		cmd = "sudo";
+		cmdArgs = ["-n", file, ...args];
+	}
 	return new Promise((resolve) => {
-		execFile(file, args, { timeout: timeoutMs, maxBuffer: 8 * 1024 * 1024 }, (err, stdout, stderr) => {
-			resolve({ ok: !err, stdout: String(stdout), stderr: String(stderr) });
-		});
+		execFile(
+			cmd,
+			cmdArgs,
+			{ timeout: opts.timeoutMs ?? 60000, maxBuffer: 16 * 1024 * 1024 },
+			(err, stdout, stderr) => {
+				const { code, missing } = exitCodeOf(err as NodeJS.ErrnoException | null);
+				resolve({ ok: code === 0, code, stdout: String(stdout), stderr: String(stderr), missing });
+			},
+		);
 	});
 }
 
+export function failureText(r: RunResult): string {
+	const text = `${r.stderr}\n${r.stdout}`.trim();
+	if (r.missing) return "command not found";
+	if (!text) return `exited with code ${r.code}`;
+	return text.split("\n").slice(-4).join("\n");
+}
+
+/** Run the system tailscale CLI. */
+export function ts(args: string[], timeoutMs = 30000): Promise<RunResult> {
+	return run("tailscale", args, { timeoutMs });
+}
+
 export async function tailscaleInstalled(): Promise<boolean> {
-	const [cli, daemon] = await Promise.all([run("tailscale", ["version"], 5000), run("tailscaled", ["--version"], 5000)]);
+	const [cli, daemon] = await Promise.all([
+		run("tailscale", ["version"], { timeoutMs: 5000 }),
+		run("tailscaled", ["--version"], { timeoutMs: 5000 }),
+	]);
 	return cli.ok && daemon.ok;
 }
 
-function freePort(): Promise<number> {
+export function freePort(): Promise<number> {
 	return new Promise((resolve, reject) => {
 		const srv = net.createServer();
 		srv.once("error", reject);
@@ -42,7 +97,103 @@ function sleep(ms: number): Promise<void> {
 	return new Promise((r) => setTimeout(r, ms));
 }
 
+export async function waitFor(check: () => Promise<boolean>, timeoutMs: number): Promise<boolean> {
+	const deadline = Date.now() + timeoutMs;
+	for (;;) {
+		if (await check()) return true;
+		if (Date.now() > deadline) return false;
+		await sleep(250);
+	}
+}
+
+// ---------------------------------------------------------------------------
+// System node status and Funnel
+// ---------------------------------------------------------------------------
+
+export interface SystemStatus {
+	backendState: string;
+	/** MagicDNS name with the trailing dot removed, e.g. brain.tailnet.ts.net. */
+	dnsName: string;
+	hostName: string;
+	tags: string[];
+	tailnetName: string;
+}
+
+export function parseSystemStatus(raw: string): SystemStatus | null {
+	let json: any;
+	try {
+		json = JSON.parse(raw);
+	} catch {
+		return null;
+	}
+	const self = json?.Self ?? {};
+	let dns = String(self.DNSName ?? "").trim();
+	if (dns.endsWith(".")) dns = dns.slice(0, -1);
+	const tailnet = json?.CurrentTailnet ?? {};
+	return {
+		backendState: String(json?.BackendState ?? "Unknown"),
+		dnsName: dns,
+		hostName: String(self.HostName ?? ""),
+		tags: Array.isArray(self.Tags) ? self.Tags.map(String) : [],
+		tailnetName: String(tailnet.Name ?? ""),
+	};
+}
+
+export async function systemStatus(): Promise<SystemStatus | null> {
+	const r = await ts(["status", "--json"], 20000);
+	if (!r.ok && !r.stdout.trim()) return null;
+	return parseSystemStatus(r.stdout);
+}
+
+export function funnelUrl(dnsName: string, publicPort: number): string {
+	let base = dnsName.trim();
+	if (base.endsWith(".")) base = base.slice(0, -1);
+	if (publicPort === 443) return `https://${base}`;
+	return `https://${base}:${publicPort}`;
+}
+
+export function funnelDnsWarning(dnsName: string): string | null {
+	if (!dnsName) return "Tailscale reports no MagicDNS name for this device; Funnel needs one.";
+	if (dnsName.endsWith(FUNNEL_DNS_SUFFIX)) return null;
+	return `This tailnet uses the MagicDNS domain "${dnsName}", but Funnel can only serve names ending in ${FUNNEL_DNS_SUFFIX}. Use a tailnet with the standard Tailscale domain.`;
+}
+
+/** Publish a local port to the internet. `--bg` keeps it running across reboots. */
+export async function enableFunnel(localPort: number, publicPort: number): Promise<RunResult> {
+	return ts(["funnel", "--bg", `--https=${publicPort}`, String(localPort)], 120000);
+}
+
+export async function funnelStatus(): Promise<RunResult> {
+	return ts(["funnel", "status"], 20000);
+}
+
+export async function resetFunnel(): Promise<RunResult> {
+	return ts(["funnel", "reset"], 20000);
+}
+
+/** Join the system tailscale. A key that already carries tags is enough on its own. */
+export async function joinSystem(authKey: string, tags: string[] = []): Promise<RunResult> {
+	const args = ["up", `--auth-key=${authKey}`];
+	for (const tag of tags) args.push(`--advertise-tags=${tag}`);
+	let result = await ts(args, 120000);
+	if (!result.ok && /permission denied|must be root|access denied/i.test(result.stderr)) {
+		result = await run("tailscale", args, { timeoutMs: 120000, sudo: true });
+	}
+	return result;
+}
+
+// ---------------------------------------------------------------------------
+// Agent-side userspace tailscaled
+// ---------------------------------------------------------------------------
+
+export interface BrainPeer {
+	name: string;
+	ip: string;
+	online: boolean;
+}
+
 export interface TailnetStartOptions {
+	/** Empty/undefined = the Tailscale control plane. Otherwise a login server URL. */
 	loginServer?: string;
 	authKey: string;
 }
@@ -81,11 +232,10 @@ export class UserspaceTailnet {
 		);
 		this.proc.on("error", () => {});
 
-		const deadline = Date.now() + 15000;
-		while (!fs.existsSync(this.socket)) {
-			if (!this.running) throw new Error("tailscaled exited during startup");
-			if (Date.now() > deadline) throw new Error("tailscaled socket did not appear");
-			await sleep(200);
+		const appeared = await waitFor(async () => fs.existsSync(this.socket), 15000);
+		if (!appeared) {
+			await this.stop();
+			throw new Error("tailscaled socket did not appear");
 		}
 
 		const args = [
@@ -99,15 +249,15 @@ export class UserspaceTailnet {
 			"--timeout=60s",
 		];
 		if (opts.loginServer) args.push(`--login-server=${opts.loginServer}`);
-		const up = await run("tailscale", args, 70000);
+		const up = await run("tailscale", args, { timeoutMs: 90000 });
 		if (!up.ok) {
 			await this.stop();
-			throw new Error(`tailscale up failed: ${(up.stderr || up.stdout).trim().split("\n").pop()}`);
+			throw new Error(`tailscale up failed: ${failureText(up)}`);
 		}
 	}
 
 	async findBrain(): Promise<BrainPeer | null> {
-		const st = await run("tailscale", [`--socket=${this.socket}`, "status", "--json"], 15000);
+		const st = await run("tailscale", [`--socket=${this.socket}`, "status", "--json"], { timeoutMs: 15000 });
 		if (!st.ok) return null;
 		let json: any;
 		try {
@@ -120,7 +270,13 @@ export class UserspaceTailnet {
 			const tags: string[] = peer.Tags ?? [];
 			if (!tags.includes(BRAIN_TAG)) continue;
 			const ips: string[] = peer.TailscaleIPs ?? [];
-			const ip = ips.find((i) => !i.includes(":")) ?? ips[0];
+			let ip = ips[0] ?? "";
+			for (const candidate of ips) {
+				if (!candidate.includes(":")) {
+					ip = candidate;
+					break;
+				}
+			}
 			if (!ip) continue;
 			peers.push({ name: String(peer.HostName ?? peer.DNSName ?? ip), ip, online: peer.Online === true });
 		}

@@ -1,4 +1,5 @@
 import * as http from "node:http";
+import * as https from "node:https";
 import { socksHttp } from "./socks.js";
 import type { UserspaceTailnet } from "./tailnet.js";
 
@@ -56,6 +57,47 @@ export function localTransport(): BrainTransport {
 			if (req.body !== undefined) request.write(req.body);
 			request.end();
 		});
+}
+
+/** Public HTTPS transport (Funnel), with normal certificate verification. */
+export function publicTransport(): BrainTransport {
+	return (host, port, req) =>
+		new Promise((resolve, reject) => {
+			const request = https.request(
+				{
+					host,
+					port,
+					path: req.path,
+					method: req.method,
+					headers: req.headers,
+					servername: host,
+					timeout: 20000,
+				},
+				(res) => {
+					const chunks: Buffer[] = [];
+					res.on("data", (c) => chunks.push(c));
+					res.on("end", () => resolve({ status: res.statusCode ?? 0, body: Buffer.concat(chunks).toString("utf-8") }));
+				},
+			);
+			request.on("timeout", () => request.destroy(new Error("request timed out")));
+			request.on("error", reject);
+			if (req.body !== undefined) request.write(req.body);
+			request.end();
+		});
+}
+
+export interface BrainTarget {
+	host: string;
+	port: number;
+}
+
+/** Split a public brain URL into the host and port the transport needs. */
+export function parseBrainUrl(url: string): BrainTarget {
+	const parsed = new URL(url.trim());
+	if (parsed.protocol !== "https:") throw new Error("the brain URL must start with https:// (Funnel serves TLS only)");
+	let port = 443;
+	if (parsed.port) port = Number(parsed.port);
+	return { host: parsed.hostname, port };
 }
 
 export function tailnetTransport(tailnet: UserspaceTailnet): BrainTransport {

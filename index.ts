@@ -1,18 +1,21 @@
 /**
- * pi-scale-memory — shared remote memory for pi agents over a private tailnet.
+ * pi-scale-memory — one shared memory for many pi agents, over Tailscale.
  *
  * Roles (/self-tag):
- *   agent — runs its own userspace tailscaled (no TUN device, no route changes,
- *           SOCKS5 proxy only), joins the tailnet as tag:agent, finds the machine
- *           tagged tag:brain and reads/writes memory there.
- *   brain — hosts the memory. Talks to the local brain server on loopback and
- *           (with /setup-headscale) can host Headscale for the tailnet.
+ *   brain — runs the memory server on loopback, is tagged tag:brain, and publishes
+ *           it to the internet with Tailscale Funnel (/setup-funnel).
+ *   agent — uses its own userspace tailscaled (no TUN device, no route changes,
+ *           SOCKS5 proxy only) so joining a tailnet leaves the machine's system
+ *           Tailscale alone. It either discovers the brain by tag or talks to the
+ *           public Funnel URL, and mirrors the memory for offline reads.
  *
  * Commands:
- *   /self-tag          — set this pi agent's role (brain or agent)
- *   /join-tailnet      — choose Tailscale or Headscale and join with a pre-auth key
- *   /setup-headscale   — brain only: install and configure Headscale end to end
- *   /generate-preauth  — brain only: mint a tag:agent pre-auth key for other machines
+ *   /self-tag               — set this pi agent's role (brain or agent)
+ *   /setup-funnel           — brain only: token, join, publish, print the URL
+ *   /generate-preauth       — brain only: mint a tag:agent key via the Tailscale API
+ *   /join-tailnet           — agent: join the tailnet, or point at a public brain URL
+ *   /brain                  — status | sync | reindex | reconnect | reset
+ *   /update-pi-scale-memory — update the extension itself, then reload
  */
 import { spawn } from "node:child_process";
 import * as fs from "node:fs";
@@ -36,7 +39,7 @@ import {
 	searchWithFallback,
 	syncCache,
 } from "./src/cache.js";
-import { BrainClient, localTransport, tailnetTransport } from "./src/client.js";
+import { BrainClient, localTransport, parseBrainUrl, publicTransport, tailnetTransport } from "./src/client.js";
 import {
 	CONFIG_DIR,
 	CONFIG_PATH,
@@ -47,8 +50,11 @@ import {
 	saveConfig,
 	updateConfig,
 } from "./src/config.js";
-import { generateAgentKey, runHeadscaleSetup } from "./src/setup.js";
-import { tailscaleInstalled, UserspaceTailnet, type BrainPeer } from "./src/tailnet.js";
+import { createAuthKey } from "./src/apikeys.js";
+import { brainLogPath, ensureBrainServer, stopBrainServer } from "./src/brain-server.js";
+import { runFunnelSetup } from "./src/funnel.js";
+import { inspectInstall, runUpdate } from "./src/update.js";
+import { AGENT_TAG, tailscaleInstalled, UserspaceTailnet, type BrainPeer } from "./src/tailnet.js";
 import type { Ui } from "./src/ui.js";
 
 const FLUSH_INTERVAL_MS = 30_000;
@@ -65,6 +71,22 @@ const EXT_DIR = path.dirname(fileURLToPath(import.meta.url));
 function errMsg(e: unknown): string {
 	if (e instanceof Error) return e.message;
 	return String(e);
+}
+
+/** "90d" / "24h" / "30m" / "45s" -> seconds. Bare numbers are seconds. */
+export function parseDurationSeconds(text: string): number | null {
+	const match = text.trim().match(/^(\d+)\s*([smhdw])?$/i);
+	if (!match) return null;
+	const value = Number(match[1]);
+	if (!Number.isFinite(value) || value <= 0) return null;
+	let unit = "s";
+	if (match[2]) unit = match[2].toLowerCase();
+	let factor = 1;
+	if (unit === "m") factor = 60;
+	else if (unit === "h") factor = 3600;
+	else if (unit === "d") factor = 86400;
+	else if (unit === "w") factor = 604800;
+	return value * factor;
 }
 
 function mark(done: boolean): string {
@@ -201,50 +223,19 @@ export default function (pi: ExtensionAPI) {
 		return ctx.sessionManager.getSessionId().slice(0, 8);
 	}
 
-	// --- brain role: make sure the local memory server is up, then use loopback ---
-
-	async function brainHealthy(port: number): Promise<boolean> {
-		try {
-			const res = await localTransport()("127.0.0.1", port, { method: "GET", path: "/v1/health", headers: {} });
-			return res.status === 200;
-		} catch {
-			return false;
-		}
-	}
-
-	async function ensureLocalBrain(ctx: ExtensionContext, cfg: Config): Promise<boolean> {
-		if (await brainHealthy(cfg.brainPort)) return true;
-		const server = path.join(EXT_DIR, "brain", "server.mjs");
-		if (!fs.existsSync(server)) {
-			lastError = `brain server not found at ${server}`;
-			return false;
-		}
-		if (!localBrainStarted) {
-			localBrainStarted = true;
-			fs.mkdirSync(CONFIG_DIR, { recursive: true });
-			const logPath = path.join(CONFIG_DIR, "brain.log");
-			const out = fs.openSync(logPath, "a");
-			const child = spawn(process.execPath, [server], {
-				detached: true,
-				stdio: ["ignore", out, out],
-				env: { ...process.env, BRAIN_PORT: String(cfg.brainPort) },
-			});
-			child.unref();
-			if (ctx.hasUI) ctx.ui.notify(`Starting the brain server (log: ${logPath})`, "info");
-		}
-		const deadline = Date.now() + 8000;
-		while (Date.now() < deadline) {
-			if (await brainHealthy(cfg.brainPort)) return true;
-			await new Promise((r) => setTimeout(r, 400));
-		}
-		lastError = `nothing is answering on 127.0.0.1:${cfg.brainPort}`;
-		return false;
-	}
+	// --- brain role: the local memory server on loopback ---
 
 	async function connectLocal(ctx: ExtensionContext, cfg: Config): Promise<void> {
 		status(ctx, "brain: local");
 		try {
-			if (!(await ensureLocalBrain(ctx, cfg))) throw new Error(lastError);
+			const server = await ensureBrainServer(
+				EXT_DIR,
+				{ port: cfg.brainPort, token: cfg.brainToken ?? "" },
+				(message) => {
+					if (ctx.hasUI) ctx.ui.notify(message, "info");
+				},
+			);
+			if (!server.ok) throw new Error(server.detail);
 			client = new BrainClient({
 				host: "127.0.0.1",
 				port: cfg.brainPort,
@@ -255,8 +246,10 @@ export default function (pi: ExtensionAPI) {
 			await client.health();
 			snapshot = await client.context();
 			lastError = "";
-			status(ctx, "brain: local server");
-			if (ctx.hasUI) ctx.ui.notify(`pi-scale-memory: brain role, using the local brain server on port ${cfg.brainPort}`, "info");
+			let where = `local server on port ${cfg.brainPort}`;
+			if (cfg.funnelUrl) where += `, public at ${cfg.funnelUrl}`;
+			status(ctx, `brain: ${where}`);
+			if (ctx.hasUI) ctx.ui.notify(`pi-scale-memory: brain role, using the local brain server (log: ${brainLogPath()})`, "info");
 		} catch (err) {
 			lastError = errMsg(err);
 			status(ctx, "brain: offline");
@@ -273,7 +266,36 @@ export default function (pi: ExtensionAPI) {
 		return peer.ip;
 	}
 
+	/** Agent mode without a tailnet: talk straight to the public Funnel URL. */
+	async function connectPublic(ctx: ExtensionContext, cfg: Config, url: string): Promise<void> {
+		status(ctx, "brain: public url…");
+		try {
+			const target = parseBrainUrl(url);
+			const candidate = new BrainClient({
+				host: target.host,
+				port: target.port,
+				token: cfg.brainToken ?? "",
+				agentId,
+				transport: publicTransport(),
+			});
+			await candidate.health();
+			client = candidate;
+			snapshot = await candidate.context();
+			lastError = "";
+			status(ctx, `brain: ${target.host}`);
+			if (ctx.ui && ctx.hasUI) ctx.ui.notify(`pi-scale-memory: connected to the brain at ${url}`, "info");
+		} catch (err) {
+			lastError = errMsg(err);
+			status(ctx, "brain: offline");
+			if (ctx.hasUI) ctx.ui.notify(`pi-scale-memory: ${lastError}`, "warning");
+		}
+	}
+
 	async function connectAgent(ctx: ExtensionContext, cfg: Config): Promise<void> {
+		if (cfg.brainUrl) {
+			await connectPublic(ctx, cfg, cfg.brainUrl);
+			return;
+		}
 		if (!(await tailscaleInstalled())) {
 			lastError = "tailscale/tailscaled not found in PATH";
 			if (ctx.hasUI) ctx.ui.notify("pi-scale-memory: install Tailscale (tailscale + tailscaled) first.", "error");
@@ -282,7 +304,7 @@ export default function (pi: ExtensionAPI) {
 		if (!cfg.authKey && !cfg.loginServer) {
 			lastError = "not joined yet";
 			status(ctx, "brain: not joined");
-			if (ctx.hasUI) ctx.ui.notify("pi-scale-memory: run /join-tailnet to join a tailnet.", "warning");
+			if (ctx.hasUI) ctx.ui.notify("pi-scale-memory: run /join-tailnet to join a tailnet or set a public brain URL.", "warning");
 			return;
 		}
 		status(ctx, "brain: joining tailnet…");
@@ -591,22 +613,60 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	// --- /setup-funnel (brain only) ---
+	pi.registerCommand("setup-funnel", {
+		description: "Brain only: publish the memory API through Tailscale Funnel and print its URL",
+		handler: async (_args, ctx) => {
+			const cfg = loadConfig(false);
+			if (cfg.role !== "brain") {
+				ctx.ui.notify("Only a brain publishes a funnel. Run /self-tag brain first.", "error");
+				return;
+			}
+			if (!ctx.hasUI) {
+				ctx.ui.notify("Interactive setup requires the terminal UI.", "error");
+				return;
+			}
+			await runFunnelSetup(uiFrom(ctx), EXT_DIR, cfg);
+			await disconnect();
+			await connect(ctx);
+		},
+	});
+
 	// --- /join-tailnet ---
 	pi.registerCommand("join-tailnet", {
-		description: "Join a tailnet (Tailscale or self-hosted Headscale) with a tagged pre-auth key",
+		description: "Agent: join the tailnet as tag:agent, or point at a public brain URL",
 		handler: async (_args, ctx) => {
-			const target = await ctx.ui.select("Which tailnet?", [
-				"Tailscale (default control plane)",
-				"Self-hosted (Headscale)",
+			const mode = await ctx.ui.select("How should this agent reach the brain?", [
+				"Join the tailnet as tag:agent (discover the brain by tag)",
+				"Use a public brain URL (Funnel)",
 			]);
-			if (!target) return;
-			let loginServer: string | undefined;
-			if (target.startsWith("Self-hosted")) {
-				const stored = loadConfig(false).loginServer ?? "";
-				const url = await ctx.ui.input("Headscale URL", stored || "https://headscale.example.com");
-				if (!url?.trim()) return;
-				loginServer = url.trim().replace(/\/+$/, "");
+			if (!mode) return;
+
+			if (mode.startsWith("Use a public")) {
+				const stored = loadConfig(false);
+				const answer = await ctx.ui.input("Brain URL", stored.brainUrl ?? stored.funnelUrl ?? "https://brain.tailnet.ts.net");
+				if (!answer?.trim()) return;
+				let target: { host: string; port: number };
+				try {
+					target = parseBrainUrl(answer.trim());
+				} catch (err) {
+					ctx.ui.notify(errMsg(err), "error");
+					return;
+				}
+				let token = stored.brainToken ?? "";
+				if (!token) {
+					const entered = await ctx.ui.input("Brain token", "from /setup-funnel on the brain");
+					if (!entered?.trim()) return;
+					token = entered.trim();
+				}
+				const url = answer.trim().replace(/\/+$/, "");
+				updateConfig({ role: "agent", brainUrl: url, brainToken: token, authKey: undefined, loginServer: undefined });
+				ctx.ui.notify(`Saved. Connecting to ${target.host}:${target.port}…`, "info");
+				await disconnect();
+				await connect(ctx);
+				return;
 			}
+
 			const stored = loadConfig(false).authKey;
 			let authKey = "";
 			if (stored) {
@@ -615,31 +675,12 @@ export default function (pi: ExtensionAPI) {
 				if (keySource.startsWith("Use the stored")) authKey = stored;
 			}
 			if (!authKey) {
-				const entered = await ctx.ui.input("Pre-auth key (tagged tag:agent, reusable)", "tskey-auth-...");
+				const entered = await ctx.ui.input("Tailscale pre-auth key tagged tag:agent", "tskey-auth-...");
 				if (!entered?.trim()) return;
 				authKey = entered.trim();
 			}
-			updateConfig({ role: "agent", loginServer, authKey });
+			updateConfig({ role: "agent", authKey, brainUrl: undefined });
 			ctx.ui.notify("Saved. Joining as tag:agent…", "info");
-			await disconnect();
-			await connect(ctx);
-		},
-	});
-
-	// --- /setup-headscale (brain only) ---
-	pi.registerCommand("setup-headscale", {
-		description: "Brain only: install and configure Headscale, then join this machine as tag:brain",
-		handler: async (_args, ctx) => {
-			const cfg = loadConfig(false);
-			if (cfg.role !== "brain") {
-				ctx.ui.notify("Only a brain can host Headscale. Run /self-tag brain first.", "error");
-				return;
-			}
-			if (!ctx.hasUI) {
-				ctx.ui.notify("Interactive setup requires the terminal UI.", "error");
-				return;
-			}
-			await runHeadscaleSetup(uiFrom(ctx), cfg.brainPort);
 			await disconnect();
 			await connect(ctx);
 		},
@@ -647,18 +688,107 @@ export default function (pi: ExtensionAPI) {
 
 	// --- /generate-preauth (brain only) ---
 	pi.registerCommand("generate-preauth", {
-		description: "Brain only: mint a tag:agent pre-auth key for other machines",
+		description: "Brain only: mint a tag:agent auth key through the Tailscale API",
 		handler: async (_args, ctx) => {
 			const cfg = loadConfig(false);
 			if (cfg.role !== "brain") {
-				ctx.ui.notify("Only a brain can mint agent keys. Run /self-tag brain first.", "error");
+				ctx.ui.notify("Only a brain mints agent keys. Run /self-tag brain first.", "error");
 				return;
 			}
 			if (!ctx.hasUI) {
 				ctx.ui.notify("Interactive setup requires the terminal UI.", "error");
 				return;
 			}
-			await generateAgentKey(uiFrom(ctx), cfg.brainPort);
+
+			let apiToken = cfg.tailscaleApiToken ?? "";
+			if (!apiToken) {
+				const entered = await ctx.ui.input("Tailscale API access token (scope auth_keys)", "tskey-api-...");
+				if (!entered?.trim()) {
+					ctx.ui.notify(
+						
+"Create one at https://login.tailscale.com/admin/settings/keys (auth_keys scope), or create the agent key by hand in the admin console.",
+
+						"warning",
+					);
+					return;
+				}
+				apiToken = entered.trim();
+			}
+
+			const expiry = await ctx.ui.input("Key expiry (e.g. 90d, 24h, 1h)", "90d");
+			if (!expiry?.trim()) return;
+			const seconds = parseDurationSeconds(expiry.trim());
+			if (seconds === null) {
+				ctx.ui.notify(`Could not read "${expiry.trim()}" as a duration. Try 30d, 24h or 1h.`, "error");
+				return;
+			}
+
+			const scope = await ctx.ui.select("Key scope", [
+				"Reusable + ephemeral (recommended: one key for many agents)",
+				"Single-use (one machine, then expired)",
+			]);
+			if (!scope) return;
+			let reusable = true;
+			let ephemeral = true;
+			if (scope.startsWith("Single-use")) {
+				reusable = false;
+				ephemeral = false;
+			}
+
+			try {
+				const created = await createAuthKey({
+					apiToken,
+					tags: [AGENT_TAG],
+					reusable,
+					ephemeral,
+					preauthorized: true,
+					expirySeconds: seconds,
+				});
+				updateConfig({ tailscaleApiToken: apiToken });
+				ctx.ui.notify(
+					[
+						`Tailscale auth key for agents (${AGENT_TAG}):`,
+						"",
+						created.key,
+						"",
+						`Expires ${created.expires}. reusable=${created.reusable}, ephemeral=${created.ephemeral}.`,
+						"On each agent: /join-tailnet → join the tailnet, then paste this key.",
+					].join("\n"),
+					"info",
+				);
+			} catch (err) {
+				ctx.ui.notify(`Could not create the key: ${errMsg(err)}`, "error");
+			}
+		},
+	});
+
+	// --- /update-pi-scale-memory ---
+	pi.registerCommand("update-pi-scale-memory", {
+		description: "Update this extension (git pull or pi update), then reload it",
+		handler: async (_args, ctx) => {
+			const info = await inspectInstall(EXT_DIR);
+			const where = info.kind === "git" ? `git checkout ${info.commit ?? "?"}` : `${info.kind}${info.source ? ` ${info.source}` : ""}`;
+			if (!(await ctx.ui.confirm(`Update pi-scale-memory?`, `Source: ${where}\nDirectory: ${EXT_DIR}`))) return;
+
+			const result = await runUpdate(info);
+			if (!result.ok) {
+				ctx.ui.notify(result.message, "error");
+				return;
+			}
+
+			const version = info.version ?? "?";
+			if (info.kind === "git" && result.before === result.after) {
+				ctx.ui.notify(`Already up to date (${result.after ?? version}). Reloading anyway.`, "info");
+			} else {
+				ctx.ui.notify(`Updated ${result.before ?? ""} → ${result.after ?? ""} (v${version}). Reloading.`.trim(), "info");
+			}
+
+			// The brain server is a separate process; restart it so it runs the new code.
+			if (loadConfig(false).role === "brain") {
+				const stopped = await stopBrainServer();
+				if (stopped.stopped) ctx.ui.notify(`Restarting the brain server (${stopped.detail})`, "info");
+			}
+			await ctx.reload();
 		},
 	});
 

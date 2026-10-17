@@ -4,31 +4,24 @@ import * as path from "node:path";
 
 export type Role = "brain" | "agent";
 
-/** Headscale details recorded by /setup-headscale. Brain role only. */
-export interface HeadscaleConfig {
-	configPath: string;
-	policyPath: string;
-	policyMode: "file" | "database";
-	serverUrl: string;
-	/** Headscale user that owns the agent pre-auth keys. */
-	user: string;
-	layout: "system" | "user";
-	installed: boolean;
-}
-
 export interface Config {
 	/** What this pi agent is: the memory host (brain) or a client (agent). */
 	role?: Role;
-	/** Empty/undefined = the Tailscale control plane. Otherwise a Headscale (or other) URL. */
+	/** Tailscale login server override. Empty = the Tailscale control plane. */
 	loginServer?: string;
-	/** Tagged (tag:agent) pre-auth key. */
+	/** Tagged (tag:agent) pre-auth key used to join the tailnet. */
 	authKey?: string;
 	brainPort: number;
-	/** Optional bearer token, must match BRAIN_TOKEN on the brain server. */
+	/** Bearer token, must match BRAIN_TOKEN on the brain server. Required when funneled. */
 	brainToken?: string;
 	/** Mirror brain memory locally so reads work offline (agents only). Default true. */
 	cache?: boolean;
-	headscale?: HeadscaleConfig;
+	/** Brain role: the public Funnel URL published by /setup-funnel. */
+	funnelUrl?: string;
+	/** Agent role: reach the brain at this URL (public HTTPS) instead of tag discovery. */
+	brainUrl?: string;
+	/** Tailscale API access token (tskey-api-...) used by /generate-preauth. */
+	tailscaleApiToken?: string;
 }
 
 const DIR = path.join(os.homedir(), ".pi", "agent", "pi-scale-memory");
@@ -47,6 +40,11 @@ export function loadConfig(applyEnv = true): Config {
 	if (env.PI_SCALE_MEMORY_AUTHKEY) cfg.authKey = env.PI_SCALE_MEMORY_AUTHKEY;
 	if (env.PI_SCALE_MEMORY_PORT) cfg.brainPort = Number(env.PI_SCALE_MEMORY_PORT);
 	if (env.PI_SCALE_MEMORY_TOKEN) cfg.brainToken = env.PI_SCALE_MEMORY_TOKEN;
+	if (env.PI_SCALE_MEMORY_BRAIN_URL) {
+		cfg.brainUrl = env.PI_SCALE_MEMORY_BRAIN_URL;
+		cfg.role = "agent";
+	}
+	if (env.PI_SCALE_MEMORY_TAILSCALE_API_TOKEN) cfg.tailscaleApiToken = env.PI_SCALE_MEMORY_TAILSCALE_API_TOKEN;
 	if (env.PI_SCALE_MEMORY_CACHE === "0" || env.PI_SCALE_MEMORY_CACHE === "false") cfg.cache = false;
 	return cfg;
 }
@@ -68,3 +66,8 @@ export function resetConfig(): void {
 
 export const CONFIG_PATH = FILE;
 export const CONFIG_DIR = DIR;
+
+/** Resolved at call time so tests can redirect state with PI_SCALE_MEMORY_CONFIG_DIR. */
+export function configDir(): string {
+	return process.env.PI_SCALE_MEMORY_CONFIG_DIR ?? DIR;
+}

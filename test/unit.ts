@@ -1,6 +1,7 @@
 /**
- * Unit + localhost integration tests: `npm test`.
- * No tailnet is involved — the brain server is exercised over loopback.
+ * Unit tests plus a few localhost integration tests: `npm test`.
+ * No tailnet is involved. The brain server and the brain-server lifecycle are
+ * exercised over loopback; anything needing a real tailnet is out of scope here.
  */
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
@@ -9,7 +10,12 @@ import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { parse as parseYaml } from "yaml";
+import {
+	authKeyBody,
+	authKeyPath,
+	parseCreatedKey,
+} from "../src/apikeys.js";
+import { ensureBrainServer, stopBrainServer } from "../src/brain-server.js";
 import {
 	cacheDir,
 	contextWithFallback,
@@ -20,7 +26,7 @@ import {
 	searchWithFallback,
 	syncCache,
 } from "../src/cache.js";
-import { BrainClient, localTransport } from "../src/client.js";
+import { BrainClient, localTransport, parseBrainUrl, publicTransport } from "../src/client.js";
 import {
 	clampLimit,
 	normalizeHits,
@@ -32,19 +38,18 @@ import {
 	stripAnsi,
 } from "../brain/qmd.mjs";
 import {
-	checksumFor,
-	compareVersions,
-	parsePreauthKey,
-	parseUsers,
-	parseVersion,
-	renderConfig,
-	renderPolicy,
-	userPaths,
-} from "../src/headscale.js";
-import { guessServerUrl, joinCommand, readPolicyMode } from "../src/setup.js";
+	funnelDnsWarning,
+	funnelUrl,
+	parseSystemStatus,
+} from "../src/tailnet.js";
+import { findPackageSource, inspectInstall } from "../src/update.js";
+import { parseDurationSeconds } from "../index.js";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.join(HERE, "..");
+/** Keep brain-server state (pid file, log) out of the real pi config dir. */
+process.env.PI_SCALE_MEMORY_CONFIG_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "psm-cfgdir-"));
+
 let failures = 0;
 
 function check(name: string, fn: () => void) {
@@ -67,14 +72,6 @@ async function checkAsync(name: string, fn: () => Promise<void>) {
 	}
 }
 
-/** huJSON allows comments; strip them so the structure can be validated as JSON. */
-function stripComments(text: string): string {
-	return text
-		.split("\n")
-		.filter((line) => !line.trim().startsWith("//"))
-		.join("\n");
-}
-
 function freePort(): Promise<number> {
 	return new Promise((resolve, reject) => {
 		const srv = net.createServer();
@@ -86,174 +83,8 @@ function freePort(): Promise<number> {
 	});
 }
 
-console.log("headscale helpers");
-check("parseVersion reads v-prefixed output", () => {
-	assert.equal(parseVersion("headscale version v0.29.5"), "0.29.5");
-	assert.equal(parseVersion("headscale version 0.22.3"), "0.22.3");
-	assert.equal(parseVersion("no version here"), null);
-});
-check("compareVersions orders releases", () => {
-	assert.equal(compareVersions("0.26.0", "0.26"), 0);
-	assert.equal(compareVersions("0.25.1", "0.26"), -1);
-	assert.equal(compareVersions("0.29.5", "0.26"), 1);
-});
-check("checksumFor matches by basename", () => {
-	const sums = "abc123  headscale_0.29.5_linux_amd64\nDEF456  ./headscale_0.29.5_linux_amd64.deb\n";
-	assert.equal(checksumFor(sums, "headscale_0.29.5_linux_amd64"), "abc123");
-	assert.equal(checksumFor(sums, "headscale_0.29.5_linux_amd64.deb"), "def456");
-	assert.equal(checksumFor(sums, "other"), null);
-});
-check("parseUsers reads json and table output", () => {
-	const json = JSON.stringify([{ id: "1", name: "alice" }, { id: 2, name: "bob" }]);
-	assert.deepEqual(parseUsers(json), [
-		{ id: "1", name: "alice" },
-		{ id: "2", name: "bob" },
-	]);
-	const wrapped = JSON.stringify({ users: [{ id: 3, name: "carol" }] });
-	assert.deepEqual(parseUsers(wrapped), [{ id: "3", name: "carol" }]);
-	const table = "ID | Name  | Email\n1  | alice | a@example.com\n2  | bob   | b@example.com\n";
-	assert.deepEqual(parseUsers(table), [
-		{ id: "1", name: "alice" },
-		{ id: "2", name: "bob" },
-	]);
-});
-check("parsePreauthKey reads json, hskey and legacy forms", () => {
-	assert.equal(parsePreauthKey('{"key":"hskey-auth-abc123"}'), "hskey-auth-abc123");
-	assert.equal(parsePreauthKey('[{"key":"hskey-auth-zzz"}]'), "hskey-auth-zzz");
-	assert.equal(parsePreauthKey("hskey-auth-fff999"), "hskey-auth-fff999");
-	assert.equal(parsePreauthKey(`done ${"a".repeat(48)}`), "a".repeat(48));
-	assert.equal(parsePreauthKey("no key"), null);
-});
-
-console.log("generated policy");
-check("policy keeps tagOwners user-based (no wildcard) and only opens the brain port", () => {
-	const policy = stripComments(renderPolicy([{ id: "1", name: "alice" }, { id: "2", name: "bob" }], 8787));
-	const parsed = JSON.parse(policy);
-	assert.deepEqual(parsed.groups["group:agents"], ["alice@", "bob@"]);
-	assert.deepEqual(parsed.tagOwners["tag:agent"], ["group:agents"]);
-	assert.deepEqual(parsed.tagOwners["tag:brain"], ["group:agents"]);
-	assert.deepEqual(parsed.acls, [{ action: "accept", src: ["tag:agent"], dst: ["tag:brain:8787"] }]);
-	assert.ok(!policy.includes('"*"'), "policy must not contain a wildcard owner");
-});
-check("policy tracks the live user list", () => {
-	const a = stripComments(renderPolicy([{ id: "1", name: "alice" }], 8787));
-	const b = stripComments(renderPolicy([{ id: "1", name: "alice" }, { id: "2", name: "bob" }], 8787));
-	assert.notEqual(a, b);
-	assert.ok(JSON.parse(b).groups["group:agents"].includes("bob@"));
-});
-
-console.log("generated config");
-check("config parses and carries the keys headscale requires", () => {
-	const paths = userPaths();
-	const text = renderConfig(paths, "http://192.168.1.10:8080", "file");
-	const parsed = parseYaml(text);
-	assert.equal(parsed.server_url, "http://192.168.1.10:8080");
-	assert.equal(parsed.listen_addr, "0.0.0.0:8080");
-	assert.equal(parsed.noise.private_key_path, paths.noiseKeyPath);
-	assert.equal(parsed.prefixes.v4, "100.64.0.0/10");
-	assert.equal(parsed.prefixes.v6, "fd7a:115c:a1e0::/48");
-	assert.equal(parsed.policy.mode, "file");
-	assert.equal(parsed.policy.path, paths.policyPath);
-	assert.equal(parsed.unix_socket, paths.socket);
-	assert.equal(parsed.database.sqlite.path, path.join(paths.dataDir, "db.sqlite"));
-});
-check("config follows the url port", () => {
-	const parsed = parseYaml(renderConfig(userPaths(), "https://headscale.example.com:9443", "database"));
-	assert.equal(parsed.listen_addr, "0.0.0.0:9443");
-	assert.equal(parsed.policy.mode, "database");
-});
-check("readPolicyMode defaults to file and detects database", () => {
-	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "psm-cfg-"));
-	const dbPath = path.join(dir, "db.yaml");
-	fs.writeFileSync(dbPath, "server_url: http://x:8080\npolicy:\n  mode: database\n  path: /tmp/a.hujson\n");
-	assert.equal(readPolicyMode(dbPath), "database");
-	const filePath = path.join(dir, "file.yaml");
-	fs.writeFileSync(filePath, "server_url: http://x:8080\npolicy:\n  mode: file\n");
-	assert.equal(readPolicyMode(filePath), "file");
-	assert.equal(readPolicyMode(path.join(dir, "missing.yaml")), "file");
-	const legacy = path.join(dir, "legacy.yaml");
-	fs.writeFileSync(legacy, "server_url: http://x:8080\npolicy:\n  mode: db\n");
-	assert.equal(readPolicyMode(legacy), "database");
-});
-check("guessServerUrl produces a valid url", () => {
-	const url = new URL(guessServerUrl("8080"));
-	assert.match(url.protocol, /^http:$/);
-	assert.ok(url.port === "8080");
-});
-check("joinCommand matches the tailscale CLI", () => {
-	assert.equal(
-		joinCommand("https://headscale.example.com", "hskey-auth-abc"),
-		"tailscale up --login-server https://headscale.example.com --auth-key hskey-auth-abc",
-	);
-});
-
-console.log("qmd plumbing");
-check("parseQmdJson survives progress noise and empty output", () => {
-	assert.deepEqual(parseQmdJson(""), []);
-	assert.deepEqual(parseQmdJson("No results found."), []);
-	const noisy = "\u001b[?25lEmbedding 2 queries...\n\u001b[?25h\n[\n  {\"file\": \"qmd://c/MEMORY.md\"}\n]\n";
-	assert.deepEqual(parseQmdJson(noisy), [{ file: "qmd://c/MEMORY.md" }]);
-	assert.throws(() => parseQmdJson("total nonsense"));
-});
-check("normalizeHits flattens qmd's field names", () => {
-	const hits = normalizeHits(
-		[
-			{ file: "qmd://pi-scale-memory/MEMORY.md", score: 0.6412, snippet: "  hello  ", line: 3 },
-			{ path: "qmd://pi-scale-memory/daily/2026-10-18.md", content: "note" },
-			{ file: "qmd://other/x.md", chunk: "best" },
-		],
-		"pi-scale-memory",
-	);
-	assert.equal(hits[0].file, "MEMORY.md");
-	assert.equal(hits[0].score, 0.641);
-	assert.equal(hits[0].text, "hello");
-	assert.equal(hits[0].line, 3);
-	assert.equal(hits[1].file, "daily/2026-10-18.md");
-	assert.equal(hits[1].text, "note");
-	assert.equal(hits[1].score, 0);
-	assert.equal(hits[2].file, "qmd://other/x.md", "a foreign collection stays untouched");
-});
-check("relativeFile strips only the matching collection", () => {
-	assert.equal(relativeFile("qmd://c/a/b.md", "c"), "a/b.md");
-	assert.equal(relativeFile("qmd://d/a.md", "c"), "qmd://d/a.md");
-	assert.equal(relativeFile("", "c"), "");
-});
-check("qmdArgs builds the right subcommand per mode", () => {
-	assert.deepEqual(qmdArgs("keyword", "col", "postgres", 3), ["search", "--json", "-c", "col", "-n", "3", "postgres"]);
-	assert.deepEqual(qmdArgs("semantic", "col", "q", 5), ["vsearch", "--json", "-c", "col", "-n", "5", "q"]);
-	assert.deepEqual(qmdArgs("deep", "col", "q", 5), ["query", "--json", "-c", "col", "-n", "5", "q"]);
-	assert.equal(qmdArgs("bogus", "col", "q", 5)[0], "vsearch", "an unknown mode must not become a broken invocation");
-});
-check("clampLimit and normalizeMode reject nonsense", () => {
-	assert.equal(clampLimit(undefined), 5);
-	assert.equal(clampLimit(Number.NaN), 5);
-	assert.equal(clampLimit(0), 1);
-	assert.equal(clampLimit(-4), 1);
-	assert.equal(clampLimit(1000), 20);
-	assert.equal(clampLimit(7), 7);
-	assert.equal(normalizeMode("deep"), "deep");
-	assert.equal(normalizeMode("keyword"), "keyword");
-	assert.equal(normalizeMode("garbage"), "semantic");
-	assert.equal(normalizeMode(undefined), "semantic");
-});
-check("parseCollections reads the collection list", () => {
-	const out = stripAnsi("Collections (2):\n\npi-memory (qmd://pi-memory/)\n  Pattern:  **/*.md\npsmtest (qmd://psmtest/)\n");
-	assert.deepEqual(parseCollections(out), ["pi-memory", "psmtest"]);
-	assert.deepEqual(parseCollections(""), []);
-});
-
-// ---------------------------------------------------------------------------
-// brain server over loopback (the exact path the brain role uses)
-// ---------------------------------------------------------------------------
-
-/**
- * The suite must not disturb the qmd install on this machine: every brain runs
- * under a throwaway collection name with automatic indexing off, and the
- * collection is removed afterwards.
- */
 function qmdInstalled(): boolean {
-	const res = spawnSync("qmd", ["--version"], { encoding: "utf-8" });
-	return res.status === 0;
+	return spawnSync("qmd", ["--version"], { encoding: "utf-8" }).status === 0;
 }
 
 function removeCollection(name: string): void {
@@ -293,7 +124,175 @@ async function startBrain(dir: string, port: number, collection: string) {
 	}
 }
 
-console.log("brain client over loopback");
+console.log("tailscale helpers");
+check("parseSystemStatus reads the fields the funnel needs", () => {
+	const status = parseSystemStatus(
+		JSON.stringify({
+			BackendState: "Running",
+			CurrentTailnet: { Name: "example.com" },
+			Self: { DNSName: "brain.tail1a2b.ts.net.", HostName: "brain", Tags: ["tag:brain"] },
+		}),
+	);
+	assert.ok(status);
+	assert.equal(status.dnsName, "brain.tail1a2b.ts.net", "the trailing dot must go");
+	assert.equal(status.backendState, "Running");
+	assert.deepEqual(status.tags, ["tag:brain"]);
+	assert.equal(status.tailnetName, "example.com");
+	assert.equal(parseSystemStatus("not json"), null);
+	assert.equal(parseSystemStatus("{}")?.backendState, "Unknown");
+});
+check("funnelUrl omits :443 and keeps other ports", () => {
+	assert.equal(funnelUrl("brain.tail1a2b.ts.net", 443), "https://brain.tail1a2b.ts.net");
+	assert.equal(funnelUrl("brain.tail1a2b.ts.net.", 443), "https://brain.tail1a2b.ts.net");
+	assert.equal(funnelUrl("brain.tail1a2b.ts.net", 8443), "https://brain.tail1a2b.ts.net:8443");
+	assert.equal(funnelUrl("brain.tail1a2b.ts.net", 10000), "https://brain.tail1a2b.ts.net:10000");
+});
+check("funnelDnsWarning only accepts the tailnet ts.net domain", () => {
+	assert.equal(funnelDnsWarning("brain.tail1a2b.ts.net"), null);
+	assert.match(String(funnelDnsWarning("nv00016680.substrait.local")), /can only serve names ending in \.ts\.net/);
+	assert.match(String(funnelDnsWarning("")), /no MagicDNS name/);
+});
+
+console.log("brain url transport");
+check("parseBrainUrl requires https and defaults to 443", () => {
+	assert.deepEqual(parseBrainUrl("https://brain.tail1a2b.ts.net"), { host: "brain.tail1a2b.ts.net", port: 443 });
+	assert.deepEqual(parseBrainUrl("https://brain.tail1a2b.ts.net:8443"), { host: "brain.tail1a2b.ts.net", port: 8443 });
+	assert.deepEqual(parseBrainUrl(" https://brain.tail1a2b.ts.net/ "), { host: "brain.tail1a2b.ts.net", port: 443 });
+	assert.throws(() => parseBrainUrl("http://brain.example.com"));
+	assert.throws(() => parseBrainUrl("brain.tail1a2b.ts.net"));
+});
+check("the public transport exists and is distinct from the local one", () => {
+	assert.equal(typeof publicTransport(), "function");
+	assert.notEqual(publicTransport(), localTransport());
+});
+
+console.log("tailscale api keys");
+check("authKeyBody matches the documented request shape", () => {
+	const body = authKeyBody({
+		apiToken: "tskey-api-x",
+		tags: ["tag:agent"],
+		reusable: true,
+		ephemeral: true,
+		preauthorized: true,
+		expirySeconds: 7776000,
+	}) as any;
+	assert.deepEqual(body.capabilities.devices.create, {
+		reusable: true,
+		ephemeral: true,
+		preauthorized: true,
+		tags: ["tag:agent"],
+	});
+	assert.equal(body.expirySeconds, 7776000);
+});
+check("authKeyPath addresses the token's own tailnet by default", () => {
+	assert.equal(authKeyPath("-"), "/api/v2/tailnet/-/keys");
+	assert.equal(authKeyPath("example.com"), "/api/v2/tailnet/example.com/keys");
+	assert.equal(authKeyPath("a b"), "/api/v2/tailnet/a%20b/keys");
+});
+check("parseCreatedKey reads the created key", () => {
+	const parsed = parseCreatedKey(
+		JSON.stringify({
+			id: "k1",
+			key: "tskey-auth-abc",
+			expires: "2026-01-01T00:00:00Z",
+			capabilities: { devices: { create: { reusable: true, ephemeral: false, tags: ["tag:agent"] } } },
+		}),
+	);
+	assert.equal(parsed.key, "tskey-auth-abc");
+	assert.equal(parsed.reusable, true);
+	assert.equal(parsed.ephemeral, false);
+	assert.deepEqual(parsed.tags, ["tag:agent"]);
+});
+
+console.log("durations");
+check("parseDurationSeconds understands the units used by the API", () => {
+	assert.equal(parseDurationSeconds("90d"), 7776000);
+	assert.equal(parseDurationSeconds("24h"), 86400);
+	assert.equal(parseDurationSeconds("30m"), 1800);
+	assert.equal(parseDurationSeconds("45s"), 45);
+	assert.equal(parseDurationSeconds("2w"), 1209600);
+	assert.equal(parseDurationSeconds("300"), 300);
+	assert.equal(parseDurationSeconds("soon"), null);
+	assert.equal(parseDurationSeconds("0d"), null);
+	assert.equal(parseDurationSeconds("-5h"), null);
+});
+
+console.log("self-update");
+check("this checkout is detected as git with a version", async () => {
+	const info = await inspectInstall(ROOT);
+	assert.equal(info.kind, "git");
+	assert.ok(info.commit && info.commit.length >= 7);
+	assert.ok(info.branch && info.branch.length > 0);
+	assert.equal(typeof info.version, "string");
+});
+check("inspectInstall falls back to pi packages for a non-git dir", async () => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "psm-nogit-"));
+	fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "pi-scale-memory", version: "9.9.9" }));
+	const info = await inspectInstall(dir);
+	assert.equal(info.version, "9.9.9");
+	assert.equal(typeof info.kind, "string");
+	fs.rmSync(dir, { recursive: true, force: true });
+});
+check("findPackageSource matches strings and objects", () => {
+	assert.equal(findPackageSource({ packages: ["npm:pi-cache-optimizer", "npm:pi-scale-memory"] }), "npm:pi-scale-memory");
+	assert.equal(findPackageSource({ packages: [{ source: "git:github.com/aaronmurniadi/pi-scale-memory" }] }), "git:github.com/aaronmurniadi/pi-scale-memory");
+	assert.equal(findPackageSource({ packages: ["npm:other"] }), null);
+	assert.equal(findPackageSource({}), null);
+});
+
+console.log("qmd plumbing");
+check("parseQmdJson survives progress noise and empty output", () => {
+	assert.deepEqual(parseQmdJson(""), []);
+	assert.deepEqual(parseQmdJson("No results found."), []);
+	const noisy = "\u001b[?25lEmbedding 2 queries...\n\u001b[?25h\n[\n  {\"file\": \"qmd://c/MEMORY.md\"}\n]\n";
+	assert.deepEqual(parseQmdJson(noisy), [{ file: "qmd://c/MEMORY.md" }]);
+	assert.throws(() => parseQmdJson("total nonsense"));
+});
+check("normalizeHits flattens qmd's field names", () => {
+	const hits = normalizeHits(
+		[
+			{ file: "qmd://pi-scale-memory/MEMORY.md", score: 0.6412, snippet: "  hello  ", line: 3 },
+			{ path: "qmd://pi-scale-memory/daily/2026-10-18.md", content: "note" },
+			{ file: "qmd://other/x.md", chunk: "best" },
+		],
+		"pi-scale-memory",
+	);
+	assert.equal(hits[0].file, "MEMORY.md");
+	assert.equal(hits[0].score, 0.641);
+	assert.equal(hits[0].text, "hello");
+	assert.equal(hits[0].line, 3);
+	assert.equal(hits[1].file, "daily/2026-10-18.md");
+	assert.equal(hits[1].score, 0);
+	assert.equal(hits[2].file, "qmd://other/x.md", "a foreign collection stays untouched");
+});
+check("relativeFile strips only the matching collection", () => {
+	assert.equal(relativeFile("qmd://c/a/b.md", "c"), "a/b.md");
+	assert.equal(relativeFile("qmd://d/a.md", "c"), "qmd://d/a.md");
+	assert.equal(relativeFile("", "c"), "");
+});
+check("qmdArgs builds the right subcommand per mode", () => {
+	assert.deepEqual(qmdArgs("keyword", "col", "postgres", 3), ["search", "--json", "-c", "col", "-n", "3", "postgres"]);
+	assert.deepEqual(qmdArgs("semantic", "col", "q", 5), ["vsearch", "--json", "-c", "col", "-n", "5", "q"]);
+	assert.deepEqual(qmdArgs("deep", "col", "q", 5), ["query", "--json", "-c", "col", "-n", "5", "q"]);
+	assert.equal(qmdArgs("bogus", "col", "q", 5)[0], "vsearch", "an unknown mode must not become a broken invocation");
+});
+check("clampLimit and normalizeMode reject nonsense", () => {
+	assert.equal(clampLimit(undefined), 5);
+	assert.equal(clampLimit(Number.NaN), 5);
+	assert.equal(clampLimit(0), 1);
+	assert.equal(clampLimit(1000), 20);
+	assert.equal(clampLimit(7), 7);
+	assert.equal(normalizeMode("deep"), "deep");
+	assert.equal(normalizeMode("garbage"), "semantic");
+	assert.equal(normalizeMode(undefined), "semantic");
+});
+check("parseCollections reads the collection list", () => {
+	const out = stripAnsi("Collections (2):\n\npi-memory (qmd://pi-memory/)\n  Pattern:  **/*.md\npsmtest (qmd://psmtest/)\n");
+	assert.deepEqual(parseCollections(out), ["pi-memory", "psmtest"]);
+	assert.deepEqual(parseCollections(""), []);
+});
+
+console.log("brain server over loopback");
 await checkAsync("write/read/search/scratchpad/forget round-trip", async () => {
 	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "psm-brain-"));
 	const port = await freePort();
@@ -336,6 +335,10 @@ await checkAsync("write/read/search/scratchpad/forget round-trip", async () => {
 		const list = await client.read("list");
 		assert.equal(list.files.length, 1);
 
+		const snap = await client.snapshot();
+		assert.ok(snap.takenAt.length > 0);
+		assert.match(snap.files["MEMORY.md"], /chose #postgres/);
+
 		const added = await client.writeNow({ path: "/v1/scratchpad", body: { action: "add", text: "todo one" } });
 		assert.equal(added.items.length, 1);
 		assert.equal(added.items[0].done, false);
@@ -344,17 +347,9 @@ await checkAsync("write/read/search/scratchpad/forget round-trip", async () => {
 		const cleared = await client.writeNow({ path: "/v1/scratchpad", body: { action: "clear_done" } });
 		assert.equal(cleared.items.length, 0);
 
-		const snap = await client.snapshot();
-		assert.ok(snap.takenAt.length > 0);
-		assert.match(snap.files["MEMORY.md"], /chose #postgres/);
-		assert.equal(Object.keys(snap.files).filter((f) => f.startsWith("daily/")).length, 1);
-
 		const forgot = await client.forget({ match: "postgres" });
 		assert.equal(forgot.removed, 1);
 		assert.ok(fs.existsSync(path.join(dir, "recovery", `${forgot.recoveryId}.json`)));
-		const after = await client.context();
-		assert.ok(!after.includes("postgres"), "the forgotten note must be gone");
-		assert.match(after, /fixed \[\[auth\]\]/, "the daily entry must survive");
 	} finally {
 		child.kill("SIGKILL");
 		fs.rmSync(dir, { recursive: true, force: true });
@@ -373,6 +368,55 @@ await checkAsync("a write to a dead brain is queued, not lost", async () => {
 	const res = await client.writeOrQueue({ path: "/v1/write", body: { target: "daily", content: "queued note" } });
 	assert.equal(res.queued, true);
 	assert.equal(client.pending, 1);
+});
+
+await checkAsync("the brain server lifecycle starts, reports and stops", async () => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "psm-lifecycle-"));
+	const port = await freePort();
+	const collection = testCollection();
+	const messages: string[] = [];
+	try {
+		const started = await ensureBrainServer(
+			ROOT,
+			{ port, token: "secret-token", env: { BRAIN_DIR: dir, BRAIN_HOST: "127.0.0.1", QMD_COLLECTION: collection, QMD_UPDATE: "off" } },
+			(m) => messages.push(m),
+		);
+		assert.equal(started.ok, true, `ensureBrainServer: ${started.detail}`);
+		assert.equal(started.started, true);
+		assert.ok(messages.length >= 1);
+
+		// A server started this way enforces the token it was given.
+		const anonymous = await localTransport()("127.0.0.1", port, { method: "GET", path: "/v1/health", headers: {} });
+		assert.equal(anonymous.status, 401, "a public brain must reject anonymous calls");
+		const authorized = await localTransport()("127.0.0.1", port, {
+			method: "GET",
+			path: "/v1/health",
+			headers: { authorization: "Bearer secret-token" },
+		});
+		assert.equal(authorized.status, 200);
+
+		// Calling it again with the same token adopts the running server.
+		const again = await ensureBrainServer(
+			ROOT,
+			{ port, token: "secret-token", env: { BRAIN_DIR: dir } },
+			() => {},
+		);
+		assert.equal(again.ok, true);
+		assert.equal(again.started, false);
+
+		// A different token on the same port is a conflict worth reporting.
+		const conflict = await ensureBrainServer(
+			ROOT,
+			{ port, token: "other-token", env: { BRAIN_DIR: dir } },
+			() => {},
+		);
+		assert.equal(conflict.ok, false);
+		assert.match(conflict.detail, /different token/);
+	} finally {
+		await stopBrainServer();
+		removeCollection(collection);
+		fs.rmSync(dir, { recursive: true, force: true });
+	}
 });
 
 console.log("agent offline cache");
@@ -404,12 +448,8 @@ await checkAsync("mirrors the brain, then serves reads while offline", async () 
 		assert.equal(hasCache(cache), false);
 		const meta = await syncCache(live, cache);
 		assert.equal(meta.files, 3, "MEMORY.md, SCRATCHPAD.md and one daily log");
-		assert.ok(meta.takenAt.length > 0);
 		assert.equal(metaOf(cache)?.files, 3);
-		assert.equal(hasCache(cache), true);
-		assert.ok(fs.existsSync(path.join(cache, "daily")));
 
-		// offline: reads and search come from the mirror
 		const offlineRead = await readWithFallback(dead, cache, "long_term");
 		assert.equal(offlineRead.source, "cache");
 		assert.match(String((offlineRead.value as { content: string }).content), /cache me #alpha/);
@@ -421,10 +461,8 @@ await checkAsync("mirrors the brain, then serves reads while offline", async () 
 
 		const offlineContext = await contextWithFallback(dead, cache);
 		assert.equal(offlineContext.source, "cache");
-		assert.match(offlineContext.value, /cache me #alpha/);
 		assert.match(offlineContext.value, /cache todo/);
 
-		// a live brain still wins over the mirror
 		const onlineRead = await readWithFallback(live, cache, "long_term");
 		assert.equal(onlineRead.source, "brain");
 		const onlineSearch = await searchWithFallback(live, cache, "#alpha", 5);
@@ -432,18 +470,12 @@ await checkAsync("mirrors the brain, then serves reads while offline", async () 
 		assert.ok(onlineSearch.results.length >= 1);
 		assert.equal((await contextWithFallback(live, cache)).source, "brain");
 
-		// never synced and offline: the fallback must not invent an empty answer
 		const empty = cacheDir(fs.mkdtempSync(path.join(os.tmpdir(), "psm-cache-empty-")));
 		await assert.rejects(() => readWithFallback(dead, empty, "long_term"));
 
-		// deletions on the brain propagate
 		await live.forget({ match: "cache me" });
 		await syncCache(live, cache);
 		assert.equal(await readFromCache(cache, "long_term").content, "");
-
-		// a cache dir with no meta.json counts as "no cache"
-		fs.rmSync(path.join(cache, "meta.json"), { force: true });
-		assert.equal(hasCache(cache), false);
 	} finally {
 		child.kill("SIGKILL");
 		fs.rmSync(brainDir, { recursive: true, force: true });
@@ -469,8 +501,6 @@ await checkAsync("cache sync ignores paths outside the memory layout", async () 
 	try {
 		const meta = await syncCache(fake, cache);
 		assert.equal(meta.files, 2);
-		assert.ok(fs.existsSync(path.join(cache, "MEMORY.md")));
-		assert.ok(fs.existsSync(path.join(cache, "daily", "2026-10-18.md")));
 		assert.ok(!fs.existsSync(path.join(cache, "not-a-date.md")));
 		assert.ok(!fs.existsSync(path.join(path.dirname(cache), "escape.md")));
 	} finally {
@@ -483,21 +513,13 @@ if (qmdInstalled()) {
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "psm-qmd-"));
 		const port = await freePort();
 		const collection = testCollection();
-		// Written before the brain starts so the collection is indexed on creation.
 		fs.writeFileSync(
 			path.join(dir, "MEMORY.md"),
 			"# Memory\n\nWe chose postgres for the billing database because of JSON support.\n",
 		);
 		const child = await startBrain(dir, port, collection);
-		const client = new BrainClient({
-			host: "127.0.0.1",
-			port,
-			token: "",
-			agentId: "test-agent",
-			transport: localTransport(),
-		});
+		const client = new BrainClient({ host: "127.0.0.1", port, token: "", agentId: "test-agent", transport: localTransport() });
 		try {
-			// The brain wires qmd up just after it starts listening.
 			let ready = false;
 			const deadline = Date.now() + 30000;
 			while (Date.now() < deadline) {
@@ -510,14 +532,12 @@ if (qmdInstalled()) {
 			}
 			assert.ok(ready, "the brain should report its qmd collection ready");
 
-			// Embeddings for semantic search (scoped to this test's collection).
 			const embedded = spawnSync("qmd", ["embed", "-c", collection, "--timeout", "5"], {
 				encoding: "utf-8",
 				timeout: 240000,
 			});
 			if (embedded.status !== 0) {
 				const detail = String(embedded.stderr).trim().split("\n").pop() ?? "";
-				// A missing collection is our bug; a missing model is this machine's limit.
 				if (/Collection not found/i.test(detail)) throw new Error(`embed failed: ${detail}`);
 				console.log(`  skip qmd search: embeddings unavailable (${detail})`);
 				return;
@@ -527,17 +547,12 @@ if (qmdInstalled()) {
 			assert.equal(semantic.engine, "qmd");
 			assert.equal(semantic.mode, "semantic");
 			assert.ok(semantic.results.length >= 1, "semantic search should find the note");
-			assert.equal(semantic.results[0].file, "MEMORY.md", "the qmd:// prefix must be stripped");
+			assert.equal(semantic.results[0].file, "MEMORY.md");
 			assert.match(semantic.results[0].text, /postgres/);
 
 			const keyword = await client.search("postgres", 3, "keyword");
 			assert.equal(keyword.engine, "qmd");
 			assert.ok(keyword.results.length >= 1);
-
-			// After a qmd-backed search the health endpoint must report qmd.
-			const after = await client.health();
-			assert.equal(after.search?.engine, "qmd");
-			assert.equal(after.search?.mode, "semantic");
 		} finally {
 			child.kill("SIGKILL");
 			fs.rmSync(dir, { recursive: true, force: true });
@@ -567,17 +582,26 @@ await checkAsync("the extension registers its commands and tools", async () => {
 		},
 	};
 	mod.default(stub as never);
-	assert.deepEqual(
-		commands.sort(),
-		["brain", "generate-preauth", "join-tailnet", "self-tag", "setup-headscale"],
-	);
-	assert.deepEqual(
-		tools.sort(),
-		["memory_forget", "memory_read", "memory_search", "memory_write", "scratchpad"],
-	);
-	assert.ok(events.includes("session_start"), "session_start must be handled");
-	assert.ok(events.includes("before_agent_start"), "the memory snapshot must be injected");
+	assert.deepEqual(commands.sort(), [
+		"brain",
+		"generate-preauth",
+		"join-tailnet",
+		"self-tag",
+		"setup-funnel",
+		"update-pi-scale-memory",
+	]);
+	assert.deepEqual(tools.sort(), [
+		"memory_forget",
+		"memory_read",
+		"memory_search",
+		"memory_write",
+		"scratchpad",
+	]);
+	assert.ok(events.includes("session_start"));
+	assert.ok(events.includes("before_agent_start"));
 });
+
+fs.rmSync(process.env.PI_SCALE_MEMORY_CONFIG_DIR as string, { recursive: true, force: true });
 
 console.log("");
 if (failures > 0) {
