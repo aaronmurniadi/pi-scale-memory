@@ -1,0 +1,23 @@
+{
+	"name": "pi-scale-memory",
+	"version": "0.1.0",
+	"description": "Pi agent extension: shared remote memory over a Tailscale/Headscale tailnet using userspace networking",
+	"type": "module",
+	"main": "index.ts",
+	"keywords": ["pi", "pi-package", "memory", "tailscale", "headscale"],
+	"pi": { "extensions": ["./index.ts"] },
+	"files": ["index.ts", "src", "brain", "README.md"],
+	"bin": { "pi-scale-brain": "brain/server.mjs" },
+	"scripts": { "build": "tsc -p tsconfig.json --noEmit", "brain": "node brain/server.mjs" },
+	"engines": { "node": ">=22.19.0" },
+	"devDependencies": {
+		"@earendil-works/pi-ai": "0.84.1",
+		"@earendil-works/pi-coding-agent": "0.84.1",
+		"@types/node": "^22.0.0",
+		"typescript": "^5.9.3"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-ai": "*",
+		"@earendil-works/pi-coding-agent": "*"
+	}
+}
