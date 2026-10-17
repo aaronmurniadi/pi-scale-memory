@@ -94,16 +94,23 @@ export function parseTaggedPeers(raw: string, tag: string): string[] {
 	return names.sort();
 }
 
-export function upArgs(authKey: string, hostname: string): string[] {
-	return [
+/**
+ * Joining args. `advertiseTag` is false on the first attempt on purpose: a key
+ * that already carries the tag tags the device by itself, which Tailscale allows
+ * without consulting tagOwners at all. Advertising is only needed for a key with
+ * no tags of its own.
+ */
+export function upArgs(authKey: string, hostname: string, advertiseTag = false): string[] {
+	const args = [
 		"up",
 		`--auth-key=${authKey}`,
-		`--advertise-tags=${BRAIN_TAG}`,
 		`--hostname=${hostname}`,
 		"--accept-dns=false",
 		"--accept-routes=false",
 		"--timeout=60s",
 	];
+	if (advertiseTag) args.splice(2, 0, `--advertise-tags=${BRAIN_TAG}`);
+	return args;
 }
 
 /**
@@ -121,27 +128,34 @@ export function tagRejected(stderr: string): boolean {
  * the key's identity has to be allowed to apply it. Both ways out are spelled out
  * because which one is easier depends on whether you already have the tag.
  */
-export function tagPermissionHelp(tag: string): string {
-	return [
-		`Tailscale refused ${tag} for this pre-auth key.`,
+export function tagPermissionHelp(tag: string, observed: string[] = []): string {
+	const lines = [`Tailscale refused ${tag} for this pre-auth key.`];
+	if (observed.length > 0) {
+		lines.push(
+			"",
+			`This node authenticated with: ${observed.join(", ")}. When a key carries tags, Tailscale`,
+			`only applies the exact set the key carries, or a tag owned by one of them. ${tag} is`,
+			`neither, so the request is refused — even if ${tag} is declared in tagOwners.`,
+		);
+	} else {
+		lines.push("", "A tag only exists once declared, and only some identities may apply it.");
+	}
+	lines.push(
 		"",
-		"A tag only exists once it is declared, and only some identities may apply it.",
+		"Fix it one of these ways:",
 		"",
-		"1. Declare it in the tailnet policy file (admin console -> Access controls):",
+		`1. Create the pre-auth key with ${tag} selected (and no other tag). A key's own tags`,
+		"   are applied without consulting tagOwners, so this always works.",
+		"",
+		"2. Or keep this key and let it apply the tag, in the tailnet policy file",
+		"   (admin console -> Access controls):",
 		"",
 		'     "tagOwners": {',
-		`       "${tag}": ["autogroup:member"]`,
-		"     }",
-		"",
-		"   Narrow autogroup:member to a user or group if you like. Owners, Admins and",
-		"   Network admins may apply any declared tag.",
-		"",
-		`2. Then confirm the key itself carries ${tag}. A key created in the admin console`,
-		`   with ${tag} selected tags the device by itself, which Tailscale allows without`,
-		"   consulting tagOwners at all.",
-		"",
-		"Re-run /join-tailnet-brain afterwards.",
-	].join("\n");
+	);
+	if (observed.length > 0) lines.push(`       "${tag}": ["${observed[0]}"]`);
+	else lines.push(`       "${tag}": ["autogroup:member"]`);
+	lines.push("     }", "", "Re-run /join-tailnet-brain afterwards.");
+	return lines.join("\n");
 }
 
 /** Publish 127.0.0.1:<port> to the tailnet on the same port. */
@@ -245,12 +259,20 @@ export async function ensureBrainNode(opts: {
 			};
 		}
 		const hostname = brainNodeHostname(os.hostname());
-		let up = await nodeCli(upArgs(opts.authKey, hostname), 120000);
-		if (!up.ok && /non-default|explicitly mention/i.test(up.stderr)) {
-			// This node exists only for pi-scale-memory, so clearing its own
-			// preferences disturbs nothing of the user's.
-			up = await nodeCli([...upArgs(opts.authKey, hostname), "--reset"], 120000);
-		}
+
+		const join = async (advertiseTag: boolean) => {
+			let up = await nodeCli(upArgs(opts.authKey as string, hostname, advertiseTag), 120000);
+			if (!up.ok && /non-default|explicitly mention/i.test(up.stderr)) {
+				// This node exists only for pi-scale-memory, so clearing its own
+				// preferences disturbs nothing of the user's.
+				up = await nodeCli([...upArgs(opts.authKey as string, hostname, advertiseTag), "--reset"], 120000);
+			}
+			return up;
+		};
+
+		// First attempt: let the key's own tags apply. Second: advertise the tag,
+		// which needs tagOwners to allow whoever the key authenticated as.
+		let up = await join(false);
 		if (!up.ok) {
 			let detail = `tailscale up failed: ${up.stderr.trim().split("\n").slice(-3).join(" ")}`;
 			if (tagRejected(up.stderr)) detail = tagPermissionHelp(BRAIN_TAG);
@@ -261,6 +283,20 @@ export async function ensureBrainNode(opts: {
 			const current = await nodeStatus();
 			return Boolean(current && current.backendState === "Running");
 		}, 30000).then(async () => nodeStatus());
+
+		if (status && status.backendState === "Running" && !status.tags.includes(BRAIN_TAG)) {
+			const observed = status.tags;
+			up = await join(true);
+			if (!up.ok) {
+				let detail = `tailscale up failed: ${up.stderr.trim().split("\n").slice(-3).join(" ")}`;
+				if (tagRejected(up.stderr)) detail = tagPermissionHelp(BRAIN_TAG, observed);
+				return { ok: false, detail, status, joined: true, served: false };
+			}
+			status = await waitFor(async () => {
+				const current = await nodeStatus();
+				return Boolean(current && current.tags.includes(BRAIN_TAG));
+			}, 30000).then(async () => nodeStatus());
+		}
 	}
 
 	if (!status || status.backendState !== "Running") {

@@ -168,14 +168,21 @@ check("other tag:brain devices are detected", () => {
 	assert.deepEqual(parseTaggedPeers("not json", "tag:brain"), []);
 	assert.deepEqual(parseTaggedPeers("{}", "tag:brain"), []);
 });
-check("up keeps the node's own settings and never accepts routes or DNS", () => {
-	const args = upArgs("tskey-auth-x", "pi-brain-mac");
-	assert.ok(args.includes("--auth-key=tskey-auth-x"));
-	assert.ok(args.includes("--advertise-tags=tag:brain"));
-	assert.ok(args.includes("--hostname=pi-brain-mac"));
-	assert.ok(args.includes("--accept-dns=false"), "the host's DNS must not be touched");
-	assert.ok(args.includes("--accept-routes=false"));
-	assert.equal(args[0], "up");
+check("the first join attempt lets the key's own tags apply", () => {
+	const plain = upArgs("tskey-auth-x", "pi-brain-mac");
+	assert.equal(plain[0], "up");
+	assert.ok(plain.includes("--auth-key=tskey-auth-x"));
+	assert.ok(plain.includes("--hostname=pi-brain-mac"));
+	assert.ok(plain.includes("--accept-dns=false"), "the host's DNS must not be touched");
+	assert.ok(plain.includes("--accept-routes=false"));
+	assert.ok(
+		!plain.includes("--advertise-tags=tag:brain"),
+		"a key that already carries the tag must not need tagOwners",
+	);
+
+	const advertised = upArgs("tskey-auth-x", "pi-brain-mac", true);
+	assert.ok(advertised.includes("--advertise-tags=tag:brain"), "the fallback advertises it");
+	assert.equal(advertised.filter((a: string) => a.startsWith("--advertise-tags=")).length, 1);
 });
 check("a rejected tag is recognised and explained", () => {
 	// The exact message a key without the tag produces.
@@ -183,13 +190,20 @@ check("a rejected tag is recognised and explained", () => {
 	assert.equal(tagRejected("requested tags [tag:a tag:b] are invalid or not permitted"), true);
 	assert.equal(tagRejected("Failed to connect to local tailscaled"), false);
 
-	const help = tagPermissionHelp("tag:brain");
+	const help = tagPermissionHelp("tag:brain", ["tag:agent"]);
+	assert.match(help, /authenticated with: tag:agent/, "it should name the tags the key actually applied");
+	assert.match(help, /"tag:brain": \["tag:agent"\]/, "and offer ownership by those tags");
+	assert.match(help, /no other tag/, "the simplest fix is a key carrying only the wanted tag");
 	assert.match(help, /refused tag:brain/);
 	assert.match(help, /tagOwners/, "declaring the tag is the primary fix");
 	assert.match(help, /admin console/, "it should say where to do it");
 	assert.match(help, /"tagOwners"/);
-	assert.match(help, /"tag:brain": \["autogroup:member"\]/);
 	assert.match(help, /Access controls/);
+
+	// Without observed tags the advice falls back to declaring the tag for members.
+	const bare = tagPermissionHelp("tag:brain");
+	assert.match(bare, /"tag:brain": \["autogroup:member"\]/);
+	assert.ok(!bare.includes("authenticated with"));
 });
 check("serve publishes the memory port to the tailnet over loopback", () => {
 	assert.deepEqual(serveArgs(8787), ["serve", "--bg", "--tcp=8787", "tcp://127.0.0.1:8787"]);
