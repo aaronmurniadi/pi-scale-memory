@@ -171,15 +171,41 @@ export async function resetFunnel(): Promise<RunResult> {
 	return ts(["funnel", "reset"], 20000);
 }
 
-/** Join the system tailscale. A key that already carries tags is enough on its own. */
+function attempt(args: string[]): Promise<RunResult> {
+	return ts(args, 120000).then((result) => {
+		if (!result.ok && /permission denied|must be root|access denied/i.test(result.stderr)) {
+			return run("tailscale", args, { timeoutMs: 120000, sudo: true });
+		}
+		return result;
+	});
+}
+
+/**
+ * Join the system tailscale.
+ *
+ * A pre-auth key that already carries its tags does not need `--advertise-tags`,
+ * and asking for a tag the key cannot grant is an error, so that case is retried
+ * without the flag rather than failing the join.
+ */
 export async function joinSystem(authKey: string, tags: string[] = []): Promise<RunResult> {
-	const args = ["up", `--auth-key=${authKey}`];
-	for (const tag of tags) args.push(`--advertise-tags=${tag}`);
-	let result = await ts(args, 120000);
-	if (!result.ok && /permission denied|must be root|access denied/i.test(result.stderr)) {
-		result = await run("tailscale", args, { timeoutMs: 120000, sudo: true });
+	const base = ["up", `--auth-key=${authKey}`];
+	const withTags = [...base];
+	for (const tag of tags) withTags.push(`--advertise-tags=${tag}`);
+
+	let result = await attempt(withTags);
+	if (!result.ok && tags.length > 0 && /tag|owns|permission/i.test(result.stderr)) {
+		result = await attempt(base);
 	}
 	return result;
+}
+
+/** `null` when the device carries the tag, otherwise what to tell the user. */
+export function missingTagWarning(status: SystemStatus | null, tag: string): string | null {
+	if (!status) return "Could not read tailscale status after joining.";
+	if (status.tags.includes(tag)) return null;
+	let found = "none";
+	if (status.tags.length) found = status.tags.join(", ");
+	return `This device reports tags: ${found}. Expected ${tag}: the pre-auth key must be tagged ${tag}, and its owner must be allowed to use that tag.`;
 }
 
 // ---------------------------------------------------------------------------

@@ -176,7 +176,7 @@ export async function runFunnelSetup(ui: Ui, extDir: string, cfg: Config): Promi
 			`URL:   ${url}`,
 			`Token: ${token}`,
 			"",
-			"On each agent: /join-tailnet → \"Use a public brain URL\", then paste the URL and the token.",
+			"On each agent: /join-tailnet-agent → \"Use a public brain URL\", then paste the URL and the token.",
 			`Tailnet-only access still works too: agents joined with a ${BRAIN_TAG} ACL grant can discover this machine by tag.`,
 			"",
 			"Anyone with the URL *and* the token can read and write the shared memory. Keep the token secret.",

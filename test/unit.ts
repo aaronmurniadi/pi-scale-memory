@@ -40,6 +40,7 @@ import {
 import {
 	funnelDnsWarning,
 	funnelUrl,
+	missingTagWarning,
 	parseSystemStatus,
 } from "../src/tailnet.js";
 import { findPackageSource, inspectInstall } from "../src/update.js";
@@ -151,6 +152,22 @@ check("funnelDnsWarning only accepts the tailnet ts.net domain", () => {
 	assert.equal(funnelDnsWarning("brain.tail1a2b.ts.net"), null);
 	assert.match(String(funnelDnsWarning("nv00016680.substrait.local")), /can only serve names ending in \.ts\.net/);
 	assert.match(String(funnelDnsWarning("")), /no MagicDNS name/);
+});
+
+check("missingTagWarning reports a tag that did not stick", () => {
+	const tagged = parseSystemStatus(
+		JSON.stringify({ BackendState: "Running", Self: { DNSName: "b.tail.ts.net.", Tags: ["tag:brain"] } }),
+	);
+	assert.equal(missingTagWarning(tagged, "tag:brain"), null);
+
+	const untagged = parseSystemStatus(JSON.stringify({ BackendState: "Running", Self: { DNSName: "b.tail.ts.net." } }));
+	const warning = missingTagWarning(untagged, "tag:brain");
+	assert.match(String(warning), /reports tags: none/);
+	assert.match(String(warning), /pre-auth key must be tagged tag:brain/);
+
+	const other = parseSystemStatus(JSON.stringify({ BackendState: "Running", Self: { Tags: ["tag:agent"] } }));
+	assert.match(String(missingTagWarning(other, "tag:brain")), /reports tags: tag:agent/);
+	assert.match(String(missingTagWarning(null, "tag:brain")), /Could not read tailscale status/);
 });
 
 console.log("brain url transport");
@@ -585,7 +602,8 @@ await checkAsync("the extension registers its commands and tools", async () => {
 	assert.deepEqual(commands.sort(), [
 		"brain",
 		"generate-preauth",
-		"join-tailnet",
+		"join-tailnet-agent",
+		"join-tailnet-brain",
 		"self-tag",
 		"setup-funnel",
 		"update-pi-scale-memory",

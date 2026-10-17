@@ -13,7 +13,8 @@
  *   /self-tag               — set this pi agent's role (brain or agent)
  *   /setup-funnel           — brain only: token, join, publish, print the URL
  *   /generate-preauth       — brain only: mint a tag:agent key via the Tailscale API
- *   /join-tailnet           — agent: join the tailnet, or point at a public brain URL
+ *   /join-tailnet-brain     — join this machine as the tag:brain device
+ *   /join-tailnet-agent     — join as a tag:agent device, or use a public brain URL
  *   /brain                  — status | sync | reindex | reconnect | reset
  *   /update-pi-scale-memory — update the extension itself, then reload
  */
@@ -54,7 +55,18 @@ import { createAuthKey } from "./src/apikeys.js";
 import { brainLogPath, ensureBrainServer, stopBrainServer } from "./src/brain-server.js";
 import { runFunnelSetup } from "./src/funnel.js";
 import { inspectInstall, runUpdate } from "./src/update.js";
-import { AGENT_TAG, tailscaleInstalled, UserspaceTailnet, type BrainPeer } from "./src/tailnet.js";
+import {
+	AGENT_TAG,
+	BRAIN_TAG,
+	failureText,
+	joinSystem,
+	missingTagWarning,
+	systemStatus,
+	tailscaleInstalled,
+	UserspaceTailnet,
+	type BrainPeer,
+	waitFor,
+} from "./src/tailnet.js";
 import type { Ui } from "./src/ui.js";
 
 const FLUSH_INTERVAL_MS = 30_000;
@@ -304,7 +316,7 @@ export default function (pi: ExtensionAPI) {
 		if (!cfg.authKey && !cfg.loginServer) {
 			lastError = "not joined yet";
 			status(ctx, "brain: not joined");
-			if (ctx.hasUI) ctx.ui.notify("pi-scale-memory: run /join-tailnet to join a tailnet or set a public brain URL.", "warning");
+			if (ctx.hasUI) ctx.ui.notify("pi-scale-memory: run /join-tailnet-agent to join a tailnet or use a public brain URL.", "warning");
 			return;
 		}
 		status(ctx, "brain: joining tailnet…");
@@ -505,7 +517,7 @@ export default function (pi: ExtensionAPI) {
 			if (sub === "reset") {
 				await disconnect();
 				resetConfig();
-				ctx.ui.notify(`Config removed (${CONFIG_PATH}). Use /self-tag and /join-tailnet to set up again.`, "info");
+				ctx.ui.notify(`Config removed (${CONFIG_PATH}). Use /self-tag and /join-tailnet-brain (or /join-tailnet-agent) to set up again.`, "info");
 				return;
 			}
 			if (sub === "sync") {
@@ -608,7 +620,7 @@ export default function (pi: ExtensionAPI) {
 				);
 				return;
 			}
-			ctx.ui.notify("This pi agent is an agent: memory comes from the machine tagged tag:brain. Next: /join-tailnet.", "info");
+			ctx.ui.notify("This pi agent is an agent: memory comes from the machine tagged tag:brain. Next: /join-tailnet-agent.", "info");
 			if (current === "brain") ctx.ui.notify("Note: the local brain server keeps running if you started it.", "info");
 		},
 	});
@@ -632,57 +644,145 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	// --- /join-tailnet ---
-	pi.registerCommand("join-tailnet", {
-		description: "Agent: join the tailnet as tag:agent, or point at a public brain URL",
+	// --- joining helpers (shared by the two role-specific join commands) ---
+
+	async function askPreauthKey(ctx: ExtensionContext, tag: string): Promise<string | null> {
+		const stored = loadConfig(false).authKey;
+		if (stored) {
+			const source = await ctx.ui.select(`Pre-auth key for ${tag}`, ["Use the stored key", "Enter a new key"]);
+			if (!source) return null;
+			if (source.startsWith("Use the stored")) return stored;
+		}
+		const entered = await ctx.ui.input(`Tailscale pre-auth key tagged ${tag}`, "tskey-auth-...");
+		if (!entered?.trim()) return null;
+		return entered.trim();
+	}
+
+	/** Agent device: userspace tailscaled, tag:agent, then find the brain by tag. */
+	async function joinAsAgent(ctx: ExtensionContext): Promise<void> {
+		const key = await askPreauthKey(ctx, AGENT_TAG);
+		if (!key) return;
+		updateConfig({ role: "agent", authKey: key, brainUrl: undefined });
+		ctx.ui.notify(`Saved. Joining the tailnet as ${AGENT_TAG}…`, "info");
+		await disconnect();
+		await connect(ctx);
+		if (client) {
+			ctx.ui.notify(
+				`Joined as ${tailnet.hostname} and connected to brain "${client.brainName}".`,
+				"info",
+			);
+			return;
+		}
+		ctx.ui.notify(
+			`Joined the tailnet, but no online device tagged ${BRAIN_TAG} was found. Publish the brain with /setup-funnel (or tag a machine ${BRAIN_TAG}), then run /brain reconnect.`,
+			"warning",
+		);
+	}
+
+	/** Agent device without a tailnet: talk straight to the public Funnel URL. */
+	async function joinAsPublicAgent(ctx: ExtensionContext): Promise<void> {
+		const stored = loadConfig(false);
+		const answer = await ctx.ui.input("Brain URL", stored.brainUrl ?? stored.funnelUrl ?? "https://brain.tailnet.ts.net");
+		if (!answer?.trim()) return;
+		let target: { host: string; port: number };
+		try {
+			target = parseBrainUrl(answer.trim());
+		} catch (err) {
+			ctx.ui.notify(errMsg(err), "error");
+			return;
+		}
+		let token = stored.brainToken ?? "";
+		if (!token) {
+			const entered = await ctx.ui.input("Brain token", "printed by /setup-funnel on the brain");
+			if (!entered?.trim()) return;
+			token = entered.trim();
+		}
+		updateConfig({
+			role: "agent",
+			brainUrl: answer.trim().replace(/\/+$/, ""),
+			brainToken: token,
+			authKey: undefined,
+			loginServer: undefined,
+		});
+		ctx.ui.notify(`Saved. Connecting to ${target.host}:${target.port}…`, "info");
+		await disconnect();
+		await connect(ctx);
+	}
+
+	/** Brain device: the machine's own tailscale, tag:brain, hosting the memory. */
+	async function joinAsBrain(ctx: ExtensionContext): Promise<void> {
+		if (!(await tailscaleInstalled())) {
+			ctx.ui.notify("Tailscale is required (tailscale + tailscaled on PATH).", "error");
+			return;
+		}
+		let status = await systemStatus();
+		let alreadyTagged = false;
+		if (status) alreadyTagged = missingTagWarning(status, BRAIN_TAG) === null;
+
+		if (alreadyTagged) {
+			ctx.ui.notify(`Already joined as ${BRAIN_TAG} (${status?.dnsName || status?.hostName}).`, "info");
+		} else {
+			if (status && status.backendState === "Running") {
+				ctx.ui.notify(
+					`This machine is joined as tags: ${status.tags.length ? status.tags.join(", ") : "none"}. Joining again with a ${BRAIN_TAG} key reassigns its tags.`,
+					"info",
+				);
+			}
+			const key = await askPreauthKey(ctx, BRAIN_TAG);
+			if (!key) return;
+			const joined = await joinSystem(key, [BRAIN_TAG]);
+			if (!joined.ok) {
+				ctx.ui.notify(`tailscale up failed:\n${failureText(joined)}`, "error");
+				return;
+			}
+			status = await waitFor(async () => {
+				const current = await systemStatus();
+				if (current && current.backendState === "Running") return true;
+				return false;
+			}, 30000).then(async () => systemStatus());
+			if (!status || status.backendState !== "Running") {
+				ctx.ui.notify("Joined, but tailscale does not report itself as running yet. Re-run in a moment.", "warning");
+			}
+			const warning = missingTagWarning(status, BRAIN_TAG);
+			if (warning) ctx.ui.notify(warning, "warning");
+			else ctx.ui.notify(`Joined the tailnet as ${BRAIN_TAG}.`, "info");
+		}
+
+		updateConfig({ role: "brain", authKey: undefined, brainUrl: undefined });
+		await disconnect();
+		await connect(ctx);
+		ctx.ui.notify(
+			[
+				"This machine is the brain.",
+				"Next: /setup-funnel to give its memory API a public URL (and a token),",
+				"then /generate-preauth for keys the agents can join with.",
+			].join("\n"),
+			"info",
+		);
+	}
+
+	// --- /join-tailnet-agent ---
+	pi.registerCommand("join-tailnet-agent", {
+		description: "Join the tailnet as a tag:agent device, or point at a public brain URL",
 		handler: async (_args, ctx) => {
 			const mode = await ctx.ui.select("How should this agent reach the brain?", [
-				"Join the tailnet as tag:agent (discover the brain by tag)",
+				`Join the tailnet as ${AGENT_TAG} (discover the brain by tag)`,
 				"Use a public brain URL (Funnel)",
 			]);
 			if (!mode) return;
-
 			if (mode.startsWith("Use a public")) {
-				const stored = loadConfig(false);
-				const answer = await ctx.ui.input("Brain URL", stored.brainUrl ?? stored.funnelUrl ?? "https://brain.tailnet.ts.net");
-				if (!answer?.trim()) return;
-				let target: { host: string; port: number };
-				try {
-					target = parseBrainUrl(answer.trim());
-				} catch (err) {
-					ctx.ui.notify(errMsg(err), "error");
-					return;
-				}
-				let token = stored.brainToken ?? "";
-				if (!token) {
-					const entered = await ctx.ui.input("Brain token", "from /setup-funnel on the brain");
-					if (!entered?.trim()) return;
-					token = entered.trim();
-				}
-				const url = answer.trim().replace(/\/+$/, "");
-				updateConfig({ role: "agent", brainUrl: url, brainToken: token, authKey: undefined, loginServer: undefined });
-				ctx.ui.notify(`Saved. Connecting to ${target.host}:${target.port}…`, "info");
-				await disconnect();
-				await connect(ctx);
+				await joinAsPublicAgent(ctx);
 				return;
 			}
+			await joinAsAgent(ctx);
+		},
+	});
 
-			const stored = loadConfig(false).authKey;
-			let authKey = "";
-			if (stored) {
-				const keySource = await ctx.ui.select("Pre-auth key", ["Use the stored key", "Enter a new key"]);
-				if (!keySource) return;
-				if (keySource.startsWith("Use the stored")) authKey = stored;
-			}
-			if (!authKey) {
-				const entered = await ctx.ui.input("Tailscale pre-auth key tagged tag:agent", "tskey-auth-...");
-				if (!entered?.trim()) return;
-				authKey = entered.trim();
-			}
-			updateConfig({ role: "agent", authKey, brainUrl: undefined });
-			ctx.ui.notify("Saved. Joining as tag:agent…", "info");
-			await disconnect();
-			await connect(ctx);
+	// --- /join-tailnet-brain ---
+	pi.registerCommand("join-tailnet-brain", {
+		description: "Join the tailnet as the tag:brain device that hosts the memory",
+		handler: async (_args, ctx) => {
+			await joinAsBrain(ctx);
 		},
 	});
 
@@ -752,7 +852,7 @@ export default function (pi: ExtensionAPI) {
 						created.key,
 						"",
 						`Expires ${created.expires}. reusable=${created.reusable}, ephemeral=${created.ephemeral}.`,
-						"On each agent: /join-tailnet → join the tailnet, then paste this key.",
+						"On each agent: /join-tailnet-agent → join the tailnet, then paste this key.",
 					].join("\n"),
 					"info",
 				);

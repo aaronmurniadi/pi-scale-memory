@@ -36,7 +36,8 @@ Headscale also cannot serve `tailscale serve` yet ([#1921](https://github.com/ju
 | `/self-tag [brain\|agent]` | both | Sets this agent's role, saves it, and reconnects |
 | `/setup-funnel` | brain only | Starts the brain server with a token, joins Tailscale as `tag:brain`, publishes the memory API through Funnel, verifies the public URL, and prints it with the token |
 | `/generate-preauth` | brain only | Mints a `tag:agent` auth key through the Tailscale API (needs an API token with the `auth_keys` scope) |
-| `/join-tailnet` | agent | Either joins the tailnet with a `tag:agent` key and discovers the brain by tag, or points at a public brain URL with its token |
+| `/join-tailnet-agent` | agent | Joins the tailnet with a `tag:agent` key and discovers the brain by tag, or points at a public brain URL with its token |
+| `/join-tailnet-brain` | brain | Joins this machine with a `tag:brain` key, verifies the tag stuck, and switches the role to `brain` |
 | `/brain status\|sync\|reindex\|reconnect\|reset` | both | Shows role, brain, health, search engine, queue and cache age; refreshes the offline mirror; reports the brain's index; rejoins; deletes the saved config |
 | `/update-pi-scale-memory` | both | Updates the extension (git pull, or `pi update`) and reloads it |
 
@@ -45,19 +46,19 @@ Headscale also cannot serve `tailscale serve` yet ([#1921](https://github.com/ju
 On the machine that will hold the memory:
 
 ```
-/self-tag brain
+/join-tailnet-brain  # join with a tag:brain key (sets the role to brain)
 /setup-funnel        # prints the public URL and the brain token
 /generate-preauth    # prints a tag:agent key for the other machines
 ```
 
-On every other machine, either:
+On every other machine:
 
 ```
-/join-tailnet        # "Join the tailnet" + the tag:agent key   (brain discovered by tag)
-/join-tailnet        # or "Use a public brain URL" + URL + token (no tailnet needed)
+/join-tailnet-agent          # "Join the tailnet as tag:agent" + the key
+/join-tailnet-agent          # or "Use a public brain URL" + URL + token (no tailnet needed)
 ```
 
-`/setup-funnel` and `/generate-preauth` refuse to run unless `/self-tag brain` was set first.
+`/setup-funnel` and `/generate-preauth` refuse to run unless the role is `brain`; `/join-tailnet-brain` sets it for you, or use `/self-tag brain`. Joining the tailnet as `tag:brain` does not publish anything on its own — that is what `/setup-funnel` does.
 
 ## What `/setup-funnel` does
 
@@ -114,7 +115,7 @@ tailscale funnel --bg --https=443 8787      # publishes https://<machine>.<tailn
 tailscale funnel status                     # shows what is published
 ```
 
-Then on each agent set the URL and token (or use `/join-tailnet`).
+Then on each agent set the URL and token (or use `/join-tailnet-agent`).
 
 ### Tailscale ACL
 
