@@ -20,14 +20,21 @@ Memory model and tools follow [pi-memory](https://github.com/jayzeng/pi-memory):
 
 ### Sample Headscale ACL
 
-Headscale policy file (HuJSON), e.g. `/etc/headscale/acl.hujson` referenced by `policy.path` in the Headscale config. Replace `aaron@` with your Headscale user (recent versions use the `name@` form):
+Headscale policy file (huJSON), e.g. `/etc/headscale/acl.hujson` referenced by `policy.path` in the Headscale config:
 
 ```jsonc
 {
+  // Every Headscale user allowed to run agents. Add or remove names here and
+  // the ACL below keeps working — nothing is tied to a single user.
+  // Current Headscale versions want the trailing "@" on usernames.
+  "groups": {
+    "group:agents": ["alice@", "bob@"]
+  },
+
   // Who may apply the tags (pre-auth keys and --advertise-tags)
   "tagOwners": {
-    "tag:agent": ["aaron@"],
-    "tag:brain": ["aaron@"]
+    "tag:agent": ["group:agents"],
+    "tag:brain": ["group:agents"]
   },
 
   "acls": [
@@ -42,6 +49,11 @@ Headscale policy file (HuJSON), e.g. `/etc/headscale/acl.hujson` referenced by `
   ]
 }
 ```
+
+Two limits worth knowing when you edit this:
+
+- `tagOwners` accepts only users (`name@`), groups (`group:x`), and tags (`tag:x`). There is no wildcard and no autogroup there: `"*"` and `"autogroup:member"` are rejected as invalid owners. A group is the way to say "any of my users".
+- `*` and autogroups *are* valid in ACL `src`/`dst`. If you would rather allow every device to reach the brain instead of only `tag:agent`, use `"src": ["*"]` or `"src": ["autogroup:member"]` (autogroup:member means untagged personal devices only).
 
 Create the keys and reload the policy:
 
