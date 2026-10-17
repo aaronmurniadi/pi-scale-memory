@@ -53,19 +53,8 @@ import {
 import { createAuthKey } from "./src/apikeys.js";
 import { brainLogPath, ensureBrainServer, stopBrainServer } from "./src/brain-server.js";
 import { inspectInstall, runUpdate } from "./src/update.js";
-import {
-	AGENT_TAG,
-	BRAIN_TAG,
-	failureText,
-	joinSystem,
-	requiresExplicitFlags,
-	missingTagWarning,
-	systemStatus,
-	tailscaleInstalled,
-	UserspaceTailnet,
-	type BrainPeer,
-	waitFor,
-} from "./src/tailnet.js";
+import { AGENT_TAG, BRAIN_TAG, tailscaleInstalled, UserspaceTailnet, type BrainPeer } from "./src/tailnet.js";
+import { brainNodePaths, brainNodeRunning, ensureBrainNode, nodeStatus, stopBrainNode } from "./src/tailnet-node.js";
 import type { Ui } from "./src/ui.js";
 
 const FLUSH_INTERVAL_MS = 30_000;
@@ -239,6 +228,24 @@ export default function (pi: ExtensionAPI) {
 	async function connectLocal(ctx: ExtensionContext, cfg: Config): Promise<void> {
 		status(ctx, "brain: local");
 		try {
+			// The brain reaches agents through its own userspace tailscale node,
+			// published with `tailscale serve` (no sudo, no host tailscale changes).
+			// Nothing is started when the node has never been joined.
+			const joinable = Boolean(cfg.authKey) || fs.existsSync(brainNodePaths().state) || brainNodeRunning();
+			if (joinable) {
+				const node = await ensureBrainNode({
+					port: cfg.brainPort,
+					authKey: cfg.authKey,
+					log: (message) => {
+						if (ctx.hasUI) ctx.ui.notify(`pi-scale-memory: ${message}`, "info");
+					},
+				});
+				if (!node.ok) {
+					if (ctx.hasUI) ctx.ui.notify(`pi-scale-memory: agents cannot reach this brain — ${node.detail}`, "warning");
+				}
+			} else if (ctx.hasUI) {
+				ctx.ui.notify("pi-scale-memory: run /join-tailnet-brain so agents can reach this brain.", "warning");
+			}
 			const server = await ensureBrainServer(
 				EXT_DIR,
 				{ port: cfg.brainPort, token: cfg.brainToken ?? "" },
@@ -483,6 +490,8 @@ export default function (pi: ExtensionAPI) {
 		handler: async (args, ctx) => {
 			const sub = (args ?? "").trim().split(/\s+/)[0] || "status";
 			if (sub === "reset") {
+				await stopBrainServer();
+				await stopBrainNode();
 				await disconnect();
 				resetConfig();
 				ctx.ui.notify(`Config removed (${CONFIG_PATH}). Use /self-tag and /join-tailnet-brain (or /join-tailnet-agent) to set up again.`, "info");
@@ -523,6 +532,8 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			if (sub === "reconnect") {
+				await stopBrainNode();
+
 				await disconnect();
 				await connect(ctx);
 				return;
@@ -556,8 +567,14 @@ export default function (pi: ExtensionAPI) {
 			let cacheInfo = "cache: none";
 			const meta = metaOf(cacheRoot);
 			if (meta) cacheInfo = `cache: ${meta.files} file(s) taken ${meta.takenAt}`;
+			let nodeInfo = `node: ${tailnet.hostname || "n/a"}`;
+			if (cfg.role === "brain") {
+				const node = await nodeStatus();
+				if (node) nodeInfo = `node: ${node.hostname} ${node.ip} tags=[${node.tags.join(",")}]`;
+				else nodeInfo = "node: not joined (run /join-tailnet-brain)";
+			}
 			ctx.ui.notify(
-				`Role: ${cfg.role ?? "unset"} | brain: ${client.brainName} (${where}) health=${health} search=${search} queued=${client.pending} | ${cacheInfo} | node: ${tailnet.hostname || "n/a"}`,
+				`Role: ${cfg.role ?? "unset"} | brain: ${client.brainName} (${where}) health=${health} search=${search} queued=${client.pending} | ${cacheInfo} | ${nodeInfo}`,
 				"info",
 			);
 		},
@@ -628,70 +645,54 @@ export default function (pi: ExtensionAPI) {
 		);
 	}
 
-	/** Brain device: the machine's own tailscale, tag:brain, hosting the memory. */
+	/** Brain device: our own userspace tailscaled, tag:brain, hosting the memory. */
 	async function joinAsBrain(ctx: ExtensionContext): Promise<void> {
 		if (!(await tailscaleInstalled())) {
 			ctx.ui.notify("Tailscale is required (tailscale + tailscaled on PATH).", "error");
 			return;
 		}
-		let status = await systemStatus();
+		const cfg = loadConfig(false);
+		let status = await nodeStatus();
 		let alreadyTagged = false;
-		if (status) alreadyTagged = missingTagWarning(status, BRAIN_TAG) === null;
+		if (status) alreadyTagged = status.tags.includes(BRAIN_TAG);
 
 		if (alreadyTagged) {
-			ctx.ui.notify(`Already joined as ${BRAIN_TAG} (${status?.dnsName || status?.hostName}).`, "info");
-		} else {
-			if (status && status.backendState === "Running") {
-				ctx.ui.notify(
-					`This machine is joined as tags: ${status.tags.length ? status.tags.join(", ") : "none"}. Joining again with a ${BRAIN_TAG} key reassigns its tags.`,
-					"info",
-				);
-			}
-			const key = await askPreauthKey(ctx, BRAIN_TAG);
-			if (!key) return;
-			let joined = await joinSystem(key, [BRAIN_TAG]);
-			if (!joined.ok && requiresExplicitFlags(joined.stderr)) {
-				// joinSystem already retried with the device's own settings named
-				// explicitly, so reaching here means that suggestion was not usable.
-				const reset = await ctx.ui.confirm(
-					"Tailscale refuses to change these settings",
-					[
-						failureText(joined),
-						"",
-						`Retry with --reset? That clears this device's other Tailscale settings (exit node, routes, SSH, hostname) and rejoins with ${BRAIN_TAG} only.`,
-					].join("\n"),
-				);
-				if (!reset) return;
-				joined = await joinSystem(key, [BRAIN_TAG], { reset: true });
-			}
-			if (!joined.ok) {
-				ctx.ui.notify(`tailscale up failed:\n${failureText(joined)}`, "error");
-				return;
-			}
-			if (joined.preservedFlags && joined.preservedFlags.length > 0) {
-				ctx.ui.notify(`Kept this device's existing Tailscale settings: ${joined.preservedFlags.join(" ")}`, "info");
-			}
-			status = await waitFor(async () => {
-				const current = await systemStatus();
-				if (current && current.backendState === "Running") return true;
-				return false;
-			}, 30000).then(async () => systemStatus());
-			if (!status || status.backendState !== "Running") {
-				ctx.ui.notify("Joined, but tailscale does not report itself as running yet. Re-run in a moment.", "warning");
-			}
-			const warning = missingTagWarning(status, BRAIN_TAG);
-			if (warning) ctx.ui.notify(warning, "warning");
-			else ctx.ui.notify(`Joined the tailnet as ${BRAIN_TAG}.`, "info");
+			ctx.ui.notify(
+				`This brain already has its own tailnet node (${status?.hostname || "?"} at ${status?.ip || status?.dnsName || "?"}).`,
+				"info",
+			);
+		}
+		ctx.ui.notify(
+			[
+				"This joins using a private userspace tailscale: no sudo,",
+				"and the machine's own Tailscale is left untouched.",
+			].join("\n"),
+			"info",
+		);
+
+		const key = await askPreauthKey(ctx, BRAIN_TAG);
+		if (!key) return;
+
+		const node = await ensureBrainNode({
+			port: cfg.brainPort,
+			authKey: key,
+			log: (message) => ctx.ui.notify(`pi-scale-memory: ${message}`, "info"),
+		});
+		if (!node.ok) {
+			ctx.ui.notify(node.detail, "error");
+			return;
 		}
 
-		updateConfig({ role: "brain", authKey: undefined });
+		updateConfig({ role: "brain", authKey: key });
 		await disconnect();
 		await connect(ctx);
 		ctx.ui.notify(
 			[
-				"This machine is the brain and its memory API is on the tailnet.",
+				`This machine is the brain, reachable on the tailnet as ${node.detail}.`,
+				`The memory API is published to the tailnet on port ${cfg.brainPort} (proxied to 127.0.0.1).`,
+				"",
 				"Next: /generate-preauth for keys the agents can join with,",
-				`and make sure the ACL lets ${AGENT_TAG} reach ${BRAIN_TAG}:8787.`,
+				`and make sure the ACL lets ${AGENT_TAG} reach ${BRAIN_TAG}:${cfg.brainPort}.`,
 			].join("\n"),
 			"info",
 		);

@@ -27,6 +27,7 @@ import {
 	syncCache,
 } from "../src/cache.js";
 import { BrainClient, localTransport } from "../src/client.js";
+import { run, tailscaleInstalled } from "../src/tailnet.js";
 import {
 	clampLimit,
 	normalizeHits,
@@ -37,14 +38,8 @@ import {
 	relativeFile,
 	stripAnsi,
 } from "../brain/qmd.mjs";
-import {
-	displayFlags,
-	mergeUpArgs,
-	missingTagWarning,
-	parseSuggestedUpArgs,
-	parseSystemStatus,
-	requiresExplicitFlags,
-} from "../src/tailnet.js";
+import { ensureBrainNode, nodeStatus, stopBrainNode } from "../src/tailnet-node.js";
+import { brainNodeHostname, parseNodeStatus, serveArgs, upArgs } from "../src/tailnet-node.js";
 import { findPackageSource, inspectInstall } from "../src/update.js";
 import { parseDurationSeconds } from "../index.js";
 
@@ -105,7 +100,6 @@ async function startBrain(dir: string, port: number, collection: string) {
 			...process.env,
 			BRAIN_DIR: dir,
 			BRAIN_PORT: String(port),
-			BRAIN_HOST: "127.0.0.1",
 			QMD_COLLECTION: collection,
 			QMD_UPDATE: "off",
 		},
@@ -127,59 +121,47 @@ async function startBrain(dir: string, port: number, collection: string) {
 	}
 }
 
-console.log("tailscale helpers");
-check("parseSystemStatus and missingTagWarning agree on the tag", () => {
-	assert.equal(parseSystemStatus("not json"), null);
-	const tagged = parseSystemStatus(
-		JSON.stringify({ BackendState: "Running", Self: { DNSName: "b.tail.ts.net.", Tags: ["tag:brain"] } }),
+console.log("the brain's own tailnet node");
+check("the node hostname is stable and does not collide with the host", () => {
+	assert.equal(brainNodeHostname("NV00016680"), "pi-brain-nv00016680");
+	assert.equal(brainNodeHostname("aaron-mac.local"), "pi-brain-aaron-mac");
+	assert.equal(brainNodeHostname("Weird Name!"), "pi-brain-weird-name");
+	assert.equal(brainNodeHostname(""), "pi-brain");
+	assert.equal(brainNodeHostname("   "), "pi-brain");
+	assert.equal(brainNodeHostname("NV00016680"), brainNodeHostname("NV00016680"), "restarts must reuse the name");
+});
+check("parseNodeStatus reads the fields the brain needs", () => {
+	const status = parseNodeStatus(
+		JSON.stringify({
+			BackendState: "Running",
+			Self: {
+				HostName: "pi-brain-mac",
+				DNSName: "pi-brain-mac.tail1a2b.ts.net.",
+				Tags: ["tag:brain"],
+				TailscaleIPs: ["fd7a:115c:a1e0::1", "100.101.102.103"],
+			},
+		}),
 	);
-	assert.equal(missingTagWarning(tagged, "tag:brain"), null);
-
-	const untagged = parseSystemStatus(JSON.stringify({ BackendState: "Running", Self: { DNSName: "b.tail.ts.net." } }));
-	const warning = missingTagWarning(untagged, "tag:brain");
-	assert.match(String(warning), /reports tags: none/);
-	assert.match(String(warning), /pre-auth key must be tagged tag:brain/);
-
-	const other = parseSystemStatus(JSON.stringify({ BackendState: "Running", Self: { Tags: ["tag:agent"] } }));
-	assert.match(String(missingTagWarning(other, "tag:brain")), /reports tags: tag:agent/);
-	assert.match(String(missingTagWarning(null, "tag:brain")), /Could not read tailscale status/);
+	assert.ok(status);
+	assert.equal(status.backendState, "Running");
+	assert.equal(status.hostname, "pi-brain-mac");
+	assert.equal(status.dnsName, "pi-brain-mac.tail1a2b.ts.net");
+	assert.deepEqual(status.tags, ["tag:brain"]);
+	assert.equal(status.ip, "100.101.102.103", "the IPv4 address is the one agents use");
+	assert.equal(parseNodeStatus("not json"), null);
+	assert.equal(parseNodeStatus("{}")?.backendState, "Unknown");
 });
-
-console.log("joining with existing settings");
-const NON_DEFAULT_ERROR = [
-	"Error: changing settings via 'tailscale up' requires mentioning all",
-	"non-default flags. To proceed, either re-run your command with --reset or",
-	"use the command below to explicitly mention the current value of all",
-	"non-default settings:",
-	"",
-	"\ttailscale up --accept-routes --ssh --hostname=brain",
-	"",
-].join("\n");
-
-check("the non-default settings error is recognised and its suggestion parsed", () => {
-	assert.equal(requiresExplicitFlags(NON_DEFAULT_ERROR), true);
-	assert.equal(requiresExplicitFlags("Error: something else"), false);
-	assert.deepEqual(parseSuggestedUpArgs(NON_DEFAULT_ERROR), ["--accept-routes", "--ssh", "--hostname=brain"]);
-	assert.equal(parseSuggestedUpArgs("tailscale up\n"), null);
-	assert.equal(parseSuggestedUpArgs("no suggestion here"), null);
+check("up keeps the node's own settings and never accepts routes or DNS", () => {
+	const args = upArgs("tskey-auth-x", "pi-brain-mac");
+	assert.ok(args.includes("--auth-key=tskey-auth-x"));
+	assert.ok(args.includes("--advertise-tags=tag:brain"));
+	assert.ok(args.includes("--hostname=pi-brain-mac"));
+	assert.ok(args.includes("--accept-dns=false"), "the host's DNS must not be touched");
+	assert.ok(args.includes("--accept-routes=false"));
+	assert.equal(args[0], "up");
 });
-check("the retry keeps the device's settings and adds ours", () => {
-	const merged = mergeUpArgs(["--accept-routes", "--ssh", "--advertise-tags=tag:dws"], "tskey-auth-x", ["tag:brain"]);
-	assert.equal(merged[0], "up");
-	assert.ok(merged.includes("--auth-key=tskey-auth-x"));
-	assert.ok(merged.includes("--accept-routes"), "an existing setting must not be dropped");
-	assert.ok(merged.includes("--ssh"));
-	const tags = merged.filter((a) => a.startsWith("--advertise-tags="));
-	assert.equal(tags.length, 1, "tags must be merged into one flag");
-	assert.equal(tags[0], "--advertise-tags=tag:dws,tag:brain");
-});
-check("an echoed auth key is replaced, not duplicated, and never displayed", () => {
-	const merged = mergeUpArgs(["up", "--auth-key=old", "--advertise-tags=tag:brain"], "new-key", ["tag:brain"]);
-	const keys = merged.filter((a) => a.startsWith("--auth-key="));
-	assert.deepEqual(keys, ["--auth-key=new-key"]);
-	assert.equal(merged.filter((a) => a === "up").length, 1);
-	assert.deepEqual(displayFlags(["--auth-key=secret", "--ssh", "-x", "--accept-routes"]), ["--ssh", "--accept-routes"]);
-	assert.ok(!displayFlags(["--auth-key=secret"]).join(" ").includes("secret"));
+check("serve publishes the memory port to the tailnet over loopback", () => {
+	assert.deepEqual(serveArgs(8787), ["serve", "--bg", "--tcp=8787", "tcp://127.0.0.1:8787"]);
 });
 
 console.log("tailscale api keys");
@@ -434,6 +416,53 @@ await checkAsync("the brain server lifecycle starts, reports and stops", async (
 		fs.rmSync(dir, { recursive: true, force: true });
 	}
 });
+
+if (await tailscaleInstalled()) {
+	await checkAsync("the brain node is userspace-only and leaves the host daemon alone", async () => {
+		const hostBefore = await run("tailscale", ["status", "--json"], { timeoutMs: 20000 });
+		let before: any = null;
+		if (hostBefore.ok || hostBefore.stdout.trim()) {
+			try {
+				before = JSON.parse(hostBefore.stdout);
+			} catch {
+				before = null;
+			}
+		}
+
+		try {
+			const node = await ensureBrainNode({ port: 8787 });
+			assert.equal(node.ok, false, "without a pre-auth key this node cannot join");
+			assert.match(node.detail, /not joined|pre-auth key/);
+
+			// Our own socket answers, and it is a different node from the host's.
+			const status = await nodeStatus();
+			assert.ok(status, "the private socket must answer status");
+			assert.equal(status.backendState, "NeedsLogin");
+
+			if (before) {
+				const hostAfter = await run("tailscale", ["status", "--json"], { timeoutMs: 20000 });
+				let after: any = null;
+				try {
+					after = JSON.parse(hostAfter.stdout);
+				} catch {
+					after = null;
+				}
+				assert.ok(after, "the host daemon must still answer");
+				assert.equal(after.BackendState, before.BackendState, "the host daemon's state must not change");
+				assert.equal(after.Self?.NodeID, before.Self?.NodeID, "the host must still be the same node");
+				assert.equal(
+					Object.keys(after.Peer ?? {}).length,
+					Object.keys(before.Peer ?? {}).length,
+					"the host's peers must not change",
+				);
+			}
+		} finally {
+			await stopBrainNode();
+		}
+	});
+} else {
+	console.log("  skip brain node test: tailscale is not installed");
+}
 
 console.log("agent offline cache");
 await checkAsync("mirrors the brain, then serves reads while offline", async () => {

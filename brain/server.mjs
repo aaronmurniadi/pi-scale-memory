@@ -11,8 +11,11 @@
  * Search: qmd (keyword / semantic / deep) when installed, otherwise the built-in
  * BM25 search over the same files. See brain/qmd.mjs.
  *
+ * It binds loopback by default: the brain's own userspace tailscale node
+ * publishes it to the tailnet with `tailscale serve`.
+ *
  * Env: BRAIN_DIR (default ~/.pi-scale-brain), BRAIN_PORT (8787),
- *      BRAIN_HOST (0.0.0.0), BRAIN_TOKEN (optional shared bearer token)
+ *      BRAIN_HOST (127.0.0.1), BRAIN_TOKEN (optional shared bearer token)
  */
 import fs from "node:fs";
 import http from "node:http";
@@ -53,7 +56,7 @@ import {
 
 const DIR = process.env.BRAIN_DIR || path.join(os.homedir(), ".pi-scale-brain");
 const PORT = Number(process.env.BRAIN_PORT || 8787);
-const HOST = process.env.BRAIN_HOST || "0.0.0.0";
+const HOST = process.env.BRAIN_HOST || "127.0.0.1";
 const TOKEN = process.env.BRAIN_TOKEN || "";
 const MAX_BODY = 2 * 1024 * 1024;
 const SEARCH_MODE = normalizeMode(process.env.QMD_SEARCH_MODE);

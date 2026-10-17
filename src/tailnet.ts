@@ -1,12 +1,12 @@
 /**
  * Tailscale plumbing.
  *
- * Two distinct roles use this module:
- *   - the brain joins the tailnet with the **system** tailscale as tag:brain, so
- *     its memory API is reachable at its tailnet address;
- *   - agents each run a private **userspace** tailscaled (no TUN device, no route
- *     changes, SOCKS5 proxy only) so joining a tailnet never disturbs the
- *     machine's own system tailscale.
+ * Nothing here ever talks to the machine's system tailscale: every node is a
+ * private userspace tailscaled with its own socket and state.
+ *   - agents run one in-process for the session (memory-only state, ephemeral),
+ *     and reach the brain through its SOCKS5 proxy;
+ *   - the brain runs a detached one (see src/tailnet-node.ts) and publishes its
+ *     memory API to the tailnet with `tailscale serve`.
  */
 import { type ChildProcess, execFile, spawn } from "node:child_process";
 import * as crypto from "node:crypto";
@@ -66,11 +66,6 @@ export function failureText(r: RunResult): string {
 	return text.split("\n").slice(-4).join("\n");
 }
 
-/** Run the system tailscale CLI. */
-export function ts(args: string[], timeoutMs = 30000): Promise<RunResult> {
-	return run("tailscale", args, { timeoutMs });
-}
-
 export async function tailscaleInstalled(): Promise<boolean> {
 	const [cli, daemon] = await Promise.all([
 		run("tailscale", ["version"], { timeoutMs: 5000 }),
@@ -101,185 +96,6 @@ export async function waitFor(check: () => Promise<boolean>, timeoutMs: number):
 		if (Date.now() > deadline) return false;
 		await sleep(250);
 	}
-}
-
-// ---------------------------------------------------------------------------
-// System node status (the brain side)
-// ---------------------------------------------------------------------------
-
-export interface SystemStatus {
-	backendState: string;
-	/** MagicDNS name with the trailing dot removed, e.g. brain.tailnet.ts.net. */
-	dnsName: string;
-	hostName: string;
-	tags: string[];
-	tailnetName: string;
-}
-
-export function parseSystemStatus(raw: string): SystemStatus | null {
-	let json: any;
-	try {
-		json = JSON.parse(raw);
-	} catch {
-		return null;
-	}
-	const self = json?.Self ?? {};
-	let dns = String(self.DNSName ?? "").trim();
-	if (dns.endsWith(".")) dns = dns.slice(0, -1);
-	const tailnet = json?.CurrentTailnet ?? {};
-	return {
-		backendState: String(json?.BackendState ?? "Unknown"),
-		dnsName: dns,
-		hostName: String(self.HostName ?? ""),
-		tags: Array.isArray(self.Tags) ? self.Tags.map(String) : [],
-		tailnetName: String(tailnet.Name ?? ""),
-	};
-}
-
-export async function systemStatus(): Promise<SystemStatus | null> {
-	const r = await ts(["status", "--json"], 20000);
-	if (!r.ok && !r.stdout.trim()) return null;
-	return parseSystemStatus(r.stdout);
-}
-
-function attempt(args: string[]): Promise<RunResult> {
-	return ts(args, 120000).then((result) => {
-		if (!result.ok && /permission denied|must be root|access denied/i.test(result.stderr)) {
-			return run("tailscale", args, { timeoutMs: 120000, sudo: true });
-		}
-		return result;
-	});
-}
-
-export interface JoinResult extends RunResult {
-	/** Non-default settings carried over from this device's existing prefs. */
-	preservedFlags?: string[];
-	usedReset?: boolean;
-}
-
-/**
- * Tailscale refuses to change a setting while the device already has non-default
- * ones, and prints the command to use instead:
- *
- *   changing settings via 'tailscale up' requires mentioning all non-default
- *   flags ... use the command below to explicitly mention the current value of
- *   all non-default settings:
- *       tailscale up --accept-routes --ssh
- */
-export function requiresExplicitFlags(stderr: string): boolean {
-	return /non-default|explicitly mention/i.test(stderr);
-}
-
-/** Pull the suggested `tailscale up ...` argument list out of that error. */
-export function parseSuggestedUpArgs(stderr: string): string[] | null {
-	for (const line of stderr.split(/\r?\n/)) {
-		const text = line.trim();
-		if (!text.startsWith("tailscale up")) continue;
-		const args = text.split(/\s+/).slice(2);
-		if (args.length === 0) return null;
-		return args;
-	}
-	return null;
-}
-
-function tagValues(args: string[]): string[] {
-	const tags: string[] = [];
-	for (const arg of args) {
-		if (!arg.startsWith("--advertise-tags=")) continue;
-		for (const tag of arg.slice("--advertise-tags=".length).split(",")) {
-			if (tag.trim()) tags.push(tag.trim());
-		}
-	}
-	return tags;
-}
-
-/** Flags safe to show the user: never the pre-auth key. */
-export function displayFlags(args: string[]): string[] {
-	const out: string[] = [];
-	for (const arg of args) {
-		if (arg.startsWith("--auth-key=")) continue;
-		if (arg.startsWith("--authkey=")) continue;
-		if (!arg.startsWith("--")) continue;
-		out.push(arg);
-	}
-	return out;
-}
-
-/**
- * Rebuild the suggested command with our key and tag, keeping every other
- * non-default setting the device already had (routes, SSH, exit node, hostname).
- */
-export function mergeUpArgs(suggested: string[], authKey: string, tags: string[]): string[] {
-	const merged: string[] = ["up"];
-	const kept: string[] = [];
-	for (const arg of suggested) {
-		if (arg === "up") continue;
-		if (arg.startsWith("--auth-key=") || arg.startsWith("--authkey=")) continue;
-		if (arg.startsWith("--advertise-tags=")) continue;
-		if (arg === "--reset") continue;
-		kept.push(arg);
-	}
-
-	const allTags: string[] = [];
-	for (const tag of [...tagValues(suggested), ...tags]) {
-		if (!allTags.includes(tag)) allTags.push(tag);
-	}
-
-	merged.push(`--auth-key=${authKey}`);
-	if (allTags.length > 0) merged.push(`--advertise-tags=${allTags.join(",")}`);
-	merged.push(...kept);
-	return merged;
-}
-
-/**
- * Join the system tailscale.
- *
- * Three failure modes are handled rather than surfaced raw:
- *   - a device that already has non-default settings: retried with those
- *     settings named explicitly, so nothing the user configured is lost;
- *   - a pre-auth key that already carries its tag and cannot grant it: retried
- *     without `--advertise-tags`;
- *   - a missing tag on the key: reported, since succeeding without the tag would
- *     leave agents unable to find this brain.
- */
-export async function joinSystem(
-	authKey: string,
-	tags: string[] = [],
-	opts: { reset?: boolean } = {},
-): Promise<JoinResult> {
-	const base = ["up", `--auth-key=${authKey}`];
-	const withTags = [...base];
-	for (const tag of tags) withTags.push(`--advertise-tags=${tag}`);
-	if (opts.reset) withTags.push("--reset");
-
-	let result = await attempt(withTags);
-	if (result.ok) return result;
-
-	if (requiresExplicitFlags(result.stderr)) {
-		const suggested = parseSuggestedUpArgs(result.stderr);
-		if (suggested) {
-			const merged = mergeUpArgs(suggested, authKey, tags);
-			const retried = await attempt(merged);
-			if (retried.ok) {
-				return { ...retried, preservedFlags: displayFlags(suggested) };
-			}
-			return retried;
-		}
-	}
-
-	if (tags.length > 0 && /tag|owns|permission/i.test(result.stderr)) {
-		return attempt(base);
-	}
-	return result;
-}
-
-/** `null` when the device carries the tag, otherwise what to tell the user. */
-export function missingTagWarning(status: SystemStatus | null, tag: string): string | null {
-	if (!status) return "Could not read tailscale status after joining.";
-	if (status.tags.includes(tag)) return null;
-	let found = "none";
-	if (status.tags.length) found = status.tags.join(", ");
-	return `This device reports tags: ${found}. Expected ${tag}: the pre-auth key must be tagged ${tag}, and its owner must be allowed to use that tag.`;
 }
 
 // ---------------------------------------------------------------------------
