@@ -1,7 +1,7 @@
 {
 	"name": "pi-scale-memory",
 	"version": "0.1.0",
-	"description": "Pi agent extension: shared remote memory over Tailscale, published with Funnel, with offline mirroring",
+	"description": "Pi agent extension: one shared memory for many pi agents over Tailscale, with offline mirroring",
 	"type": "module",
 	"main": "index.ts",
 	"keywords": [

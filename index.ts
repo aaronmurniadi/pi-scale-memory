@@ -582,7 +582,7 @@ export default function (pi: ExtensionAPI) {
 			await connect(ctx);
 			if (role === "brain") {
 				ctx.ui.notify(
-					"This pi agent is the brain: memory is served locally. Next: /setup-headscale to host the tailnet, then /generate-preauth for agent keys.",
+					"This pi agent is the brain: memory is served locally. Next: /generate-preauth for agent keys, and make sure the ACL lets tag:agent reach tag:brain:8787.",
 					"info",
 				);
 				return;
