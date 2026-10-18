@@ -11,7 +11,7 @@ import { brainLogPath, stopBrainServer } from "./brain-server.js";
 import { configDir } from "./config.js";
 import { daemonFiles, readDaemonPid } from "./daemon.js";
 import { PSM_TMP_PREFIX, reapOrphanedTailscaled, run } from "./tailnet.js";
-import { brainNodePaths, stopBrainNode } from "./tailnet-node.js";
+import { agentNodePaths, brainNodePaths, logoutAgentNode, stopAgentNode, stopBrainNode } from "./tailnet-node.js";
 
 /** Sessions that crashed leave their userspace tailscaled socket dir behind. */
 export const TMP_PREFIX = PSM_TMP_PREFIX;
@@ -71,6 +71,8 @@ export function planReset(now = Date.now(), tmpDir = os.tmpdir()): ResetPlan {
 	if (brainPid !== null) stop.push(`brain server (pid ${brainPid})`);
 	const nodePid = readDaemonPid("brain-tailscaled");
 	if (nodePid !== null) stop.push(`the brain's tailscale node (pid ${nodePid})`);
+	const agentPid = readDaemonPid("agent-tailscaled");
+	if (agentPid !== null) stop.push(`this machine's agent node (pid ${agentPid})`);
 
 	const present = remove.filter((p) => fs.existsSync(p));
 	return { remove, stop, present };
@@ -110,12 +112,17 @@ export interface ResetOutcome {
 export async function performReset(log: (message: string) => void): Promise<ResetOutcome> {
 	const outcome: ResetOutcome = { stopped: [], removed: [], loggedOut: [] };
 	const node = brainNodePaths();
+	const agent = agentNodePaths();
 
-	// Log out before the socket disappears, so the node does not linger as a
-	// live device holding an expired key.
+	// Log out before the sockets disappear, so neither node lingers as a live
+	// device holding an expired key. The agent node is machine-wide, so this is
+	// the only place it gets logged out.
 	if (fs.existsSync(node.socket)) {
 		const res = await run("tailscale", [`--socket=${node.socket}`, "logout"], { timeoutMs: 20000 });
 		if (res.ok) outcome.loggedOut.push("the brain's tailscale node");
+	}
+	if (fs.existsSync(agent.socket) && (await logoutAgentNode())) {
+		outcome.loggedOut.push("this machine's agent node");
 	}
 
 	const server = await stopBrainServer();
@@ -127,6 +134,11 @@ export async function performReset(log: (message: string) => void): Promise<Rese
 	if (nodeStopped.stopped) {
 		outcome.stopped.push(`brain tailscale node (${nodeStopped.detail})`);
 		log(`stopped the brain's tailscale node (${nodeStopped.detail})`);
+	}
+	const agentStopped = await stopAgentNode();
+	if (agentStopped.stopped) {
+		outcome.stopped.push(`agent tailscale node (${agentStopped.detail})`);
+		log(`stopped this machine's agent node (${agentStopped.detail})`);
 	}
 
 	// Those same crashed sessions leave their tailscaled running with no socket to

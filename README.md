@@ -4,7 +4,7 @@ A pi extension that gives many pi agents one shared memory (a "brain") over a pr
 
 **Every node here is a private userspace `tailscaled`.** Nothing in this extension ever calls the machine's own Tailscale: no `sudo`, no TUN device, no route or DNS changes, and no reading or writing of the host's Tailscale state. On a machine already signed in to another tailnet (a work one, say), pi joins its own separate node and leaves the host alone.
 
-The brain runs a detached userspace node and publishes its memory API to the tailnet with `tailscale serve --tcp`, which proxies tailnet traffic to `127.0.0.1`. Agents run a userspace node for the session and reach the brain through its SOCKS5 proxy. Agents also keep a local mirror of the memory, so they can still read while the brain is unreachable.
+The brain runs a detached userspace node and publishes its memory API to the tailnet with `tailscale serve --tcp`, which proxies tailnet traffic to `127.0.0.1`. Agents run a detached node too, one per machine, and reach the brain through its SOCKS5 proxy. Every session on a machine shares that one node, so a machine joins once and keeps the same device from then on. Agents also keep a local mirror of the memory, so they can still read while the brain is unreachable.
 
 **Agents find the brain by asking, not by tag.** Each agent reads the peer list it already has from its own netmap and asks every peer on the memory port whether it is the brain. A peer answers by identifying itself in its `/v1/health` response (`service: pi-scale-memory`, `role: brain`), so no tag policy, no `tagOwners`, and no port scanning of anything outside your tailnet are involved. **This extension uses no tags at all** — there is no tag to declare, and nothing to configure in `tagOwners`, for either role.
 
@@ -13,7 +13,7 @@ Memory model and tools follow [pi-memory](https://github.com/jayzeng/pi-memory):
 ## Requirements
 
 - **Tailscale** on every machine (`tailscale` and `tailscaled` on `PATH`). No root access is needed.
-- Pre-auth keys, created in the Tailscale admin console: one for the brain, reusable ones for agents. No tags are involved.
+- Pre-auth keys, created in the Tailscale admin console: one per machine, for whichever role that machine has. No tags are involved. A key is only used to register a node once, so a single-use key is enough for a machine — it is not needed again on later sessions.
 - Node >= 22.
 - Optional, on the **brain**: [qmd](https://github.com/tobi/qmd) for semantic and deep search, installable from inside pi with `/install-qmd`. Agents never need qmd.
 
@@ -26,7 +26,7 @@ Nothing is published to the internet: the memory API is reachable only from the 
 | Role | What it does | Memory path |
 |---|---|---|
 | `brain` | Runs the memory server plus a detached userspace node, and publishes the API with `tailscale serve` | local server on `127.0.0.1`, proxied to the tailnet |
-| `agent` | Runs a session userspace node, then asks its peers which one is the brain | the tailnet, plus a local mirror for offline reads |
+| `agent` | Runs a detached userspace node (shared by every session on the machine), then asks its peers which one is the brain | the tailnet, plus a local mirror for offline reads |
 
 ## Commands
 
@@ -42,9 +42,10 @@ Nothing is published to the internet: the memory API is reachable only from the 
 
 ### Quick start
 
-Create a pre-auth key in the Tailscale admin console (Settings -> Keys) for the
-brain, and one for the agents (reusable). Then, on the machine that will hold the
-memory:
+Create a pre-auth key in the Tailscale admin console (Settings -> Keys) for each
+machine: one for the brain, one for each agent. Leave Reusable off if you like —
+a node registers once and keeps its identity, so a key is spent only by that
+machine's first join. Then, on the machine that will hold the memory:
 
 ```
 /join-tailnet-brain  # paste the brain's key
@@ -56,9 +57,9 @@ On every other machine:
 /join-tailnet-agent  # paste an agent key
 ```
 
-That is the whole setup. The brain prints the node name and tailnet address it joined as, and agents report the node name they registered as plus the brain they found. Nothing has to be declared beforehand: agents identify the brain by asking it. Two agents can share one pre-auth key if it is reusable.
+That is the whole setup. The brain prints the node name and tailnet address it joined as, and agents report the node name they registered as plus the brain they found. Nothing has to be declared beforehand: agents identify the brain by asking it. One key covers one machine's first join; make it reusable only if you want the same key to serve several machines.
 
-Two nodes appear in your tailnet: `pi-brain-<host>` for the brain and `pi-agent-<host>-<id>` per agent session. The host machines' own Tailscale devices are untouched and can be in a different tailnet entirely.
+Two nodes appear in your tailnet: `pi-brain-<host>` for the brain and `pi-agent-<host>` for each agent machine. A machine keeps its device across sessions and restarts rather than registering a new one, so the list does not grow as you use it. The host machines' own Tailscale devices are untouched and can be in a different tailnet entirely.
 
 ### Making it reachable
 
@@ -200,7 +201,7 @@ This extension targets Tailscale. It has not been tested against Headscale; `PI_
 
 It also clears socket directories left behind by sessions that crashed, but only those older than an hour, so a concurrently running pi is left alone. Everything it will stop and delete is listed in the confirmation prompt before anything happens; declining changes nothing.
 
-It cannot delete the machines this extension registered in your tailnet — that needs the admin console or the Tailscale API. They are listed there as devices named `pi-brain-<host>` and `pi-agent-<host>-<id>`; delete them yourself, or use ephemeral pre-auth keys so they expire on their own. After a reset, set up again with `/join-tailnet-brain` or `/join-tailnet-agent`.
+It cannot delete the machines this extension registered in your tailnet — that needs the admin console or the Tailscale API. They are listed there as devices named `pi-brain-<host>` and `pi-agent-<host>`. A reset logs the agent node out too, before its socket is removed, so the device does not linger holding an expired key. After a reset, set up again with `/join-tailnet-brain` or `/join-tailnet-agent`, which registers a fresh device.
 
 ## Updating
 
@@ -228,9 +229,9 @@ npm test         # unit tests + live brain-server and cache round-trips over loo
 npm run build    # tsc --noEmit
 ```
 
-`test/unit.ts` covers the brain node's naming, status and serve helpers, peer parsing, the discovery probe (ranking, ambiguity, a pinned host, an unresponsive peer), the qmd install planning, self-update detection, the qmd plumbing, the brain server lifecycle (including token enforcement and conflict detection), the offline cache, and command registration. When qmd is installed it also runs a real semantic search through the brain using a throwaway collection that it removes afterwards, so it does not disturb any qmd index you already have.
+`test/unit.ts` covers both nodes' naming, paths, status and serve helpers, peer parsing, the discovery probe (ranking, ambiguity, a pinned host, an unresponsive peer, the deadline it hands the probe), a refused pre-auth key, the SOCKS handshake timeout and probe budget, the qmd install planning, self-update detection, the qmd plumbing, the brain server lifecycle (including token enforcement and conflict detection), the offline cache, and command registration. When qmd is installed it also runs a real semantic search through the brain using a throwaway collection that it removes afterwards, so it does not disturb any qmd index you already have.
 
-The suite also starts a real userspace `tailscaled` and asserts it is a separate, unjoined node while the host's own daemon keeps its state, node id and peers. What is **not** covered: an actual successful join, serve proxying, and discovery across real peers — those need a live tailnet and a pre-auth key.
+The suite also starts a real userspace `tailscaled` and asserts it is a separate, unjoined node while the host's own daemon keeps its state, node id and peers. What is **not** covered: an actual successful join, serve proxying, and discovery across real peers — those need a live tailnet and a pre-auth key. In particular, that a second session *reuses* an already-joined node is verified against a live daemon (one process, one pid) but not against a real tailnet.
 
 ## Security
 

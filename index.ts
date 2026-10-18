@@ -51,7 +51,7 @@ import {
 } from "./src/config.js";
 import { brainLogPath, ensureBrainServer, stopBrainServer } from "./src/brain-server.js";
 import { inspectInstall, runUpdate } from "./src/update.js";
-import { reapOrphanedTailscaled, tailscaleInstalled, UserspaceTailnet } from "./src/tailnet.js";
+import { reapOrphanedTailscaled, tailscaleInstalled } from "./src/tailnet.js";
 import { findBrain, isBrainResponse } from "./src/discovery.js";
 import {
 	installCandidates,
@@ -62,7 +62,17 @@ import {
 	qmdStatus,
 } from "./src/qmd-install.js";
 import { describeReset, performReset, planReset, summarizeReset } from "./src/reset.js";
-import { brainNodePaths, brainNodeRunning, ensureBrainNode, nodeStatus, stopBrainNode, unpublishBrainPort } from "./src/tailnet-node.js";
+import {
+	agentNodeStatus,
+	agentPeers,
+	brainNodePaths,
+	brainNodeRunning,
+	ensureAgentNode,
+	ensureBrainNode,
+	nodeStatus,
+	stopBrainNode,
+	unpublishBrainPort,
+} from "./src/tailnet-node.js";
 import type { Ui } from "./src/ui.js";
 
 const FLUSH_INTERVAL_MS = 30_000;
@@ -133,7 +143,12 @@ function uiFrom(ctx: ExtensionContext): Ui {
 }
 
 export default function (pi: ExtensionAPI) {
-	const tailnet = new UserspaceTailnet();
+	/**
+	 * This machine's agent node, shared with every other session on the machine.
+	 * It outlives a session on purpose: the node keeps its identity, so joining
+	 * costs a pre-auth key once and nothing afterwards.
+	 */
+	let agentNode: { socksPort: number; hostname: string } | null = null;
 	let client: BrainClient | null = null;
 	let snapshot = "";
 	let flushTimer: ReturnType<typeof setInterval> | null = null;
@@ -287,12 +302,14 @@ export default function (pi: ExtensionAPI) {
 	 * Tags are only a hint for probe order, so a tailnet with no tag policy works.
 	 */
 	async function discoverBrain(ctx: ExtensionContext, cfg: Config, announce = false): Promise<string | null> {
-		const peers = await tailnet.peers();
+		const peers = await agentPeers();
+		if (!agentNode) throw new Error("this machine's tailnet node is not up");
+		const transport = tailnetTransport(agentNode.socksPort);
 		const found = await findBrain(
 			peers,
 			async (host, timeoutMs) => {
 				try {
-					const res = await tailnetTransport(tailnet)(
+					const res = await transport(
 						host,
 						cfg.brainPort,
 						{
@@ -347,13 +364,23 @@ export default function (pi: ExtensionAPI) {
 		}
 		status(ctx, "brain: joining tailnet…");
 		try {
-			await tailnet.start({ loginServer: cfg.loginServer, authKey: cfg.authKey ?? "" });
+			const node = await ensureAgentNode({
+				loginServer: cfg.loginServer,
+				authKey: cfg.authKey,
+				log: (message) => {
+					if (ctx.hasUI) ctx.ui.notify(`pi-scale-memory: ${message}`, "info");
+				},
+			});
+			if (!node.ok || node.socksPort === undefined) {
+				throw new Error(node.detail);
+			}
+			agentNode = { socksPort: node.socksPort, hostname: node.hostname ?? "" };
 			const candidate = new BrainClient({
 				host: "",
 				port: cfg.brainPort,
 				token: cfg.brainToken ?? "",
 				agentId,
-				transport: tailnetTransport(tailnet),
+				transport: tailnetTransport(node.socksPort),
 				resolveHost: () => discoverBrain(ctx, cfg),
 			});
 			status(ctx, "brain: searching peers…");
@@ -389,9 +416,11 @@ export default function (pi: ExtensionAPI) {
 			clearInterval(flushTimer);
 			flushTimer = null;
 		}
-		await tailnet.stop();
-		// A session that was killed outright leaves its node running with the socket
-		// already deleted, which makes it unreachable from then on. Clear those out.
+		// The node is shared per machine and stays up between sessions, so this only
+		// drops our handle to it. /reset-pi-scale-settings stops it for good.
+		agentNode = null;
+		// Clear out anything an older version left running with its socket already
+		// deleted, which is unreachable from then on.
 		await reapOrphanedTailscaled();
 		client = null;
 		snapshot = "";
@@ -619,7 +648,10 @@ export default function (pi: ExtensionAPI) {
 			let cacheInfo = "cache: none";
 			const meta = metaOf(cacheRoot);
 			if (meta) cacheInfo = `cache: ${meta.files} file(s) taken ${meta.takenAt}`;
-			let nodeInfo = `node: ${tailnet.hostname || "n/a"}`;
+			// The node is machine-wide, so report it from the node itself: it is there
+			// even for a session that has not connected to a brain yet.
+			const agent = await agentNodeStatus();
+			let nodeInfo = `node: ${agent?.hostname || "not joined (run /join-tailnet-agent)"}`;
 			if (cfg.role === "brain") {
 				const node = await nodeStatus();
 				if (node) nodeInfo = `node: ${node.hostname} ${node.ip} tags=[${node.tags.join(",")}]`;
@@ -689,7 +721,7 @@ export default function (pi: ExtensionAPI) {
 		await connect(ctx);
 		if (client) {
 			ctx.ui.notify(
-				`Joined as ${tailnet.hostname} and connected to brain "${client.brainName}".`,
+				`Joined as ${agentNode?.hostname || "this machine"} and connected to brain "${client.brainName}".`,
 				"info",
 			);
 			return;
@@ -819,17 +851,11 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		// This session's own agent node first, while its socket still exists.
-		let loggedOutThisSession = false;
-		try {
-			loggedOutThisSession = await tailnet.logout();
-		} catch {
-			/* best effort */
-		}
+		// The agent node is machine-wide and is logged out by the reset itself, so
+		// there is nothing session-specific to log out here.
 		await disconnect();
 
 		const outcome = await performReset((message) => ctx.ui.notify(`pi-scale-memory: ${message}`, "info"));
-		if (loggedOutThisSession) outcome.loggedOut.push("this session's agent node");
 		ctx.ui.notify(summarizeReset(outcome), "info");
 	}
 

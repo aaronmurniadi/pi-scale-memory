@@ -2,17 +2,17 @@
  * Tailscale plumbing.
  *
  * Nothing here ever talks to the machine's system tailscale: every node is a
- * private userspace tailscaled with its own socket and state.
- *   - agents run one in-process for the session (memory-only state, ephemeral),
- *     and reach the brain through its SOCKS5 proxy;
- *   - the brain runs a detached one (see src/tailnet-node.ts) and publishes its
- *     memory API to the tailnet with `tailscale serve`.
+ * private userspace tailscaled with its own socket and state, run detached and
+ * one per machine (both live in src/tailnet-node.ts).
+ *   - an agent reaches the brain through its node's SOCKS5 proxy;
+ *   - the brain publishes its memory API to the tailnet with `tailscale serve`.
+ *
+ * A node keeps its own state, so it joins once and then reuses its device. That
+ * is what lets a single-use pre-auth key be enough for a machine.
  */
-import { type ChildProcess, execFile, spawn } from "node:child_process";
-import * as crypto from "node:crypto";
+import { execFile } from "node:child_process";
 import * as fs from "node:fs";
 import * as net from "node:net";
-import * as os from "node:os";
 import * as path from "node:path";
 
 /** Prefix of the temp dirs that hold an agent node's socket. */
@@ -65,6 +65,7 @@ export function failureText(r: RunResult): string {
 	if (!text) return `exited with code ${r.code}`;
 	return text.split("\n").slice(-4).join("\n");
 }
+
 
 export async function tailscaleInstalled(): Promise<boolean> {
 	const [cli, daemon] = await Promise.all([
@@ -157,98 +158,6 @@ export function agentUpArgs(hostname: string, authKey: string, loginServer?: str
 	];
 	if (loginServer) args.push(`--login-server=${loginServer}`);
 	return args;
-}
-
-export interface TailnetStartOptions {
-	/** Empty/undefined = the Tailscale control plane. Otherwise a login server URL. */
-	loginServer?: string;
-	authKey: string;
-}
-
-/** A private userspace tailscaled: no TUN device, no route changes, SOCKS5 proxy only. */
-export class UserspaceTailnet {
-	private proc: ChildProcess | null = null;
-	private dir: string | null = null;
-	private socket = "";
-	socksPort = 0;
-	hostname = "";
-
-	get running(): boolean {
-		return this.proc !== null && this.proc.exitCode === null;
-	}
-
-	get socketPath(): string {
-		return this.socket;
-	}
-
-	/** Invalidate this node's key, so a reset does not leave it live in the tailnet. */
-	async logout(): Promise<boolean> {
-		if (!this.socket) return false;
-		const res = await run("tailscale", [`--socket=${this.socket}`, "logout"], { timeoutMs: 20000 });
-		return res.ok;
-	}
-
-	async start(opts: TailnetStartOptions): Promise<void> {
-		if (this.running) return;
-		const id = crypto.randomBytes(3).toString("hex");
-		const host = os.hostname().split(".")[0].toLowerCase().replace(/[^a-z0-9-]/g, "-");
-		this.hostname = `pi-agent-${host}-${id}`;
-		// Keep the path short: unix socket paths are limited to ~104 bytes.
-		this.dir = fs.mkdtempSync(path.join(os.tmpdir(), PSM_TMP_PREFIX));
-		this.socket = path.join(this.dir, "ts.sock");
-		this.socksPort = await freePort();
-
-		this.proc = spawn(
-			"tailscaled",
-			[
-				"--tun=userspace-networking",
-				`--socks5-server=127.0.0.1:${this.socksPort}`,
-				"--state=mem:",
-				`--socket=${this.socket}`,
-			],
-			{ stdio: "ignore" },
-		);
-		this.proc.on("error", () => {});
-
-		const appeared = await waitFor(async () => fs.existsSync(this.socket), 15000);
-		if (!appeared) {
-			await this.stop();
-			throw new Error("tailscaled socket did not appear");
-		}
-
-		const args = [`--socket=${this.socket}`, ...agentUpArgs(this.hostname, opts.authKey, opts.loginServer)];
-		const up = await run("tailscale", args, { timeoutMs: 90000 });
-		if (!up.ok) {
-			await this.stop();
-			throw new Error(`tailscale up failed: ${failureText(up)}`);
-		}
-	}
-
-	/** Every peer this node can see. */
-	async peers(): Promise<BrainPeer[]> {
-		const st = await run("tailscale", [`--socket=${this.socket}`, "status", "--json"], { timeoutMs: 15000 });
-		if (!st.ok) return [];
-		return parsePeers(st.stdout);
-	}
-
-	async stop(): Promise<void> {
-		const proc = this.proc;
-		this.proc = null;
-		if (proc && proc.exitCode === null) {
-			proc.kill("SIGTERM");
-			await Promise.race([new Promise((r) => proc.once("exit", r)), sleep(3000)]);
-			if (proc.exitCode === null) {
-				proc.kill("SIGKILL");
-				// SIGKILL cannot be caught; waiting for the exit means the process is
-				// really gone before the socket dir is removed around it.
-				await Promise.race([new Promise((r) => proc.once("exit", r)), sleep(2000)]);
-			}
-		}
-		if (this.dir) {
-			fs.rmSync(this.dir, { recursive: true, force: true });
-			this.dir = null;
-		}
-	}
 }
 
 // ---------------------------------------------------------------------------

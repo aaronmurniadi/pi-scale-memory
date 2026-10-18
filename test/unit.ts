@@ -43,7 +43,11 @@ import {
 } from "../brain/qmd.mjs";
 import { ensureBrainNode, nodeStatus, stopBrainNode } from "../src/tailnet-node.js";
 import {
+	agentNodeHostname,
+	agentNodePaths,
 	brainNodeHostname,
+	keyRejected,
+	keyRejectedHelp,
 	parseNodeStatus,
 	serveArgs,
 	tagRejected,
@@ -151,6 +155,34 @@ check("the node hostname is stable and does not collide with the host", () => {
 	assert.equal(brainNodeHostname(""), "pi-brain");
 	assert.equal(brainNodeHostname("   "), "pi-brain");
 	assert.equal(brainNodeHostname("NV00016680"), brainNodeHostname("NV00016680"), "restarts must reuse the name");
+});
+
+console.log("the agent's own tailnet node");
+check("the agent node is named per machine, with no per-session suffix", () => {
+	assert.equal(agentNodeHostname("NV00016680"), "pi-agent-nv00016680");
+	assert.equal(agentNodeHostname("aaron-mac.local"), "pi-agent-aaron-mac");
+	assert.equal(agentNodeHostname("Weird Name!"), "pi-agent-weird-name");
+	assert.equal(agentNodeHostname(""), "pi-agent");
+	assert.equal(
+		agentNodeHostname("NV00016680"),
+		agentNodeHostname("NV00016680"),
+		"a stable name is what keeps one device per machine",
+	);
+	assert.notEqual(agentNodeHostname("mac"), brainNodeHostname("mac"), "the two roles must not claim one name");
+});
+check("the agent node keeps its identity in the config dir, not in a temp dir", () => {
+	const paths = agentNodePaths();
+	assert.ok(paths.state.startsWith(configDir()), `state should outlive the session: ${paths.state}`);
+	assert.ok(paths.socket.startsWith(configDir()), `socket should be stable: ${paths.socket}`);
+	assert.notEqual(paths.state, paths.socket);
+	assert.ok(
+		paths.state.includes("agent-tailnet"),
+		"the agent node must not share the brain node's state",
+	);
+	assert.ok(
+		path.basename(path.dirname(paths.socket)) === "agent-tailnet",
+		`the socket lives in a stable per-role dir, not a session temp dir: ${paths.socket}`,
+	);
 });
 check("parseNodeStatus reads the fields the brain needs", () => {
 	const status = parseNodeStatus(
@@ -339,6 +371,22 @@ check("serve publishes the memory port to the tailnet over loopback", () => {
 check("a failed brain takes its published port back off the tailnet", () => {
 	assert.deepEqual(unserveArgs(8787), ["serve", "--tcp=8787", "off"]);
 });
+check("a spent pre-auth key is recognised and explained", () => {
+	// The exact message the control plane returned for a key that had been used.
+	assert.equal(keyRejected("backend error: invalid key: API key kWeigW5A7N11CNTRL not valid"), true);
+	assert.equal(keyRejected("auth key already used"), true);
+	assert.equal(keyRejected("auth key expired"), true);
+	assert.equal(keyRejected("backend error: requested tag [tag:x] are invalid or not permitted"), false);
+	assert.equal(keyRejected("Failed to connect to local tailscaled"), false);
+
+	const help = keyRejectedHelp("/join-tailnet-agent", "invalid key: API key abc not valid");
+	assert.match(help, /Join once per machine|once per machine/, "it should say one join is enough here");
+	assert.match(help, /Settings -> Keys/, "it should say where to make a new key");
+	assert.match(help, /join-tailnet-agent/, "it should name the command to re-run");
+	assert.match(help, /Tailscale said: .*abc/, "it should keep what Tailscale actually said");
+	assert.match(keyRejectedHelp("/join-tailnet-brain"), /join-tailnet-brain/, "the brain has its own command");
+	assert.ok(!keyRejectedHelp().includes("Tailscale said:"), "nothing observed, nothing repeated");
+});
 
 console.log("socks");
 /** A proxy that accepts the connection and then says nothing, like dropped packets. */
@@ -409,7 +457,9 @@ function waitForExit(child: { exitCode: number | null; signalCode: NodeJS.Signal
 }
 await checkAsync("a node whose socket is gone is ended, a live one is left alone", async () => {
 	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "psm-reap-"));
-	// Sockets sit directly inside a psm-* dir, exactly as UserspaceTailnet lays them out.
+	// Sockets sit directly inside a psm-* dir, as an older version laid them out.
+	// New nodes keep a stable socket, but debris from those versions still needs
+	// clearing out.
 	const orphanSocket = path.join(dir, "orphan-ts.sock");
 	const liveSocket = path.join(dir, "live-ts.sock");
 	fs.writeFileSync(liveSocket, "");

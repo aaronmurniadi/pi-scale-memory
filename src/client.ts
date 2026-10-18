@@ -1,6 +1,5 @@
 import * as http from "node:http";
 import { socksHttp } from "./socks.js";
-import type { UserspaceTailnet } from "./tailnet.js";
 
 export interface SearchHit {
 	file: string;
@@ -58,10 +57,10 @@ export function localTransport(): BrainTransport {
 		});
 }
 
-export function tailnetTransport(tailnet: UserspaceTailnet): BrainTransport {
+export function tailnetTransport(socksPort: number): BrainTransport {
 	return (host, port, req, timeoutMs) =>
 		socksHttp({
-			proxyPort: tailnet.socksPort,
+			proxyPort: socksPort,
 			host,
 			port,
 			method: req.method,
