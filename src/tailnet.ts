@@ -15,6 +15,9 @@ import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 
+/** Prefix of the temp dirs that hold an agent node's socket. */
+export const PSM_TMP_PREFIX = "psm-";
+
 export interface RunResult {
 	ok: boolean;
 	code: number | null;
@@ -191,7 +194,7 @@ export class UserspaceTailnet {
 		const host = os.hostname().split(".")[0].toLowerCase().replace(/[^a-z0-9-]/g, "-");
 		this.hostname = `pi-agent-${host}-${id}`;
 		// Keep the path short: unix socket paths are limited to ~104 bytes.
-		this.dir = fs.mkdtempSync(path.join(os.tmpdir(), "psm-"));
+		this.dir = fs.mkdtempSync(path.join(os.tmpdir(), PSM_TMP_PREFIX));
 		this.socket = path.join(this.dir, "ts.sock");
 		this.socksPort = await freePort();
 
@@ -234,11 +237,120 @@ export class UserspaceTailnet {
 		if (proc && proc.exitCode === null) {
 			proc.kill("SIGTERM");
 			await Promise.race([new Promise((r) => proc.once("exit", r)), sleep(3000)]);
-			if (proc.exitCode === null) proc.kill("SIGKILL");
+			if (proc.exitCode === null) {
+				proc.kill("SIGKILL");
+				// SIGKILL cannot be caught; waiting for the exit means the process is
+				// really gone before the socket dir is removed around it.
+				await Promise.race([new Promise((r) => proc.once("exit", r)), sleep(2000)]);
+			}
 		}
 		if (this.dir) {
 			fs.rmSync(this.dir, { recursive: true, force: true });
 			this.dir = null;
 		}
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Reaping nodes left behind
+// ---------------------------------------------------------------------------
+
+/**
+ * A session that dies without running its shutdown path leaves its userspace
+ * tailscaled behind. Removing the socket dir makes that process unreachable: no
+ * CLI call can address it again, and it keeps the tailnet entry it registered.
+ * These helpers find those abandoned nodes and end them.
+ */
+
+/** `ps` elapsed time ([[dd-]hh:]mm:ss) in seconds, or null when unreadable. */
+export function parseElapsed(text: string): number | null {
+	const trimmed = text.trim();
+	if (!trimmed) return null;
+	let rest = trimmed;
+	let days = 0;
+	const dash = rest.indexOf("-");
+	if (dash !== -1) {
+		days = Number(rest.slice(0, dash));
+		rest = rest.slice(dash + 1);
+	}
+	if (!Number.isFinite(days)) return null;
+	let seconds = 0;
+	for (const part of rest.split(":")) {
+		const value = Number(part);
+		if (!Number.isFinite(value)) return null;
+		seconds = seconds * 60 + value;
+	}
+	return days * 86400 + seconds;
+}
+
+export interface TailscaledProcess {
+	pid: number;
+	socket: string;
+	/** How long the process has been running, when `ps` reported it. */
+	elapsedSeconds: number | null;
+}
+
+/** Read `ps -A -o pid=,etime=,command=` output into the userspace nodes it lists. */
+export function parseTailscaledProcesses(output: string): TailscaledProcess[] {
+	const found: TailscaledProcess[] = [];
+	for (const line of output.split("\n")) {
+		const match = /^\s*(\d+)\s+(\S+)\s+(.*)$/.exec(line);
+		if (!match) continue;
+		const command = match[3];
+		if (!command.includes("tailscaled")) continue;
+		if (!command.includes("--tun=userspace-networking")) continue;
+		const socket = /--socket=(\S+)/.exec(command);
+		if (!socket) continue;
+		found.push({ pid: Number(match[1]), socket: socket[1], elapsedSeconds: parseElapsed(match[2]) });
+	}
+	return found;
+}
+
+function isRunning(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+/** SIGTERM, then SIGKILL when the process is still there. False if it was gone. */
+async function terminate(pid: number): Promise<boolean> {
+	try {
+		process.kill(pid, "SIGTERM");
+	} catch {
+		return false;
+	}
+	const deadline = Date.now() + 3000;
+	while (isRunning(pid) && Date.now() < deadline) await sleep(100);
+	if (isRunning(pid)) {
+		try {
+			process.kill(pid, "SIGKILL");
+		} catch {
+			return true;
+		}
+	}
+	return true;
+}
+
+/**
+ * End the userspace tailscaled processes whose socket is gone.
+ *
+ * A live session always owns a socket file, so only abandoned nodes are touched.
+ * The brain's node keeps its socket in the config dir rather than a psm-* temp
+ * dir, and is stopped through its pid file instead. `minAgeMs` keeps a node that
+ * has just started, and has not created its socket yet, out of reach.
+ */
+export async function reapOrphanedTailscaled(minAgeMs = 60_000): Promise<number> {
+	const res = await run("ps", ["-A", "-o", "pid=,etime=,command="], { timeoutMs: 10000 });
+	if (!res.ok) return 0;
+	let reaped = 0;
+	for (const proc of parseTailscaledProcesses(res.stdout)) {
+		if (!path.basename(path.dirname(proc.socket)).startsWith(PSM_TMP_PREFIX)) continue;
+		if (fs.existsSync(proc.socket)) continue;
+		if (proc.elapsedSeconds !== null && proc.elapsedSeconds * 1000 < minAgeMs) continue;
+		if (await terminate(proc.pid)) reaped++;
+	}
+	return reaped;
 }

@@ -145,8 +145,22 @@ export function serveArgs(port: number): string[] {
 	return ["serve", "--bg", `--tcp=${port}`, `tcp://127.0.0.1:${port}`];
 }
 
+/** Withdraw the published port again. */
+export function unserveArgs(port: number): string[] {
+	return ["serve", `--tcp=${port}`, "off"];
+}
+
 function nodeCli(args: string[], timeoutMs = 60000): Promise<RunResult> {
 	return run("tailscale", [`--socket=${brainNodePaths().socket}`, ...args], { timeoutMs });
+}
+
+/**
+ * Take the memory port back off the tailnet. Used when the brain could not be
+ * brought up, so agents stop asking a port that nothing answers on.
+ */
+export async function unpublishBrainPort(port: number): Promise<boolean> {
+	const res = await nodeCli(unserveArgs(port), 30000);
+	return res.ok;
 }
 
 async function nodeStatusRaw(): Promise<string> {

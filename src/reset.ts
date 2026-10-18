@@ -10,11 +10,11 @@ import * as path from "node:path";
 import { brainLogPath, stopBrainServer } from "./brain-server.js";
 import { configDir } from "./config.js";
 import { daemonFiles, readDaemonPid } from "./daemon.js";
-import { run } from "./tailnet.js";
+import { PSM_TMP_PREFIX, reapOrphanedTailscaled, run } from "./tailnet.js";
 import { brainNodePaths, stopBrainNode } from "./tailnet-node.js";
 
 /** Sessions that crashed leave their userspace tailscaled socket dir behind. */
-export const TMP_PREFIX = "psm-";
+export const TMP_PREFIX = PSM_TMP_PREFIX;
 export const STALE_AFTER_MS = 60 * 60 * 1000;
 
 export interface TmpEntry {
@@ -127,6 +127,14 @@ export async function performReset(log: (message: string) => void): Promise<Rese
 	if (nodeStopped.stopped) {
 		outcome.stopped.push(`brain tailscale node (${nodeStopped.detail})`);
 		log(`stopped the brain's tailscale node (${nodeStopped.detail})`);
+	}
+
+	// Those same crashed sessions leave their tailscaled running with no socket to
+	// reach it by, so end them before the dirs they belong to are removed.
+	const reaped = await reapOrphanedTailscaled();
+	if (reaped > 0) {
+		outcome.stopped.push(`${reaped} leftover tailscale node(s)`);
+		log(`stopped ${reaped} leftover tailscale node(s)`);
 	}
 
 	const plan = planReset();

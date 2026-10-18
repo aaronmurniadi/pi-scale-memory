@@ -22,7 +22,15 @@ import {
 	syncCache,
 } from "../src/cache.js";
 import { BrainClient, localTransport } from "../src/client.js";
-import { agentUpArgs, parsePeers, run, tailscaleInstalled } from "../src/tailnet.js";
+import {
+	agentUpArgs,
+	parseElapsed,
+	parsePeers,
+	parseTailscaledProcesses,
+	reapOrphanedTailscaled,
+	run,
+	tailscaleInstalled,
+} from "../src/tailnet.js";
 import {
 	clampLimit,
 	normalizeHits,
@@ -40,8 +48,10 @@ import {
 	serveArgs,
 	tagRejected,
 	tagRejectedHelp,
+	unserveArgs,
 	upArgs,
 } from "../src/tailnet-node.js";
+import { socksConnect, socksHttp } from "../src/socks.js";
 import { findBrain, isBrainResponse, rankCandidates } from "../src/discovery.js";
 import { describeReset, planReset, staleTempDirs } from "../src/reset.js";
 import {
@@ -277,6 +287,19 @@ await checkAsync("a peer that throws does not sink the search", async () => {
 	});
 	assert.equal(found.host, "10.0.0.2");
 });
+await checkAsync("a probe is told how long it may take", async () => {
+	const budgets: number[] = [];
+	const peers: BrainPeer[] = [{ name: "a", ip: "10.0.0.1", online: true }];
+	await findBrain(
+		peers,
+		async (_host, timeoutMs) => {
+			budgets.push(timeoutMs);
+			return false;
+		},
+		{ timeoutMs: 1234 },
+	);
+	assert.deepEqual(budgets, [1234], "the probe has to receive the deadline, or it never expires");
+});
 check("no join path advertises a tag", () => {
 	const brain = upArgs("tskey-auth-x", "pi-brain-mac");
 	assert.equal(brain[0], "up");
@@ -312,6 +335,103 @@ check("a rejected tag is recognised and explained", () => {
 });
 check("serve publishes the memory port to the tailnet over loopback", () => {
 	assert.deepEqual(serveArgs(8787), ["serve", "--bg", "--tcp=8787", "tcp://127.0.0.1:8787"]);
+});
+check("a failed brain takes its published port back off the tailnet", () => {
+	assert.deepEqual(unserveArgs(8787), ["serve", "--tcp=8787", "off"]);
+});
+
+console.log("socks");
+/** A proxy that accepts the connection and then says nothing, like dropped packets. */
+function silentProxy(): Promise<{ close: () => void; port: number }> {
+	return new Promise((resolve, reject) => {
+		const srv = net.createServer(() => {});
+		srv.once("error", reject);
+		srv.listen(0, "127.0.0.1", () => {
+			resolve({ close: () => srv.close(), port: (srv.address() as net.AddressInfo).port });
+		});
+	});
+}
+await checkAsync("a silent proxy cannot hang the SOCKS handshake", async () => {
+	const proxy = await silentProxy();
+	const started = Date.now();
+	await assert.rejects(socksConnect(proxy.port, "100.64.0.1", 8787, 300), /SOCKS5 connect timed out/);
+	const took = Date.now() - started;
+	proxy.close();
+	assert.ok(took < 3000, `it should give up on its own deadline, took ${took}ms`);
+});
+await checkAsync("a dropped probe is bounded by its budget, not by the handshake", async () => {
+	const proxy = await silentProxy();
+	const started = Date.now();
+	await assert.rejects(
+		socksHttp({ proxyPort: proxy.port, host: "100.64.0.1", port: 8787, method: "GET", path: "/v1/health", timeoutMs: 300 }),
+		/SOCKS5 connect timed out/,
+	);
+	const took = Date.now() - started;
+	proxy.close();
+	assert.ok(took < 3000, `the whole probe should be bounded, took ${took}ms`);
+});
+
+console.log("leftover nodes");
+check("ps elapsed time is read in each format ps prints", () => {
+	assert.equal(parseElapsed("05:03"), 303);
+	assert.equal(parseElapsed("01:05:03"), 3903);
+	assert.equal(parseElapsed("2-01:05:03"), 176703);
+	assert.equal(parseElapsed("  12:00  "), 720);
+	assert.equal(parseElapsed(""), null);
+	assert.equal(parseElapsed("nonsense"), null);
+});
+check("only userspace tailscaled lines are read out of ps output", () => {
+	const ps = [
+		"  501 05:03 node brain/server.mjs",
+		"  612 01:05:03 tailscaled --tun=userspace-networking --socks5-server=127.0.0.1:51003 --state=mem: --socket=/tmp/psm-aaa/ts.sock",
+		"  613 2-01:05:03 /opt/homebrew/bin/tailscaled --tun=userspace-networking --state=/x/state --socket=/Users/x/.pi/agent/pi-scale-memory/brain-tailnet/tailscaled.sock",
+		"  614 00:10 tailscaled --tun=userspace-networking --state=mem:",
+	].join("\n");
+	const found = parseTailscaledProcesses(ps);
+	assert.deepEqual(
+		found.map((p) => p.pid),
+		[612, 613],
+		"the agent node and the brain node are read; a daemon with no socket and a non-tailscale line are not",
+	);
+	assert.equal(found[0].socket, "/tmp/psm-aaa/ts.sock");
+	assert.equal(found[0].elapsedSeconds, 3903);
+});
+function waitForExit(child: { exitCode: number | null; signalCode: NodeJS.Signals | null }, ms: number): Promise<boolean> {
+	return new Promise((resolve) => {
+		const deadline = Date.now() + ms;
+		const tick = () => {
+			if (child.exitCode !== null || child.signalCode !== null) return resolve(true);
+			if (Date.now() > deadline) return resolve(false);
+			setTimeout(tick, 50);
+		};
+		tick();
+	});
+}
+await checkAsync("a node whose socket is gone is ended, a live one is left alone", async () => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "psm-reap-"));
+	// Sockets sit directly inside a psm-* dir, exactly as UserspaceTailnet lays them out.
+	const orphanSocket = path.join(dir, "orphan-ts.sock");
+	const liveSocket = path.join(dir, "live-ts.sock");
+	fs.writeFileSync(liveSocket, "");
+	// A real command line, so `ps` sees exactly what an abandoned node looks like.
+	const fake = (socket: string) =>
+		spawn(
+			process.execPath,
+			["-e", "setInterval(() => {}, 1000)", "tailscaled", "--tun=userspace-networking", `--socket=${socket}`],
+			{ stdio: "ignore" },
+		);
+	const orphan = fake(orphanSocket);
+	const live = fake(liveSocket);
+	await new Promise((r) => setTimeout(r, 500));
+
+	await reapOrphanedTailscaled(0);
+
+	const orphanGone = await waitForExit(orphan, 3000);
+	const liveSurvived = !(await waitForExit(live, 500));
+	live.kill("SIGKILL");
+	fs.rmSync(dir, { recursive: true, force: true });
+	assert.ok(orphanGone, "a node with no socket is unreachable and has to be ended");
+	assert.ok(liveSurvived, "a node that still owns its socket belongs to a live session");
 });
 
 console.log("self-update");

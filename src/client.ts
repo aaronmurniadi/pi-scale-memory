@@ -37,14 +37,14 @@ export interface TransportRequest {
 
 /** Moves one HTTP request to the brain, either over loopback or through the tailnet SOCKS5 proxy. */
 export interface BrainTransport {
-	(host: string, port: number, req: TransportRequest): Promise<{ status: number; body: string }>;
+	(host: string, port: number, req: TransportRequest, timeoutMs?: number): Promise<{ status: number; body: string }>;
 }
 
 export function localTransport(): BrainTransport {
-	return (host, port, req) =>
+	return (host, port, req, timeoutMs) =>
 		new Promise((resolve, reject) => {
 			const request = http.request(
-				{ host, port, method: req.method, path: req.path, headers: req.headers, timeout: 15000 },
+				{ host, port, method: req.method, path: req.path, headers: req.headers, timeout: timeoutMs ?? 15000 },
 				(res) => {
 					const chunks: Buffer[] = [];
 					res.on("data", (c) => chunks.push(c));
@@ -59,7 +59,7 @@ export function localTransport(): BrainTransport {
 }
 
 export function tailnetTransport(tailnet: UserspaceTailnet): BrainTransport {
-	return (host, port, req) =>
+	return (host, port, req, timeoutMs) =>
 		socksHttp({
 			proxyPort: tailnet.socksPort,
 			host,
@@ -68,6 +68,7 @@ export function tailnetTransport(tailnet: UserspaceTailnet): BrainTransport {
 			path: req.path,
 			headers: req.headers,
 			body: req.body,
+			timeoutMs,
 		});
 }
 

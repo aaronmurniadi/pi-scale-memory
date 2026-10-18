@@ -51,7 +51,7 @@ import {
 } from "./src/config.js";
 import { brainLogPath, ensureBrainServer, stopBrainServer } from "./src/brain-server.js";
 import { inspectInstall, runUpdate } from "./src/update.js";
-import { tailscaleInstalled, UserspaceTailnet } from "./src/tailnet.js";
+import { reapOrphanedTailscaled, tailscaleInstalled, UserspaceTailnet } from "./src/tailnet.js";
 import { findBrain, isBrainResponse } from "./src/discovery.js";
 import {
 	installCandidates,
@@ -62,7 +62,7 @@ import {
 	qmdStatus,
 } from "./src/qmd-install.js";
 import { describeReset, performReset, planReset, summarizeReset } from "./src/reset.js";
-import { brainNodePaths, brainNodeRunning, ensureBrainNode, nodeStatus, stopBrainNode } from "./src/tailnet-node.js";
+import { brainNodePaths, brainNodeRunning, ensureBrainNode, nodeStatus, stopBrainNode, unpublishBrainPort } from "./src/tailnet-node.js";
 import type { Ui } from "./src/ui.js";
 
 const FLUSH_INTERVAL_MS = 30_000;
@@ -220,6 +220,19 @@ export default function (pi: ExtensionAPI) {
 	async function connectLocal(ctx: ExtensionContext, cfg: Config): Promise<void> {
 		status(ctx, "brain: local");
 		try {
+			// The memory server has to be listening before anything publishes the port.
+			// `tailscale serve` forwards to 127.0.0.1, so a published port with no
+			// listener behind it refuses every agent that asks, and the agents conclude
+			// there is no brain on the tailnet at all.
+			const server = await ensureBrainServer(
+				EXT_DIR,
+				{ port: cfg.brainPort, token: cfg.brainToken ?? "" },
+				(message) => {
+					if (ctx.hasUI) ctx.ui.notify(message, "info");
+				},
+			);
+			if (!server.ok) throw new Error(server.detail);
+
 			// The brain reaches agents through its own userspace tailscale node,
 			// published with `tailscale serve` (no sudo, no host tailscale changes).
 			// Nothing is started when the node has never been joined.
@@ -233,19 +246,15 @@ export default function (pi: ExtensionAPI) {
 					},
 				});
 				if (!node.ok) {
+					// A half-published port is worse than no port at all: agents would keep
+					// asking a brain that cannot answer. Withdraw it again.
+					await unpublishBrainPort(cfg.brainPort);
 					if (ctx.hasUI) ctx.ui.notify(`pi-scale-memory: agents cannot reach this brain — ${node.detail}`, "warning");
 				}
 			} else if (ctx.hasUI) {
 				ctx.ui.notify("pi-scale-memory: run /join-tailnet-brain so agents can reach this brain.", "warning");
 			}
-			const server = await ensureBrainServer(
-				EXT_DIR,
-				{ port: cfg.brainPort, token: cfg.brainToken ?? "" },
-				(message) => {
-					if (ctx.hasUI) ctx.ui.notify(message, "info");
-				},
-			);
-			if (!server.ok) throw new Error(server.detail);
+
 			client = new BrainClient({
 				host: "127.0.0.1",
 				port: cfg.brainPort,
@@ -283,11 +292,16 @@ export default function (pi: ExtensionAPI) {
 			peers,
 			async (host, timeoutMs) => {
 				try {
-					const res = await tailnetTransport(tailnet)(host, cfg.brainPort, {
-						method: "GET",
-						path: "/v1/health",
-						headers: cfg.brainToken ? { authorization: `Bearer ${cfg.brainToken}` } : {},
-					});
+					const res = await tailnetTransport(tailnet)(
+						host,
+						cfg.brainPort,
+						{
+							method: "GET",
+							path: "/v1/health",
+							headers: cfg.brainToken ? { authorization: `Bearer ${cfg.brainToken}` } : {},
+						},
+						timeoutMs,
+					);
 					return isBrainResponse(res.status, res.body);
 				} catch {
 					return false;
@@ -376,6 +390,9 @@ export default function (pi: ExtensionAPI) {
 			flushTimer = null;
 		}
 		await tailnet.stop();
+		// A session that was killed outright leaves its node running with the socket
+		// already deleted, which makes it unreachable from then on. Clear those out.
+		await reapOrphanedTailscaled();
 		client = null;
 		snapshot = "";
 		lastError = "";
@@ -709,6 +726,19 @@ export default function (pi: ExtensionAPI) {
 
 		const key = await askPreauthKey(ctx, "this brain");
 		if (!key) return;
+
+		// Joining publishes the memory port, so the server has to be answering first.
+		// An agent that probes while the port is up but nothing is behind it reads
+		// that as "no brain on this tailnet".
+		const server = await ensureBrainServer(
+			EXT_DIR,
+			{ port: cfg.brainPort, token: cfg.brainToken ?? "" },
+			(message) => ctx.ui.notify(message, "info"),
+		);
+		if (!server.ok) {
+			ctx.ui.notify(server.detail, "error");
+			return;
+		}
 
 		const node = await ensureBrainNode({
 			port: cfg.brainPort,

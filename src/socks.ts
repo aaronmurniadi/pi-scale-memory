@@ -2,16 +2,29 @@ import * as http from "node:http";
 import * as net from "node:net";
 
 /** Open a TCP connection to host:port through a local SOCKS5 proxy (no auth). */
-export function socksConnect(proxyPort: number, host: string, port: number): Promise<net.Socket> {
+export function socksConnect(
+	proxyPort: number,
+	host: string,
+	port: number,
+	timeoutMs = 15000,
+): Promise<net.Socket> {
 	return new Promise((resolve, reject) => {
 		const sock = net.connect(proxyPort, "127.0.0.1");
 		let buf = Buffer.alloc(0);
 		let stage: "greeting" | "reply" = "greeting";
+		let settled = false;
 
 		const fail = (err: Error) => {
+			if (settled) return;
+			settled = true;
 			sock.destroy();
 			reject(err);
 		};
+
+		// A port the far side drops, or a peer that went away, never replies at all.
+		// Without this the handshake would wait forever and no caller timeout would
+		// ever be reached.
+		sock.setTimeout(timeoutMs, () => fail(new Error("SOCKS5 connect timed out")));
 
 		sock.once("error", fail);
 		sock.once("connect", () => sock.write(Buffer.from([0x05, 0x01, 0x00])));
@@ -42,7 +55,9 @@ export function socksConnect(proxyPort: number, host: string, port: number): Pro
 			const rest = buf.subarray(need);
 			sock.off("data", onData);
 			sock.off("error", fail);
+			sock.setTimeout(0);
 			if (rest.length) sock.unshift(rest);
+			settled = true;
 			resolve(sock);
 		});
 	});
@@ -60,7 +75,11 @@ export interface SocksHttpOptions {
 }
 
 export async function socksHttp(opts: SocksHttpOptions): Promise<{ status: number; body: string }> {
-	const sock = await socksConnect(opts.proxyPort, opts.host, opts.port);
+	// One budget for the whole request: the SOCKS dial and the HTTP exchange share
+	// it, so a probe cannot outlive the deadline its caller gave it.
+	const timeoutMs = opts.timeoutMs ?? 15000;
+	const deadline = Date.now() + timeoutMs;
+	const sock = await socksConnect(opts.proxyPort, opts.host, opts.port, timeoutMs);
 	return new Promise((resolve, reject) => {
 		const req = http.request(
 			{
@@ -71,7 +90,7 @@ export async function socksHttp(opts: SocksHttpOptions): Promise<{ status: numbe
 				path: opts.path,
 				headers: opts.headers,
 				agent: false,
-				timeout: opts.timeoutMs ?? 15000,
+				timeout: Math.max(1, deadline - Date.now()),
 			},
 			(res) => {
 				const chunks: Buffer[] = [];
