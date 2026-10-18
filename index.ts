@@ -16,6 +16,7 @@
  *   /brain                  — status | sync | reindex | reconnect | reset
  *   /update-pi-scale-memory — update the extension itself, then reload
  *   /reset-pi-scale-settings — delete all local state and start over
+ *   /install-qmd            — optional: install qmd for semantic search on the brain
  */
 import { spawn } from "node:child_process";
 import * as fs from "node:fs";
@@ -52,6 +53,14 @@ import { brainLogPath, ensureBrainServer, stopBrainServer } from "./src/brain-se
 import { inspectInstall, runUpdate } from "./src/update.js";
 import { tailscaleInstalled, UserspaceTailnet } from "./src/tailnet.js";
 import { findBrain, isBrainResponse } from "./src/discovery.js";
+import {
+	installCandidates,
+	installQmd,
+	noCandidateHelp,
+	pickCandidate,
+	QMD_PACKAGE,
+	qmdStatus,
+} from "./src/qmd-install.js";
 import { describeReset, performReset, planReset, summarizeReset } from "./src/reset.js";
 import { brainNodePaths, brainNodeRunning, ensureBrainNode, nodeStatus, stopBrainNode } from "./src/tailnet-node.js";
 import type { Ui } from "./src/ui.js";
@@ -248,6 +257,12 @@ export default function (pi: ExtensionAPI) {
 			snapshot = await client.context();
 			lastError = "";
 			status(ctx, `brain: local server on port ${cfg.brainPort}`);
+			if (ctx.hasUI && !(await qmdStatus()).installed) {
+				ctx.ui.notify(
+					"pi-scale-memory: qmd is not installed, so memory_search uses BM25. Run /install-qmd for semantic search.",
+					"info",
+				);
+			}
 			if (ctx.hasUI) ctx.ui.notify(`pi-scale-memory: brain role, using the local brain server (log: ${brainLogPath()})`, "info");
 		} catch (err) {
 			lastError = errMsg(err);
@@ -719,6 +734,52 @@ export default function (pi: ExtensionAPI) {
 			"info",
 		);
 	}
+
+	// --- qmd (optional semantic search backend, brain side) ---
+
+	/** Install qmd into a prefix that is actually on PATH, then restart the brain. */
+	async function installQmdFlow(ctx: ExtensionContext): Promise<void> {
+		const existing = await qmdStatus();
+		if (existing.installed) {
+			ctx.ui.notify(`qmd is already installed (${existing.version}) at ${existing.dir}.`, "info");
+			return;
+		}
+
+		const candidates = await installCandidates();
+		const chosen = pickCandidate(candidates);
+		if (!chosen) {
+			ctx.ui.notify(noCandidateHelp(candidates), "error");
+			return;
+		}
+
+		const command = `npm install -g --prefix=${chosen.prefix} ${QMD_PACKAGE}`;
+		if (!(await ctx.ui.confirm("Install qmd?", command))) return;
+
+		const result = await installQmd(chosen, (message) => {
+			if (ctx.hasUI) ctx.ui.setStatus("scale-memory", message);
+		});
+		if (!result.ok) {
+			ctx.ui.notify(`qmd install failed:\n${result.detail}`, "error");
+			return;
+		}
+
+		// The brain server probes qmd at startup, so it has to come back up.
+		if (loadConfig(false).role === "brain") {
+			await stopBrainServer();
+			await connect(ctx);
+			ctx.ui.notify(`${result.detail} Restarted the brain server, which now indexes with qmd.`, "info");
+			return;
+		}
+		ctx.ui.notify(`${result.detail} The brain machine is where qmd matters.`, "info");
+	}
+
+	// --- /install-qmd ---
+	pi.registerCommand("install-qmd", {
+		description: "Install qmd (semantic search for the brain) into a prefix on your PATH",
+		handler: async (_args, ctx) => {
+			await installQmdFlow(ctx);
+		},
+	});
 
 	// --- full reset (shared by /reset-pi-scale-settings and /brain reset) ---
 	async function resetEverything(ctx: ExtensionContext): Promise<void> {

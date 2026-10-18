@@ -44,6 +44,13 @@ import {
 } from "../src/tailnet-node.js";
 import { findBrain, isBrainResponse, rankCandidates } from "../src/discovery.js";
 import { describeReset, planReset, staleTempDirs } from "../src/reset.js";
+import {
+	installCommand,
+	isOnPath,
+	noCandidateHelp,
+	pickCandidate,
+	resolveBinDir,
+} from "../src/qmd-install.js";
 import { configDir } from "../src/config.js";
 import type { BrainPeer } from "../src/tailnet.js";
 import { findPackageSource, inspectInstall } from "../src/update.js";
@@ -700,6 +707,45 @@ if (qmdInstalled()) {
 	console.log("  skip qmd search test: qmd is not installed");
 }
 
+console.log("installing qmd");
+check("the binary directory is derived per platform", () => {
+	assert.equal(resolveBinDir("/home/u/.local", "darwin"), "/home/u/.local/bin");
+	assert.equal(resolveBinDir("/home/u/.local", "linux"), "/home/u/.local/bin");
+	assert.equal(resolveBinDir("C:\\Users\\u\\node", "win32"), "C:\\Users\\u\\node");
+});
+check("only a prefix whose bin dir is on PATH is chosen", () => {
+	const entries = ["/usr/bin", "/home/u/.local/bin"];
+	assert.equal(isOnPath("/home/u/.local/bin", entries), true);
+	assert.equal(isOnPath("/home/u/.local", entries), false);
+
+	const offPath = { prefix: "/nvm/v22", binDir: "/nvm/v22/bin", onPath: false, writable: true };
+	const readOnly = { prefix: "/usr/local", binDir: "/usr/local/bin", onPath: true, writable: false };
+	const usable = { prefix: "/home/u/.local", binDir: "/home/u/.local/bin", onPath: true, writable: true };
+	// An install into the npm default prefix that is not on PATH would appear to
+	// succeed and still not resolve, which is the trap this avoids.
+	assert.equal(pickCandidate([offPath, usable]), usable);
+	assert.equal(pickCandidate([offPath, readOnly]), null, "nothing usable means no automatic install");
+	assert.equal(pickCandidate([]), null);
+});
+check("the install command is explicit about its prefix", () => {
+	assert.deepEqual(installCommand("/home/u/.local"), [
+		"install",
+		"-g",
+		"--prefix=/home/u/.local",
+		"@tobilu/qmd",
+	]);
+});
+check("when nothing is usable the user is told what to do", () => {
+	const help = noCandidateHelp([
+		{ prefix: "/nvm/v22", binDir: "/nvm/v22/bin", onPath: false, writable: true },
+		{ prefix: "/usr/local", binDir: "/usr/local/bin", onPath: true, writable: false },
+	]);
+	assert.match(help, /not on PATH/);
+	assert.match(help, /not writable/);
+	assert.match(help, /npm install -g --prefix=/);
+	assert.match(help, /export PATH=/);
+});
+
 console.log("full reset");
 check("only old leftovers are picked for deletion", () => {
 	const now = 1_000_000_000;
@@ -750,6 +796,7 @@ await checkAsync("the extension registers its commands and tools", async () => {
 	mod.default(stub as never);
 	assert.deepEqual(commands.sort(), [
 		"brain",
+		"install-qmd",
 		"join-tailnet-agent",
 		"join-tailnet-brain",
 		"reset-pi-scale-settings",

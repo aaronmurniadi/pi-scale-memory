@@ -15,7 +15,7 @@ Memory model and tools follow [pi-memory](https://github.com/jayzeng/pi-memory):
 - **Tailscale** on every machine (`tailscale` and `tailscaled` on `PATH`). No root access is needed.
 - Pre-auth keys, created in the Tailscale admin console: one for the brain, reusable ones for agents. No tags are involved.
 - Node >= 22.
-- Optional, on the **brain**: [qmd](https://github.com/tobi/qmd) (`npm install -g @tobilu/qmd`) for semantic and deep search. Agents never need qmd.
+- Optional, on the **brain**: [qmd](https://github.com/tobi/qmd) for semantic and deep search, installable from inside pi with `/install-qmd`. Agents never need qmd.
 
 Nothing is published to the internet: the memory API is reachable only from the tailnet, and the ACL is what decides who can reach it.
 
@@ -35,6 +35,7 @@ Nothing is published to the internet: the memory API is reachable only from the 
 | `/join-tailnet-brain` | brain | Starts this machine's own userspace Tailscale node, joins it with a pre-auth key, publishes the memory port to the tailnet, and sets the role to `brain` |
 | `/join-tailnet-agent` | agent | Joins with a pre-auth key on a private userspace tailscaled, then asks the tailnet which peer is the brain |
 | `/self-tag [brain\|agent]` | both | Sets the role on its own, without joining |
+| `/install-qmd` | brain | Installs qmd for semantic search, into a prefix that is on your `PATH`, then restarts the brain so it indexes with it |
 | `/reset-pi-scale-settings` | both | Stops the daemons this extension started, logs its tailscale nodes out, and deletes all of its state so you can start over |
 | `/brain status\|sync\|reindex\|reconnect\|reset` | both | Shows role, brain, health, search engine, queue and cache age; refreshes the offline mirror; reports the brain's index; rejoins; `reset` is the same as `/reset-pi-scale-settings` |
 | `/update-pi-scale-memory` | both | Updates the extension (git pull, or `pi update`) and reloads it |
@@ -92,7 +93,17 @@ The brain's node is detached and survives pi exiting, so agents keep reaching th
 
 ## Search
 
-Search runs on the brain, so one index serves every agent. With qmd installed there, the brain indexes the memory directory as a collection (default `pi-scale-memory`) and answers three modes:
+Search runs on the brain, so one index serves every agent. qmd is installed with
+`/install-qmd`; the brain mentions it once at startup when it is missing, and
+without it everything still works through BM25.
+
+`/install-qmd` is careful about one thing that makes this worth automating: a
+plain `npm install -g` writes into npm's global prefix, which on a machine using a
+node version manager is often **not on `PATH`** — the install reports success and
+`qmd` is still not findable. So it picks a prefix whose `bin` directory is actually
+on `PATH` and writable, installs with an explicit `--prefix`, and then verifies by
+running `qmd --version`. If no such prefix exists it stops and prints the exact
+commands to run yourself rather than pretending to have installed anything. With qmd installed there, the brain indexes the memory directory as a collection (default `pi-scale-memory`) and answers three modes:
 
 | `memory_search` mode | qmd command | What it does | Typical latency |
 |---|---|---|---|
@@ -217,7 +228,7 @@ npm test         # unit tests + live brain-server and cache round-trips over loo
 npm run build    # tsc --noEmit
 ```
 
-`test/unit.ts` covers the brain node's naming, status and serve helpers, peer parsing, the discovery probe (ranking, ambiguity, a pinned host, an unresponsive peer), self-update detection, the qmd plumbing, the brain server lifecycle (including token enforcement and conflict detection), the offline cache, and command registration. When qmd is installed it also runs a real semantic search through the brain using a throwaway collection that it removes afterwards, so it does not disturb any qmd index you already have.
+`test/unit.ts` covers the brain node's naming, status and serve helpers, peer parsing, the discovery probe (ranking, ambiguity, a pinned host, an unresponsive peer), the qmd install planning, self-update detection, the qmd plumbing, the brain server lifecycle (including token enforcement and conflict detection), the offline cache, and command registration. When qmd is installed it also runs a real semantic search through the brain using a throwaway collection that it removes afterwards, so it does not disturb any qmd index you already have.
 
 The suite also starts a real userspace `tailscaled` and asserts it is a separate, unjoined node while the host's own daemon keeps its state, node id and peers. What is **not** covered: an actual successful join, serve proxying, and discovery across real peers — those need a live tailnet and a pre-auth key.
 
