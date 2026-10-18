@@ -22,7 +22,8 @@ import {
 	searchWithFallback,
 	syncCache,
 } from "../src/cache.js";
-import { BrainClient, localTransport, MAX_RETRY_ATTEMPTS, retryDelayMs } from "../src/client.js";
+import { budgetMs, withBudget } from "../src/budget.js";
+import { BrainClient, type BrainTransport, localTransport, MAX_RETRY_ATTEMPTS, retryDelayMs } from "../src/client.js";
 import {
 	agentUpArgs,
 	parseElapsed,
@@ -1559,6 +1560,83 @@ await checkAsync("a project with no memory yet does not break a search", async (
 		child.kill("SIGKILL");
 		fs.rmSync(dir, { recursive: true, force: true });
 		removeCollections(collection, ["brand-new-project"]);
+	}
+});
+
+console.log("shutdown budget");
+check("a budget falls back on nonsense and is clamped", () => {
+	assert.equal(budgetMs(undefined, 3000, 60000), 3000, "unset uses the default");
+	assert.equal(budgetMs("", 3000, 60000), 3000, "an empty value is not a budget of zero");
+	assert.equal(budgetMs("soon", 3000, 60000), 3000, "a typo must not become a timeout of one tick");
+	assert.equal(budgetMs("0", 3000, 60000), 3000);
+	assert.equal(budgetMs("-1", 3000, 60000), 3000);
+	assert.equal(budgetMs("250", 3000, 60000), 250);
+	assert.equal(budgetMs("600000", 3000, 60000), 60000, "an env var must not reintroduce the quit that hangs");
+});
+await checkAsync("work that beats its budget keeps its result", async () => {
+	assert.equal(await withBudget(5_000, Promise.resolve("done")), "done");
+});
+await checkAsync("work that overruns its budget is abandoned, not fatal", async () => {
+	// The model call on the exit path: still running when the budget expires.
+	let failLater: (err: Error) => void = () => {};
+	const slow = new Promise<string>((_resolve, reject) => {
+		failLater = reject;
+	});
+	const started = Date.now();
+	assert.equal(await withBudget(50, slow), null, "the caller stops waiting at the deadline");
+	assert.ok(Date.now() - started < 2_000, "and does so at the deadline, not when the work ends");
+
+	// Pi exits immediately after the handler returns, so an abandoned promise that
+	// rejects on its way out must not become an unhandled rejection and take the
+	// process with it.
+	let unhandled = 0;
+	const onUnhandled = () => {
+		unhandled++;
+	};
+	process.on("unhandledRejection", onUnhandled);
+	failLater(new Error("the model call finally failed"));
+	await new Promise((r) => setTimeout(r, 50));
+	process.off("unhandledRejection", onUnhandled);
+	assert.equal(unhandled, 0, "an abandoned capture must not crash the process on its way out");
+});
+await checkAsync("a per-request deadline reaches the transport", async () => {
+	const seen: (number | undefined)[] = [];
+	const transport: BrainTransport = async (_host, _port, _req, timeoutMs) => {
+		seen.push(timeoutMs);
+		return { status: 200, body: "{}" };
+	};
+	const client = new BrainClient({ host: "127.0.0.1", port: 1, token: "", agentId: "test-agent", transport });
+	await client.writeNow({ path: "/v1/write", body: {} }, { timeoutMs: 250 });
+	await client.writeNow({ path: "/v1/write", body: {} });
+	assert.deepEqual(seen, [250, undefined], "only the caller that asks for a deadline gets one");
+});
+await checkAsync("a brain that never answers cannot hold up the exit path", async () => {
+	// Accepts the connection, then says nothing at all. Without a per-request
+	// budget this is the transport's 15s default, which is the slow /quit.
+	const open: net.Socket[] = [];
+	const silent = net.createServer((socket) => {
+		open.push(socket);
+	});
+	await new Promise<void>((resolve) => silent.listen(0, "127.0.0.1", resolve));
+	const port = (silent.address() as net.AddressInfo).port;
+	const client = new BrainClient({
+		host: "127.0.0.1",
+		port,
+		token: "",
+		agentId: "test-agent",
+		transport: localTransport(),
+	});
+	try {
+		const started = Date.now();
+		await assert.rejects(
+			() => client.writeNow({ path: "/v1/write", body: {} }, { timeoutMs: 200 }),
+			/request timed out/,
+		);
+		const took = Date.now() - started;
+		assert.ok(took < 2_000, `the request must give up on its own budget, took ${took}ms`);
+	} finally {
+		for (const socket of open) socket.destroy();
+		silent.close();
 	}
 });
 

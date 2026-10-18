@@ -32,6 +32,7 @@ import {
 	type ExtensionContext,
 	serializeConversation,
 } from "@earendil-works/pi-coding-agent";
+import { budgetMs, withBudget } from "./src/budget.js";
 import {
 	cacheDir,
 	contextWithFallback,
@@ -94,12 +95,38 @@ const PERIODIC_EVERY_TURNS = Number(process.env.PI_SCALE_MEMORY_SUMMARY_EVERY_TU
 const SUMMARY_MIN_MESSAGES = 4;
 const SUMMARY_MAX_CHARS = 60_000;
 const SUMMARY_TIMEOUT_MS = 25_000;
+/**
+ * Hard ceiling on everything the exit path is allowed to do.
+ *
+ * Pi awaits session_shutdown handlers before it exits, so whatever this handler
+ * does, the user watches the TUI sit there. Left unbounded that is a model call
+ * (up to SUMMARY_TIMEOUT_MS) plus a request timeout for the write plus another
+ * for the flush. Past this budget the handler returns and pi exits; a missed
+ * exit summary costs a paragraph, a quit that hangs costs every single exit.
+ */
+const SHUTDOWN_BUDGET_MS = budgetMs(process.env.PI_SCALE_MEMORY_EXIT_TIMEOUT_MS, 3_000, 60_000);
 const SUMMARY_SYSTEM_PROMPT =
 	"You extract durable memory from coding-agent conversations. Be terse and factual. Output markdown only.";
 const COMPACT_MIN_CHARS = 2_000;
 const COMPACT_SYSTEM_PROMPT =
 	"You compress an agent memory file without losing what it is for. Output markdown bullets only, no preamble.";
 const EXT_DIR = path.dirname(fileURLToPath(import.meta.url));
+
+/** How much time a capture may spend, and what it may leave behind when it runs out. */
+interface CaptureOptions {
+	/** How long the model may take to produce the summary. */
+	modelTimeoutMs?: number;
+	/** Per-request timeout for the write that stores it. */
+	requestTimeoutMs?: number;
+	/**
+	 * Queue the write when the brain does not answer within `requestTimeoutMs`.
+	 *
+	 * False on the exit path: the outbox lives in memory and is dropped with the
+	 * client as pi exits, so a write queued there is lost either way — queueing it
+	 * only buys a second attempt at the same request.
+	 */
+	queueOnFail?: boolean;
+}
 
 function errMsg(e: unknown): string {
 	if (e instanceof Error) return e.message;
@@ -601,30 +628,31 @@ export default function (pi: ExtensionAPI) {
 		return out;
 	}
 
-	async function capture(ctx: ExtensionContext, label: string, timeoutMs = SUMMARY_TIMEOUT_MS) {
-		if (!client) return;
-		let timer: ReturnType<typeof setTimeout> | undefined;
-		try {
-			const expired = new Promise<null>((r) => {
-				timer = setTimeout(() => r(null), timeoutMs);
-			});
-			const summary = await Promise.race([summarize(ctx), expired]);
-			if (!summary) return;
-				await client.writeOrQueue({
-					path: "/v1/write",
-					body: {
-						target: "daily",
-						ns: nsId(),
-						content: `## Session Summary (auto, ${label})\n\n${summary}`,
-						agent: client.agentId,
-						session: sessionTag(ctx),
-						nsKey: activeNs?.key,
-						nsLabel: activeNs?.label,
-					},
-				});
-		} finally {
-			if (timer) clearTimeout(timer);
+	async function capture(ctx: ExtensionContext, label: string, options: CaptureOptions = {}) {
+		// Held locally: the exit path runs this under a budget, so the handler can
+		// return and disconnect() can drop `client` while this is still in flight.
+		const c = client;
+		if (!c) return;
+		const request = { timeoutMs: options.requestTimeoutMs };
+		const summary = await withBudget(options.modelTimeoutMs ?? SUMMARY_TIMEOUT_MS, summarize(ctx));
+		if (!summary) return;
+		const req = {
+			path: "/v1/write",
+			body: {
+				target: "daily",
+				ns: nsId(),
+				content: `## Session Summary (auto, ${label})\n\n${summary}`,
+				agent: c.agentId,
+				session: sessionTag(ctx),
+				nsKey: activeNs?.key,
+				nsLabel: activeNs?.label,
+			},
+		};
+		if (options.queueOnFail === false) {
+			await c.writeNow(req, request);
+			return;
 		}
+		await c.writeOrQueue(req, request);
 	}
 
 	/**
@@ -718,13 +746,25 @@ export default function (pi: ExtensionAPI) {
 		const reason = (event as { reason?: string }).reason;
 		let transition = false;
 		if (reason === "reload" || reason === "new" || reason === "resume" || reason === "fork") transition = true;
-		if (client && !transition) {
-			try {
-				await capture(ctx, "exit");
-				await client.flush();
-			} catch {
-				/* best effort */
-			}
+		const c = client;
+		if (c && !transition) {
+			// Best effort, and strictly bounded: pi awaits this handler before it
+			// exits, so every second spent here is a second the TUI sits there after
+			// the user asked to quit. The summary gets the whole budget, and whatever
+			// does not fit is dropped rather than waited for.
+			const finish = async () => {
+				try {
+					await capture(ctx, "exit", {
+						modelTimeoutMs: SHUTDOWN_BUDGET_MS,
+						requestTimeoutMs: SHUTDOWN_BUDGET_MS,
+						queueOnFail: false,
+					});
+					await c.flush({ timeoutMs: SHUTDOWN_BUDGET_MS });
+				} catch {
+					/* best effort */
+				}
+			};
+			await withBudget(SHUTDOWN_BUDGET_MS, finish());
 		}
 		if (!transition) await disconnect();
 	});

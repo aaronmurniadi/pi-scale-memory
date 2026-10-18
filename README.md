@@ -142,6 +142,7 @@ Saved per machine at `~/.pi/agent/pi-scale-memory/config.json` (mode 0600): role
 | `PI_SCALE_MEMORY_CACHE` | `0` disables the agent-side offline mirror |
 | `PI_SCALE_MEMORY_CACHE_SYNC_MS` | mirror refresh interval while connected (default 60000) |
 | `PI_SCALE_MEMORY_SUMMARY_EVERY_TURNS` | turns between automatic daily-log summaries (0 disables) |
+| `PI_SCALE_MEMORY_EXIT_TIMEOUT_MS` | how long the exit summary may hold up `/quit` (default 3000, capped at 60000) |
 | `PI_SCALE_MEMORY_NAMESPACE` | pins the project namespace instead of deriving it from git |
 | `PI_SCALE_MEMORY_SCOPE_REMOTE` | which remote is canonical when a repository has several (default `origin`) |
 | `PI_SCALE_MEMORY_SCOPE_FALLBACK` | `path` (default) or `legacy` for a workspace that is not a git repository |
@@ -190,6 +191,7 @@ It cannot delete the machines this extension registered in your tailnet; those a
 - The project namespace is resolved once per session from git (`git remote`, then the repository path, then the working directory) and cached. An unresolvable workspace still gets core and shared memory.
 - Appends go out immediately; if the brain is unreachable they are queued, carrying their namespace, and flushed every 30s. `/psm-core-memory` never queues.
 - An LLM summary of the new conversation is stored in the project's daily log every 15 turns, before compaction, and on exit. Nothing writes to core or shared on its own.
+- The exit summary runs against `PI_SCALE_MEMORY_EXIT_TIMEOUT_MS`: pi waits for `session_shutdown` handlers before it exits, so the summary is time-boxed rather than allowed to hold `/quit` open, and one that does not fit in the budget is dropped.
 
 ## Development
 

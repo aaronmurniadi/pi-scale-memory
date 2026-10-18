@@ -81,6 +81,17 @@ export interface WriteRequest {
 	body: Record<string, unknown>;
 }
 
+/**
+ * Per-request overrides.
+ *
+ * `timeoutMs` exists because the shutdown path is on the user's critical path:
+ * quitting pi must not wait the default 15s per request for a brain that is not
+ * answering. Everything that runs during a session leaves it unset.
+ */
+export interface RequestOptions {
+	timeoutMs?: number;
+}
+
 export interface TransportRequest {
 	method: "GET" | "POST";
 	path: string;
@@ -216,7 +227,12 @@ export class BrainClient {
 		return host;
 	}
 
-	private async call(method: "GET" | "POST", path: string, body?: unknown): Promise<any> {
+	private async call(
+		method: "GET" | "POST",
+		path: string,
+		body?: unknown,
+		options: RequestOptions = {},
+	): Promise<any> {
 		const host = await this.hostFor();
 		const headers: Record<string, string> = { "content-type": "application/json" };
 		if (this.opts.token) headers.authorization = `Bearer ${this.opts.token}`;
@@ -225,7 +241,7 @@ export class BrainClient {
 
 		let res: { status: number; body: string };
 		try {
-			res = await this.opts.transport(host, this.opts.port, { method, path, headers, body: payload });
+			res = await this.opts.transport(host, this.opts.port, { method, path, headers, body: payload }, options.timeoutMs);
 		} catch (err) {
 			// Tailnet mode: force re-discovery so a moved brain recovers on the next call.
 			if (this.opts.resolveHost) this.host = "";
@@ -314,9 +330,9 @@ export class BrainClient {
 	}
 
 	/** Append-style write: sent now, or queued for the periodic flush when the brain is unreachable. */
-	async writeOrQueue(req: WriteRequest): Promise<{ queued: boolean; result?: any }> {
+	async writeOrQueue(req: WriteRequest, options?: RequestOptions): Promise<{ queued: boolean; result?: any }> {
 		try {
-			return { queued: false, result: await this.call("POST", req.path, req.body) };
+			return { queued: false, result: await this.call("POST", req.path, req.body, options) };
 		} catch (err) {
 			if (err instanceof Error && /^brain 4\d\d/.test(err.message)) throw err;
 			this.outbox.push(req);
@@ -325,20 +341,20 @@ export class BrainClient {
 	}
 
 	/** Send a write that must not be silently queued (overwrite, list). */
-	writeNow(req: WriteRequest) {
-		return this.call("POST", req.path, req.body);
+	writeNow(req: WriteRequest, options?: RequestOptions) {
+		return this.call("POST", req.path, req.body, options);
 	}
 
 	get pending(): number {
 		return this.outbox.length;
 	}
 
-	async flush(): Promise<number> {
+	async flush(options?: RequestOptions): Promise<number> {
 		let sent = 0;
 		while (this.outbox.length > 0) {
 			const req = this.outbox[0];
 			try {
-				await this.call("POST", req.path, req.body);
+				await this.call("POST", req.path, req.body, options);
 			} catch (err) {
 				if (!(err instanceof Error && /^brain 4\d\d/.test(err.message))) break;
 			}
