@@ -81,6 +81,12 @@ export async function socksHttp(opts: SocksHttpOptions): Promise<{ status: numbe
 	const deadline = Date.now() + timeoutMs;
 	const sock = await socksConnect(opts.proxyPort, opts.host, opts.port, timeoutMs);
 	return new Promise((resolve, reject) => {
+		// `agent` has to stay unset. Node only honours `createConnection` when no
+		// agent is chosen, so `agent: false` silently builds a default agent
+		// instead: the socket the handshake just opened is thrown away and the
+		// request dials the peer's tailnet address over the host's own network,
+		// where nothing routes it. That is indistinguishable from a brain that
+		// never answers. With no agent the socket is used for one request and closed.
 		const req = http.request(
 			{
 				createConnection: () => sock,
@@ -89,7 +95,6 @@ export async function socksHttp(opts: SocksHttpOptions): Promise<{ status: numbe
 				method: opts.method,
 				path: opts.path,
 				headers: opts.headers,
-				agent: false,
 				timeout: Math.max(1, deadline - Date.now()),
 			},
 			(res) => {

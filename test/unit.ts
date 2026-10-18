@@ -6,6 +6,7 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import * as fs from "node:fs";
+import * as http from "node:http";
 import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -433,6 +434,81 @@ await checkAsync("a dropped probe is bounded by its budget, not by the handshake
 	const took = Date.now() - started;
 	proxy.close();
 	assert.ok(took < 3000, `the whole probe should be bounded, took ${took}ms`);
+});
+
+/**
+ * A proxy that finishes the SOCKS handshake and then serves HTTP over the tunnel,
+ * remembering whether a request ever arrived through it. This is the shape a real
+ * brain probe has: the handshake is only half of it.
+ */
+function brainProxy(): Promise<{ close: () => void; port: number; sawRequest: () => boolean }> {
+	let sawRequest = false;
+	const httpServer = http.createServer((_req, res) => {
+		sawRequest = true;
+		res.writeHead(200, { "content-type": "application/json" });
+		res.end(JSON.stringify({ ok: true, service: "pi-scale-memory", role: "brain" }));
+	});
+	return new Promise((resolve, reject) => {
+		const srv = net.createServer((sock) => {
+			let buf = Buffer.alloc(0);
+			let stage = "greeting";
+			sock.on("error", () => {});
+			sock.on("data", function onData(chunk: Buffer) {
+				buf = Buffer.concat([buf, chunk]);
+				if (stage === "greeting") {
+					if (buf.length < 2) return;
+					const methods = buf[1];
+					if (buf.length < 2 + methods) return;
+					buf = buf.subarray(2 + methods);
+					stage = "connect";
+					sock.write(Buffer.from([0x05, 0x00]));
+					return;
+				}
+				if (buf.length < 5) return;
+				let need = 4;
+				if (buf[3] === 0x01) need += 4 + 2;
+				else if (buf[3] === 0x04) need += 16 + 2;
+				else need += 1 + buf[4] + 2;
+				if (buf.length < need) return;
+				const rest = buf.subarray(need);
+				sock.off("data", onData);
+				sock.write(Buffer.from([0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]));
+				if (rest.length) sock.unshift(rest);
+				httpServer.emit("connection", sock);
+			});
+		});
+		srv.once("error", reject);
+		srv.listen(0, "127.0.0.1", () => {
+			resolve({
+				close: () => {
+					srv.close();
+					httpServer.close();
+				},
+				port: (srv.address() as net.AddressInfo).port,
+				sawRequest: () => sawRequest,
+			});
+		});
+	});
+}
+await checkAsync("the request rides the socket the handshake opened", async () => {
+	// `agent` has to stay unset in socksHttp. Node honours `createConnection` only
+	// when no agent is chosen, so `agent: false` quietly builds a default agent,
+	// throws this socket away and dials the peer address over the host's own
+	// network. Nothing routes a tailnet address there, so the probe reaches no
+	// brain and reads as a timeout. Only serving HTTP on the tunnel catches that.
+	const proxy = await brainProxy();
+	const res = await socksHttp({
+		proxyPort: proxy.port,
+		host: "100.64.0.1",
+		port: 8787,
+		method: "GET",
+		path: "/v1/health",
+		timeoutMs: 3000,
+	});
+	assert.ok(proxy.sawRequest(), "the HTTP request has to arrive through the tunnel");
+	proxy.close();
+	assert.equal(res.status, 200, "the probe should get the brain's answer back");
+	assert.match(res.body, /"role":"brain"/);
 });
 
 console.log("leftover nodes");
