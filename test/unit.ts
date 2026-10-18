@@ -21,7 +21,7 @@ import {
 	searchWithFallback,
 	syncCache,
 } from "../src/cache.js";
-import { BrainClient, localTransport } from "../src/client.js";
+import { BrainClient, localTransport, retryDelayMs } from "../src/client.js";
 import {
 	agentUpArgs,
 	parseElapsed,
@@ -158,6 +158,22 @@ check("the node hostname is stable and does not collide with the host", () => {
 });
 
 console.log("the agent's own tailnet node");
+check("a brain that is not answering yet is retried, then at a steady pace", () => {
+	assert.equal(retryDelayMs(0), 5_000, "the first retry is quick: a just-joined node has no paths yet");
+	assert.equal(retryDelayMs(1), 10_000);
+	assert.equal(retryDelayMs(2), 20_000);
+	assert.equal(retryDelayMs(3), 30_000);
+	assert.equal(retryDelayMs(4), 60_000);
+	assert.equal(retryDelayMs(99), 60_000, "it must settle, not grow without bound");
+	assert.equal(retryDelayMs(-1), 5_000, "a nonsense attempt must not be cheaper than the first");
+	let previous = 0;
+	for (let attempt = 0; attempt < 20; attempt++) {
+		const delay = retryDelayMs(attempt);
+		assert.ok(delay >= previous, `backoff must not go backwards at attempt ${attempt}`);
+		previous = delay;
+	}
+	assert.ok(!/retry/i.test(String(retryDelayMs(3))), "the delay is a number, not a message");
+});
 check("the agent node is named per machine, with no per-session suffix", () => {
 	assert.equal(agentNodeHostname("NV00016680"), "pi-agent-nv00016680");
 	assert.equal(agentNodeHostname("aaron-mac.local"), "pi-agent-aaron-mac");

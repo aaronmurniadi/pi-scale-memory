@@ -40,7 +40,7 @@ import {
 	searchWithFallback,
 	syncCache,
 } from "./src/cache.js";
-import { BrainClient, localTransport, tailnetTransport } from "./src/client.js";
+import { BrainClient, localTransport, retryDelayMs, tailnetTransport } from "./src/client.js";
 import {
 	CONFIG_DIR,
 	type Config,
@@ -65,6 +65,7 @@ import { describeReset, performReset, planReset, summarizeReset } from "./src/re
 import {
 	agentNodeStatus,
 	agentPeers,
+	agentPing,
 	brainNodePaths,
 	brainNodeRunning,
 	ensureAgentNode,
@@ -76,6 +77,13 @@ import {
 import type { Ui } from "./src/ui.js";
 
 const FLUSH_INTERVAL_MS = 30_000;
+/**
+ * How long a path warm-up may run before the peers are asked anyway. The point
+ * is to start discovery early, not to wait for it: magicsock keeps working on a
+ * peer that has not answered, and the probe that follows is what gets the
+ * benefit. Peers that never answer must not hold up the search.
+ */
+const WARM_TIMEOUT_MS = 750;
 /** How often an agent refreshes its offline mirror of the brain. */
 const CACHE_SYNC_MS = Number(process.env.PI_SCALE_MEMORY_CACHE_SYNC_MS ?? 60_000);
 const PERIODIC_EVERY_TURNS = Number(process.env.PI_SCALE_MEMORY_SUMMARY_EVERY_TURNS ?? 15);
@@ -155,6 +163,8 @@ export default function (pi: ExtensionAPI) {
 	let turnsSinceCapture = 0;
 	let capturedMessageCount = 0;
 	let connecting: Promise<void> | null = null;
+	let retryTimer: ReturnType<typeof setTimeout> | null = null;
+	let retryAttempt = 0;
 	let lastError = "";
 	let localBrainStarted = false;
 	let lastCacheSync = 0;
@@ -305,6 +315,10 @@ export default function (pi: ExtensionAPI) {
 		const peers = await agentPeers();
 		if (!agentNode) throw new Error("this machine's tailnet node is not up");
 		const transport = tailnetTransport(agentNode.socksPort);
+		// A node that has just joined knows its peers but has no paths to them yet,
+		// and a dial in that state fails even though the peer is up and answering.
+		// Asking the Tailscale layer first makes magicsock go find the endpoints.
+		await Promise.all(peers.map((peer) => agentPing(peer.ip, WARM_TIMEOUT_MS)));
 		const found = await findBrain(
 			peers,
 			async (host, timeoutMs) => {
@@ -391,14 +405,53 @@ export default function (pi: ExtensionAPI) {
 			client = candidate;
 			snapshot = await client.context();
 			lastError = "";
+			cancelAgentRetry();
 			await syncCacheNow(ctx, cfg, true);
 			status(ctx, `brain: ${client.brainName}`);
 			if (ctx.hasUI) ctx.ui.notify(`pi-scale-memory: connected to brain ${client.brainName}`, "info");
 		} catch (err) {
 			lastError = errMsg(err);
 			status(ctx, "brain: offline");
-			if (ctx.hasUI) ctx.ui.notify(`pi-scale-memory: ${lastError}`, "warning");
+			// Only the first attempt warns. Saying it again every few seconds while a
+			// brain is briefly away is noise, and the retry already reports itself.
+			if (retryAttempt === 0 && ctx.hasUI) ctx.ui.notify(`pi-scale-memory: ${lastError}`, "warning");
+			scheduleAgentRetry(ctx);
 		}
+	}
+
+	/**
+	 * Keep trying a brain that is not answering, rather than stopping until someone
+	 * runs /brain reconnect. A reset brain comes back with a new address, and a
+	 * node that has just joined has no paths yet: both used to need a manual nudge.
+	 */
+	function scheduleAgentRetry(ctx: ExtensionContext): void {
+		if (retryTimer) return;
+		const delay = retryDelayMs(retryAttempt);
+		retryAttempt++;
+		status(ctx, `brain: offline, retrying in ${Math.round(delay / 1000)}s`);
+		retryTimer = setTimeout(() => {
+			retryTimer = null;
+			void reconnect(ctx);
+		}, delay);
+		retryTimer.unref();
+	}
+
+	function cancelAgentRetry(): void {
+		if (retryTimer) {
+			clearTimeout(retryTimer);
+			retryTimer = null;
+		}
+		retryAttempt = 0;
+	}
+
+	/** Connect at most once at a time, however many callers ask. */
+	async function reconnect(ctx: ExtensionContext): Promise<void> {
+		if (!connecting) {
+			connecting = connect(ctx).finally(() => {
+				connecting = null;
+			});
+		}
+		await connecting;
 	}
 
 	async function connect(ctx: ExtensionContext): Promise<void> {
@@ -416,6 +469,7 @@ export default function (pi: ExtensionAPI) {
 			clearInterval(flushTimer);
 			flushTimer = null;
 		}
+		cancelAgentRetry();
 		// The node is shared per machine and stays up between sessions, so this only
 		// drops our handle to it. /reset-pi-scale-settings stops it for good.
 		agentNode = null;
@@ -496,12 +550,10 @@ export default function (pi: ExtensionAPI) {
 		turnsSinceCapture = 0;
 		capturedMessageCount = 0;
 		if (flushTimer) clearInterval(flushTimer);
-		if (!connecting) {
-			connecting = connect(ctx).finally(() => {
-				connecting = null;
-			});
-		}
-		await connecting;
+		// A session that ended on a transition left a retry pending against its own
+		// context; start this one clean instead.
+		cancelAgentRetry();
+		await reconnect(ctx);
 		flushTimer = setInterval(async () => {
 			if (!client) return;
 			try {
@@ -727,7 +779,7 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 		ctx.ui.notify(
-			`Joined the tailnet, but no peer answered as a brain on port ${cfg.brainPort}. Run /join-tailnet-brain on the machine that will host the memory, then /brain reconnect here.`,
+			`Joined the tailnet, but no peer answered as a brain on port ${cfg.brainPort} yet. Still trying in the background — the memory comes online on its own once a brain is reachable. If none ever appears, run /join-tailnet-brain on the machine that will host it.`,
 			"warning",
 		);
 	}

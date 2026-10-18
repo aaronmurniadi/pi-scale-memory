@@ -392,6 +392,19 @@ export async function agentPeers(): Promise<BrainPeer[]> {
 	return parsePeers(res.stdout);
 }
 
+/**
+ * Ask the Tailscale layer to reach a peer.
+ *
+ * A node that has just joined has the peer list but no paths yet, and magicsock
+ * only learns a peer's endpoints when something tries to use it. That trigger is
+ * the whole point here, so the answer is not interesting: magicsock keeps going
+ * after this returns, and even after the call is given up on.
+ */
+export async function agentPing(ip: string, timeoutMs = 1000): Promise<boolean> {
+	const res = await agentCli(["ping", "--c=1", ip], timeoutMs);
+	return res.ok;
+}
+
 /** The port recorded when the node was started, so a later session can attach. */
 export function agentSocksPort(): number | null {
 	try {

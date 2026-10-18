@@ -34,6 +34,23 @@ export interface TransportRequest {
 	body?: string;
 }
 
+/**
+ * Backoff for a brain that is not answering yet: quick at first, then steady.
+ *
+ * Waiting is expected in two ordinary cases. A node that has just joined has the
+ * peer list but no paths to it yet, and a brain that was reset comes back under a
+ * new address, so the naive one-shot discovery gives up during a window that
+ * closes on its own.
+ */
+const RETRY_DELAYS_MS = [5_000, 10_000, 20_000, 30_000, 60_000];
+
+/** Delay before retry number `attempt` (0 is the first retry). */
+export function retryDelayMs(attempt: number): number {
+	if (attempt < 0) return RETRY_DELAYS_MS[0];
+	if (attempt >= RETRY_DELAYS_MS.length) return RETRY_DELAYS_MS[RETRY_DELAYS_MS.length - 1];
+	return RETRY_DELAYS_MS[attempt];
+}
+
 /** Moves one HTTP request to the brain, either over loopback or through the tailnet SOCKS5 proxy. */
 export interface BrainTransport {
 	(host: string, port: number, req: TransportRequest, timeoutMs?: number): Promise<{ status: number; body: string }>;
