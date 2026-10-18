@@ -89,14 +89,19 @@ export interface TransportRequest {
 }
 
 /**
- * Backoff for a brain that is not answering yet: quick at first, then steady.
+ * Backoff for a brain that is not answering yet.
  *
- * Waiting is expected in two ordinary cases. A node that has just joined has the
- * peer list but no paths to it yet, and a brain that was reset comes back under a
- * new address, so the naive one-shot discovery gives up during a window that
- * closes on its own.
+ * A few tries is the right size for this. A node that has just joined needs a moment
+ * to find paths to its peers, and a brain that was reset comes back under a new
+ * address, so a single attempt gives up inside a window that closes on its own.
+ * Beyond that, the cause is usually something only the user can change — no brain
+ * running yet, the wrong port, a machine that is asleep — and a loop that retries
+ * forever hides that instead of reporting it.
  */
-const RETRY_DELAYS_MS = [5_000, 10_000, 20_000, 30_000, 60_000];
+const RETRY_DELAYS_MS = [5_000, 10_000, 20_000];
+
+/** How many times an agent retries on its own before it stops and asks the user. */
+export const MAX_RETRY_ATTEMPTS = RETRY_DELAYS_MS.length;
 
 /** Delay before retry number `attempt` (0 is the first retry). */
 export function retryDelayMs(attempt: number): number {

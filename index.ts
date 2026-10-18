@@ -13,7 +13,7 @@
  *   /self-tag               — set this pi agent's role (brain or agent)
  *   /join-tailnet-brain     — join this machine and host the memory here
  *   /join-tailnet-agent     — join this machine as an agent
- *   /brain                  — status | namespaces | ns | merge | compact | sync | reindex | reconnect | reset
+ *   /brain                  — status | namespaces | ns | merge | compact | sync | reindex | connect | reset
  *   /core-memory            — write core memory (the only writer), --remove to delete, no args to show
  *   /update-pi-scale-memory — update the extension itself, then reload
  *   /reset-pi-scale-settings — delete all local state and start over
@@ -41,7 +41,7 @@ import {
 	searchWithFallback,
 	syncCache,
 } from "./src/cache.js";
-import { BrainClient, localTransport, retryDelayMs, tailnetTransport } from "./src/client.js";
+import { BrainClient, localTransport, MAX_RETRY_ATTEMPTS, retryDelayMs, tailnetTransport } from "./src/client.js";
 import { BUDGETS, DEFAULT_NS, SHARED } from "./brain/memory.mjs";
 import { type NamespaceResolution, resolveForCwd } from "./src/namespace.js";
 import { run } from "./src/shell.js";
@@ -255,7 +255,7 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	function requireClient(): BrainClient {
-		if (!client) throw new Error(`${notConnected()}. Run /brain reconnect.`);
+		if (!client) throw new Error(`${notConnected()}. Run /brain connect.`);
 		return client;
 	}
 
@@ -477,15 +477,33 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	/**
-	 * Keep trying a brain that is not answering, rather than stopping until someone
-	 * runs /brain reconnect. A reset brain comes back with a new address, and a
-	 * node that has just joined has no paths yet: both used to need a manual nudge.
+	 * Retry a brain that is not answering yet, a bounded number of times.
+	 *
+	 * A retry covers the cases that fix themselves: a node that has just joined has
+	 * the peer list but no paths yet, and a reset brain comes back under a new
+	 * address. Past a few tries the cause is usually something only the user can
+	 * change — no brain running yet, the wrong port, a machine that is asleep — so
+	 * the agent stops and says what to do instead of retrying in silence. Reads keep
+	 * coming from the mirror while it is disconnected.
 	 */
 	function scheduleAgentRetry(ctx: ExtensionContext): void {
 		if (retryTimer) return;
+		if (retryAttempt >= MAX_RETRY_ATTEMPTS) {
+			status(ctx, "brain: offline, run /brain connect");
+			if (ctx.hasUI) {
+				ctx.ui.notify(
+					`pi-scale-memory: gave up after ${MAX_RETRY_ATTEMPTS} tries (${lastError || "no peer answered as a brain"}). Run /brain connect to try again.`,
+					"warning",
+				);
+			}
+			return;
+		}
 		const delay = retryDelayMs(retryAttempt);
 		retryAttempt++;
-		status(ctx, `brain: offline, retrying in ${Math.round(delay / 1000)}s`);
+		status(
+			ctx,
+			`brain: offline, retrying in ${Math.round(delay / 1000)}s (attempt ${retryAttempt}/${MAX_RETRY_ATTEMPTS})`,
+		);
 		retryTimer = setTimeout(() => {
 			retryTimer = null;
 			void reconnect(ctx);
@@ -758,7 +776,7 @@ export default function (pi: ExtensionAPI) {
 
 	// --- /brain ---
 	pi.registerCommand("brain", {
-		description: "pi-scale-memory: status | namespaces | ns | merge | compact | sync | reindex | reconnect | reset",
+		description: "pi-scale-memory: status | namespaces | ns | merge | compact | sync | reindex | connect | reset",
 		handler: async (args, ctx) => {
 			const sub = (args ?? "").trim().split(/\s+/)[0] || "status";
 			if (sub === "reset") {
@@ -799,7 +817,9 @@ export default function (pi: ExtensionAPI) {
 				}
 				return;
 			}
-			if (sub === "reconnect") {
+			// `connect` is the name the messages point at; `reconnect` is kept as the
+			// original spelling so muscle memory and older notes still work.
+			if (sub === "reconnect" || sub === "connect") {
 				await stopBrainNode();
 
 				await disconnect();
@@ -1078,7 +1098,7 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 		ctx.ui.notify(
-			`Joined the tailnet, but no peer answered as a brain on port ${cfg.brainPort} yet. Still trying in the background — the memory comes online on its own once a brain is reachable. If none ever appears, run /join-tailnet-brain on the machine that will host it.`,
+			`Joined the tailnet, but no peer answered as a brain on port ${cfg.brainPort} yet. It tries ${MAX_RETRY_ATTEMPTS} times on its own; if none of them finds a brain, run /brain connect to try again — and /join-tailnet-brain on the machine that should host one.`,
 			"warning",
 		);
 	}
