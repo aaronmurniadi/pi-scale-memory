@@ -15,6 +15,7 @@
  *   /join-tailnet-agent     — join this machine as an agent
  *   /brain                  — status | sync | reindex | reconnect | reset
  *   /update-pi-scale-memory — update the extension itself, then reload
+ *   /reset-pi-scale-settings — delete all local state and start over
  */
 import { spawn } from "node:child_process";
 import * as fs from "node:fs";
@@ -41,10 +42,8 @@ import {
 import { BrainClient, localTransport, tailnetTransport } from "./src/client.js";
 import {
 	CONFIG_DIR,
-	CONFIG_PATH,
 	type Config,
 	loadConfig,
-	resetConfig,
 	type Role,
 	saveConfig,
 	updateConfig,
@@ -53,6 +52,7 @@ import { brainLogPath, ensureBrainServer, stopBrainServer } from "./src/brain-se
 import { inspectInstall, runUpdate } from "./src/update.js";
 import { tailscaleInstalled, UserspaceTailnet } from "./src/tailnet.js";
 import { findBrain, isBrainResponse } from "./src/discovery.js";
+import { describeReset, performReset, planReset, summarizeReset } from "./src/reset.js";
 import { brainNodePaths, brainNodeRunning, ensureBrainNode, nodeStatus, stopBrainNode } from "./src/tailnet-node.js";
 import type { Ui } from "./src/ui.js";
 
@@ -514,11 +514,7 @@ export default function (pi: ExtensionAPI) {
 		handler: async (args, ctx) => {
 			const sub = (args ?? "").trim().split(/\s+/)[0] || "status";
 			if (sub === "reset") {
-				await stopBrainServer();
-				await stopBrainNode();
-				await disconnect();
-				resetConfig();
-				ctx.ui.notify(`Config removed (${CONFIG_PATH}). Use /self-tag and /join-tailnet-brain (or /join-tailnet-agent) to set up again.`, "info");
+				await resetEverything(ctx);
 				return;
 			}
 			if (sub === "sync") {
@@ -723,6 +719,36 @@ export default function (pi: ExtensionAPI) {
 			"info",
 		);
 	}
+
+	// --- full reset (shared by /reset-pi-scale-settings and /brain reset) ---
+	async function resetEverything(ctx: ExtensionContext): Promise<void> {
+		const plan = planReset();
+		if (!(await ctx.ui.confirm("Reset pi-scale-memory completely?", describeReset(plan)))) {
+			ctx.ui.notify("Reset cancelled. Nothing was changed.", "info");
+			return;
+		}
+
+		// This session's own agent node first, while its socket still exists.
+		let loggedOutThisSession = false;
+		try {
+			loggedOutThisSession = await tailnet.logout();
+		} catch {
+			/* best effort */
+		}
+		await disconnect();
+
+		const outcome = await performReset((message) => ctx.ui.notify(`pi-scale-memory: ${message}`, "info"));
+		if (loggedOutThisSession) outcome.loggedOut.push("this session's agent node");
+		ctx.ui.notify(summarizeReset(outcome), "info");
+	}
+
+	// --- /reset-pi-scale-settings ---
+	pi.registerCommand("reset-pi-scale-settings", {
+		description: "Delete all pi-scale-memory state (config, cache, tailscale nodes) and start over",
+		handler: async (_args, ctx) => {
+			await resetEverything(ctx);
+		},
+	});
 
 	// --- /join-tailnet-agent ---
 	pi.registerCommand("join-tailnet-agent", {

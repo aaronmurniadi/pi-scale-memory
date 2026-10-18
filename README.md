@@ -35,7 +35,8 @@ Nothing is published to the internet: the memory API is reachable only from the 
 | `/join-tailnet-brain` | brain | Starts this machine's own userspace Tailscale node, joins it with a pre-auth key, publishes the memory port to the tailnet, and sets the role to `brain` |
 | `/join-tailnet-agent` | agent | Joins with a pre-auth key on a private userspace tailscaled, then asks the tailnet which peer is the brain |
 | `/self-tag [brain\|agent]` | both | Sets the role on its own, without joining |
-| `/brain status\|sync\|reindex\|reconnect\|reset` | both | Shows role, brain, health, search engine, queue and cache age; refreshes the offline mirror; reports the brain's index; rejoins; deletes the saved config |
+| `/reset-pi-scale-settings` | both | Stops the daemons this extension started, logs its tailscale nodes out, and deletes all of its state so you can start over |
+| `/brain status\|sync\|reindex\|reconnect\|reset` | both | Shows role, brain, health, search engine, queue and cache age; refreshes the offline mirror; reports the brain's index; rejoins; `reset` is the same as `/reset-pi-scale-settings` |
 | `/update-pi-scale-memory` | both | Updates the extension (git pull, or `pi update`) and reloads it |
 
 ### Quick start
@@ -177,6 +178,18 @@ Brain-side environment (where `brain/server.mjs` runs):
 ### Control plane
 
 This extension targets Tailscale. It has not been tested against Headscale; `PI_SCALE_MEMORY_LOGIN_SERVER` is honoured if you want to point the agent-side client at another control server, but nothing in the setup flow installs or configures one.
+
+## Starting over
+
+`/reset-pi-scale-settings` (or `/brain reset`) stops the brain server and the brain's tailscale node, logs this session's agent node out, and deletes the extension's whole state directory — saved role, pre-auth keys, brain token, cached memory, the brain's tailscale state, logs and pid files:
+
+```
+~/.pi/agent/pi-scale-memory/
+```
+
+It also clears socket directories left behind by sessions that crashed, but only those older than an hour, so a concurrently running pi is left alone. Everything it will stop and delete is listed in the confirmation prompt before anything happens; declining changes nothing.
+
+It cannot delete the machines this extension registered in your tailnet — that needs the admin console or the Tailscale API. They are listed there as devices named `pi-brain-<host>` and `pi-agent-<host>-<id>`; delete them yourself, or use ephemeral pre-auth keys so they expire on their own. After a reset, set up again with `/join-tailnet-brain` or `/join-tailnet-agent`.
 
 ## Updating
 

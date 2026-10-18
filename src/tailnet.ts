@@ -174,6 +174,17 @@ export class UserspaceTailnet {
 		return this.proc !== null && this.proc.exitCode === null;
 	}
 
+	get socketPath(): string {
+		return this.socket;
+	}
+
+	/** Invalidate this node's key, so a reset does not leave it live in the tailnet. */
+	async logout(): Promise<boolean> {
+		if (!this.socket) return false;
+		const res = await run("tailscale", [`--socket=${this.socket}`, "logout"], { timeoutMs: 20000 });
+		return res.ok;
+	}
+
 	async start(opts: TailnetStartOptions): Promise<void> {
 		if (this.running) return;
 		const id = crypto.randomBytes(3).toString("hex");

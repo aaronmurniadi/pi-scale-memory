@@ -43,6 +43,8 @@ import {
 	upArgs,
 } from "../src/tailnet-node.js";
 import { findBrain, isBrainResponse, rankCandidates } from "../src/discovery.js";
+import { describeReset, planReset, staleTempDirs } from "../src/reset.js";
+import { configDir } from "../src/config.js";
 import type { BrainPeer } from "../src/tailnet.js";
 import { findPackageSource, inspectInstall } from "../src/update.js";
 
@@ -698,6 +700,35 @@ if (qmdInstalled()) {
 	console.log("  skip qmd search test: qmd is not installed");
 }
 
+console.log("full reset");
+check("only old leftovers are picked for deletion", () => {
+	const now = 1_000_000_000;
+	const HOUR = 60 * 60 * 1000;
+	const entries = [
+		{ path: "/tmp/psm-crashed", mtimeMs: now - 3 * HOUR },
+		{ path: "/tmp/psm-live", mtimeMs: now - 5_000 },
+		{ path: "/tmp/other-thing", mtimeMs: now - 9 * HOUR },
+	];
+	assert.deepEqual(staleTempDirs(entries, now), ["/tmp/psm-crashed"]);
+	assert.deepEqual(staleTempDirs(entries, now, 0), ["/tmp/psm-crashed", "/tmp/psm-live"]);
+	assert.deepEqual(staleTempDirs([], now), []);
+});
+check("the reset plan names what it will delete", () => {
+	const plan = planReset(Date.now(), "/tmp/psm-nonexistent-dir");
+	assert.ok(plan.remove.length >= 1, "the config dir is always in the plan");
+	assert.equal(plan.remove[0], configDir(), "the plan must target the extension's own config dir");
+	assert.ok(
+		!plan.remove.some((p) => p === "/tmp/psm-nonexistent-dir"),
+		"a nonexistent tmp dir must not be planned",
+	);
+	const text = describeReset(plan);
+	assert.match(text, /Deletes:/);
+	assert.ok(text.includes(configDir()), "the confirmation must show the real path");
+	assert.match(text, /admin console/, "it should be honest that devices remain in Tailscale");
+	assert.match(text, /start over/i);
+	assert.match(text, /join-tailnet-brain/, "it should say how to start again");
+});
+
 console.log("extension registration");
 await checkAsync("the extension registers its commands and tools", async () => {
 	const mod = await import("../index.js");
@@ -721,6 +752,7 @@ await checkAsync("the extension registers its commands and tools", async () => {
 		"brain",
 		"join-tailnet-agent",
 		"join-tailnet-brain",
+		"reset-pi-scale-settings",
 		"self-tag",
 		"update-pi-scale-memory",
 	]);
