@@ -18,6 +18,12 @@ export interface Config {
 	brainHost?: string;
 	/** Mirror brain memory locally so reads work offline (agents only). Default true. */
 	cache?: boolean;
+	/** Pin the project namespace instead of deriving it from git. Escape hatch and CI use. */
+	namespace?: string;
+	/** Which remote is canonical when a repo has several (fork vs upstream). Default: origin. */
+	scopeRemote?: string;
+	/** Where memory goes when the workspace is not a git repository. Default: a machine-local path namespace. */
+	scopeFallback?: "path" | "legacy";
 }
 
 const DIR = path.join(os.homedir(), ".pi", "agent", "pi-scale-memory");
@@ -38,6 +44,11 @@ export function loadConfig(applyEnv = true): Config {
 	if (env.PI_SCALE_MEMORY_TOKEN) cfg.brainToken = env.PI_SCALE_MEMORY_TOKEN;
 	if (env.PI_SCALE_MEMORY_BRAIN_HOST) cfg.brainHost = env.PI_SCALE_MEMORY_BRAIN_HOST;
 	if (env.PI_SCALE_MEMORY_CACHE === "0" || env.PI_SCALE_MEMORY_CACHE === "false") cfg.cache = false;
+	if (env.PI_SCALE_MEMORY_NAMESPACE) cfg.namespace = env.PI_SCALE_MEMORY_NAMESPACE;
+	if (env.PI_SCALE_MEMORY_SCOPE_REMOTE) cfg.scopeRemote = env.PI_SCALE_MEMORY_SCOPE_REMOTE;
+	if (env.PI_SCALE_MEMORY_SCOPE_FALLBACK === "path" || env.PI_SCALE_MEMORY_SCOPE_FALLBACK === "legacy") {
+		cfg.scopeFallback = env.PI_SCALE_MEMORY_SCOPE_FALLBACK;
+	}
 	return cfg;
 }
 

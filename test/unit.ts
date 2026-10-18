@@ -69,6 +69,27 @@ import {
 import { configDir } from "../src/config.js";
 import type { BrainPeer } from "../src/tailnet.js";
 import { findPackageSource, inspectInstall } from "../src/update.js";
+import {
+	buildContext,
+	DEFAULT_NS,
+	isValidNs,
+	migrateFlat,
+	similarity,
+	todayStr,
+	tokenize,
+	TOTAL_CONTEXT_CHARS,
+	writeEntry,
+	yesterdayStr,
+} from "../brain/memory.mjs";
+import {
+	canonicalRemote,
+	detectGit,
+	mainWorktreeRoot,
+	nsIdFromKey,
+	pickRemote,
+	resolveForCwd,
+	resolveNamespace,
+} from "../src/namespace.js";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.join(HERE, "..");
@@ -116,6 +137,18 @@ function removeCollection(name: string): void {
 	spawnSync("qmd", ["collection", "remove", name], { encoding: "utf-8" });
 }
 
+/**
+ * A brain keeps one collection per tier, named `<prefix>-<tier>`, so cleanup has to
+ * name them. `qmd update` reindexes every collection on the machine, so a leftover
+ * from a test is a standing tax on every later run.
+ */
+function removeCollections(prefix: string, namespaces: string[] = []): void {
+	removeCollection(`${prefix}-core`);
+	removeCollection(`${prefix}-shared`);
+	removeCollection(`${prefix}-legacy`);
+	for (const ns of namespaces) removeCollection(`${prefix}-${ns}`);
+}
+
 function testCollection(): string {
 	return `psm-test-${process.pid}-${Math.floor(Math.random() * 1e6)}`;
 }
@@ -127,7 +160,7 @@ async function startBrain(dir: string, port: number, collection: string) {
 			...process.env,
 			BRAIN_DIR: dir,
 			BRAIN_PORT: String(port),
-			QMD_COLLECTION: collection,
+			QMD_COLLECTION_PREFIX: collection,
 			QMD_UPDATE: "off",
 		},
 		stdio: "ignore",
@@ -652,7 +685,7 @@ check("parseCollections reads the collection list", () => {
 });
 
 console.log("brain server over loopback");
-await checkAsync("write/read/search/scratchpad/forget round-trip", async () => {
+await checkAsync("tiered write/read/search/scratchpad/forget round-trip", async () => {
 	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "psm-brain-"));
 	const port = await freePort();
 	const collection = testCollection();
@@ -664,55 +697,81 @@ await checkAsync("write/read/search/scratchpad/forget round-trip", async () => {
 		agentId: "test-agent",
 		transport: localTransport(),
 	});
+	const ns = "project-a";
 	try {
-		await client.health();
-		assert.equal(await client.context(), "");
+		const health = await client.health();
+		assert.deepEqual(health.scopes, ["core", "shared", "project"]);
+		assert.equal(health.defaultNs, DEFAULT_NS);
+		assert.equal(await client.context(ns), "", "an empty brain injects nothing");
 
 		const longTerm = await client.writeOrQueue({
 			path: "/v1/write",
-			body: { target: "long_term", content: "chose #postgres", agent: "test-agent" },
+			body: { target: "long_term", ns, content: "chose #postgres", agent: "test-agent" },
 		});
 		assert.equal(longTerm.queued, false);
-		assert.equal(longTerm.result.file, "MEMORY.md");
+		assert.equal(longTerm.result.file, "project-a/MEMORY.md");
 
 		const daily = await client.writeOrQueue({
 			path: "/v1/write",
-			body: { target: "daily", content: "fixed [[auth]]", agent: "test-agent" },
+			body: { target: "daily", ns, content: "fixed [[auth]]", agent: "test-agent" },
 		});
-		assert.match(daily.result.file, /^daily\/\d{4}-\d{2}-\d{2}\.md$/);
+		assert.match(daily.result.file, /^project-a\/daily\/\d{4}-\d{2}-\d{2}\.md$/);
 
-		const context = await client.context();
+		const shared = await client.writeOrQueue({
+			path: "/v1/write",
+			body: { target: "long_term", ns: "shared", content: "always run the tests", agent: "test-agent" },
+		});
+		assert.equal(shared.result.file, "shared/MEMORY.md");
+
+		const context = await client.context(ns);
 		assert.match(context, /chose #postgres/);
 		assert.match(context, /fixed \[\[auth\]\]/);
+		assert.match(context, /always run the tests/, "shared memory is injected with the project's own");
 
-		const hits = await client.search("#postgres", 5);
+		const hits = await client.search("#postgres", 5, undefined, { ns, scope: "all" });
 		assert.ok(hits.results.length >= 1, "search should find the long-term note");
 		assert.equal(hits.results[0].file, "MEMORY.md");
+		assert.equal(hits.results[0].tier, "project");
 
-		const read = await client.read("long_term");
+		const sharedHit = await client.search("run the tests", 5, undefined, { ns, scope: "shared" });
+		assert.equal(sharedHit.results[0]?.tier, "shared");
+		assert.equal(
+			(await client.search("#postgres", 5, undefined, { ns, scope: "shared" })).results.length,
+			0,
+			"a project note must not surface from the shared tier",
+		);
+
+		const read = await client.read("long_term", { ns });
 		assert.match(read.content, /chose #postgres/);
-		const list = await client.read("list");
+		const list = await client.read("list", { ns });
 		assert.equal(list.files.length, 1);
 
-		const snap = await client.snapshot();
+		const snap = await client.snapshot(ns);
 		assert.ok(snap.takenAt.length > 0);
-		assert.match(snap.files["MEMORY.md"], /chose #postgres/);
+		assert.equal(snap.project?.id, ns);
+		assert.match(snap.project?.files["MEMORY.md"] ?? "", /chose #postgres/);
+		assert.match(snap.shared.files["MEMORY.md"] ?? "", /always run the tests/);
 
-		const added = await client.writeNow({ path: "/v1/scratchpad", body: { action: "add", text: "todo one" } });
+		// Isolation: another project sees none of this project's memory.
+		assert.equal((await client.read("long_term", { ns: "project-b" })).content, "");
+		assert.ok(!(await client.context("project-b")).includes("chose #postgres"));
+		assert.ok(fs.existsSync(path.join(dir, "ns", ns, "MEMORY.md")), "a project tier is one directory per namespace");
+
+		const added = await client.writeNow({ path: "/v1/scratchpad", body: { action: "add", ns, text: "todo one" } });
 		assert.equal(added.items.length, 1);
 		assert.equal(added.items[0].done, false);
-		const done = await client.writeNow({ path: "/v1/scratchpad", body: { action: "done", text: "todo" } });
+		const done = await client.writeNow({ path: "/v1/scratchpad", body: { action: "done", ns, text: "todo" } });
 		assert.equal(done.items[0].done, true);
-		const cleared = await client.writeNow({ path: "/v1/scratchpad", body: { action: "clear_done" } });
+		const cleared = await client.writeNow({ path: "/v1/scratchpad", body: { action: "clear_done", ns } });
 		assert.equal(cleared.items.length, 0);
 
-		const forgot = await client.forget({ match: "postgres" });
+		const forgot = await client.forget({ match: "postgres", ns });
 		assert.equal(forgot.removed, 1);
-		assert.ok(fs.existsSync(path.join(dir, "recovery", `${forgot.recoveryId}.json`)));
+		assert.ok(fs.existsSync(path.join(dir, "ns", ns, "recovery", `${forgot.recoveryId}.json`)));
 	} finally {
 		child.kill("SIGKILL");
 		fs.rmSync(dir, { recursive: true, force: true });
-		removeCollection(collection);
+		removeCollections(collection, [ns, "project-b"]);
 	}
 });
 
@@ -737,7 +796,7 @@ await checkAsync("the brain server lifecycle starts, reports and stops", async (
 	try {
 		const started = await ensureBrainServer(
 			ROOT,
-			{ port, token: "secret-token", env: { BRAIN_DIR: dir, BRAIN_HOST: "127.0.0.1", QMD_COLLECTION: collection, QMD_UPDATE: "off" } },
+			{ port, token: "secret-token", env: { BRAIN_DIR: dir, BRAIN_HOST: "127.0.0.1", QMD_COLLECTION_PREFIX: collection, QMD_UPDATE: "off" } },
 			(m) => messages.push(m),
 		);
 		assert.equal(started.ok, true, `ensureBrainServer: ${started.detail}`);
@@ -773,7 +832,7 @@ await checkAsync("the brain server lifecycle starts, reports and stops", async (
 		assert.match(conflict.detail, /different token/);
 	} finally {
 		await stopBrainServer();
-		removeCollection(collection);
+		removeCollections(collection);
 		fs.rmSync(dir, { recursive: true, force: true });
 	}
 });
@@ -847,46 +906,80 @@ await checkAsync("mirrors the brain, then serves reads while offline", async () 
 		transport: localTransport(),
 	});
 	try {
-		await live.writeNow({ path: "/v1/write", body: { target: "long_term", content: "cache me #alpha", agent: "a" } });
-		await live.writeNow({ path: "/v1/write", body: { target: "daily", content: "today note #beta", agent: "a" } });
-		await live.writeNow({ path: "/v1/scratchpad", body: { action: "add", text: "cache todo" } });
+		const ns = "project-cache";
+		await live.writeNow({ path: "/v1/write", body: { target: "long_term", ns, content: "cache me #alpha", agent: "a" } });
+		await live.writeNow({ path: "/v1/write", body: { target: "daily", ns, content: "today note #beta", agent: "a" } });
+		await live.writeNow({ path: "/v1/scratchpad", body: { action: "add", ns, text: "cache todo" } });
+		await live.writeCore({ action: "append", content: "core rule #gamma" });
+		await live.writeNow({
+			path: "/v1/write",
+			body: { target: "long_term", ns: "shared", content: "shared rule #delta", agent: "a" },
+		});
 
 		assert.equal(hasCache(cache), false);
-		const meta = await syncCache(live, cache);
-		assert.equal(meta.files, 3, "MEMORY.md, SCRATCHPAD.md and one daily log");
-		assert.equal(metaOf(cache)?.files, 3);
+		const meta = await syncCache(live, cache, ns);
+		assert.equal(meta.files, 5, "project MEMORY.md, SCRATCHPAD.md and one daily log, plus core and shared");
+		assert.equal(metaOf(cache)?.files, 5);
+		assert.equal(meta.ns, ns);
 
-		const offlineRead = await readWithFallback(dead, cache, "long_term");
+		// The two cross-project tiers are mirrored whatever project the session is in.
+		const tierRead = (tier: string) => fs.readFileSync(path.join(cache, tier, "MEMORY.md"), "utf-8");
+		assert.match(tierRead("core"), /core rule #gamma/);
+		assert.match(tierRead("shared"), /shared rule #delta/);
+
+		const offlineRead = await readWithFallback(dead, cache, "long_term", { ns });
 		assert.equal(offlineRead.source, "cache");
 		assert.match(String((offlineRead.value as { content: string }).content), /cache me #alpha/);
 
-		const offlineSearch = await searchWithFallback(dead, cache, "#alpha", 5);
+		const offlineSearch = await searchWithFallback(dead, cache, "#alpha", 5, { ns });
 		assert.equal(offlineSearch.source, "cache");
 		assert.equal(offlineSearch.engine, "bm25");
 		assert.equal(offlineSearch.results[0].file, "MEMORY.md");
 
-		const offlineContext = await contextWithFallback(dead, cache);
+		const offlineContext = await contextWithFallback(dead, cache, ns);
 		assert.equal(offlineContext.source, "cache");
 		assert.match(offlineContext.value, /cache todo/);
 
-		const onlineRead = await readWithFallback(live, cache, "long_term");
+		const onlineRead = await readWithFallback(live, cache, "long_term", { ns });
 		assert.equal(onlineRead.source, "brain");
-		const onlineSearch = await searchWithFallback(live, cache, "#alpha", 5);
+		const onlineSearch = await searchWithFallback(live, cache, "#alpha", 5, { ns });
 		assert.equal(onlineSearch.source, "brain");
 		assert.ok(onlineSearch.results.length >= 1);
-		assert.equal((await contextWithFallback(live, cache)).source, "brain");
+		assert.equal((await contextWithFallback(live, cache, ns)).source, "brain");
+
+		// A project the session is not in is never mirrored, so nothing of it is readable.
+		const other = await readWithFallback(dead, cache, "long_term", { ns: "project-other" });
+		assert.equal(String((other.value as { content: string }).content), "");
+
+		// A second session on this machine, in another repository, must not evict the
+		// first one's mirror: every session on a machine shares this cache directory.
+		await live.writeNow({
+			path: "/v1/write",
+			body: { target: "long_term", ns: "project-second", content: "second project note #omega", agent: "a" },
+		});
+		const secondMeta = await syncCache(live, cache, "project-second");
+		assert.equal(secondMeta.ns, "project-second");
+		const survived = await readWithFallback(dead, cache, "long_term", { ns });
+		assert.match(
+			String((survived.value as { content: string }).content),
+			/cache me #alpha/,
+			"another session's sync must not evict this project",
+		);
+		assert.ok(secondMeta.nsTakenAt[ns], "each tier keeps its own timestamp");
+		assert.ok(secondMeta.nsTakenAt["project-second"]);
+		assert.equal(metaOf(cache)?.nsTakenAt[ns], secondMeta.nsTakenAt[ns], "the older tier's time is not rewritten");
 
 		const empty = cacheDir(fs.mkdtempSync(path.join(os.tmpdir(), "psm-cache-empty-")));
-		await assert.rejects(() => readWithFallback(dead, empty, "long_term"));
+		await assert.rejects(() => readWithFallback(dead, empty, "long_term", { ns }));
 
-		await live.forget({ match: "cache me" });
-		await syncCache(live, cache);
-		assert.equal(await readFromCache(cache, "long_term").content, "");
+		await live.forget({ match: "cache me", ns });
+		await syncCache(live, cache, ns);
+		assert.equal((await readFromCache(cache, "long_term", ns)).content, "");
 	} finally {
 		child.kill("SIGKILL");
 		fs.rmSync(brainDir, { recursive: true, force: true });
 		fs.rmSync(cache, { recursive: true, force: true });
-		removeCollection(collection);
+		removeCollections(collection, ["project-cache", "project-second"]);
 	}
 });
 
@@ -896,18 +989,19 @@ await checkAsync("cache sync ignores paths outside the memory layout", async () 
 		brainName: "fake-brain",
 		snapshot: async () => ({
 			takenAt: "2026-10-18 09:00:00",
-			files: {
-				"MEMORY.md": "legit\n",
-				"../../escape.md": "nope\n",
-				"daily/2026-10-18.md": "ok\n",
-				"daily/not-a-date.md": "nope\n",
+			ns: "project-evil",
+			core: { files: { "MEMORY.md": "core\n" } },
+			shared: { files: { "MEMORY.md": "legit\n", "../../../escape.md": "nope\n" } },
+			project: {
+				id: "project-evil",
+				files: { "MEMORY.md": "project\n", "daily/2026-10-18.md": "ok\n", "daily/not-a-date.md": "nope\n" },
 			},
 		}),
 	} as unknown as BrainClient;
 	try {
-		const meta = await syncCache(fake, cache);
-		assert.equal(meta.files, 2);
-		assert.ok(!fs.existsSync(path.join(cache, "not-a-date.md")));
+		const meta = await syncCache(fake, cache, "project-evil");
+		assert.equal(meta.files, 4, "core, shared, project MEMORY.md and the one valid daily log");
+		assert.ok(!fs.existsSync(path.join(cache, "ns", "project-evil", "daily", "not-a-date.md")));
 		assert.ok(!fs.existsSync(path.join(path.dirname(cache), "escape.md")));
 	} finally {
 		fs.rmSync(cache, { recursive: true, force: true });
@@ -919,8 +1013,10 @@ if (qmdInstalled()) {
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "psm-qmd-"));
 		const port = await freePort();
 		const collection = testCollection();
+		const ns = "project-qmd";
+		fs.mkdirSync(path.join(dir, "ns", ns), { recursive: true });
 		fs.writeFileSync(
-			path.join(dir, "MEMORY.md"),
+			path.join(dir, "ns", ns, "MEMORY.md"),
 			"# Memory\n\nWe chose postgres for the billing database because of JSON support.\n",
 		);
 		const child = await startBrain(dir, port, collection);
@@ -930,15 +1026,15 @@ if (qmdInstalled()) {
 			const deadline = Date.now() + 30000;
 			while (Date.now() < deadline) {
 				const h = await client.health();
-				if (h.search?.ready === true && h.search.collection === collection) {
+				if (h.search?.ready === true && h.search.collections?.includes(`${collection}-${ns}`)) {
 					ready = true;
 					break;
 				}
 				await new Promise((r) => setTimeout(r, 250));
 			}
-			assert.ok(ready, "the brain should report its qmd collection ready");
+			assert.ok(ready, "the brain should report its per-tier qmd collections ready");
 
-			const embedded = spawnSync("qmd", ["embed", "-c", collection, "--timeout", "5"], {
+			const embedded = spawnSync("qmd", ["embed", "-c", `${collection}-${ns}`, "--timeout", "5"], {
 				encoding: "utf-8",
 				timeout: 240000,
 			});
@@ -949,20 +1045,25 @@ if (qmdInstalled()) {
 				return;
 			}
 
-			const semantic = await client.search("which database did we pick for billing", 3, "semantic");
+			const semantic = await client.search("which database did we pick for billing", 3, "semantic", { ns, scope: "all" });
 			assert.equal(semantic.engine, "qmd");
 			assert.equal(semantic.mode, "semantic");
 			assert.ok(semantic.results.length >= 1, "semantic search should find the note");
 			assert.equal(semantic.results[0].file, "MEMORY.md");
+			assert.equal(semantic.results[0].tier, "project");
 			assert.match(semantic.results[0].text, /postgres/);
 
-			const keyword = await client.search("postgres", 3, "keyword");
+			const keyword = await client.search("postgres", 3, "keyword", { ns, scope: "all" });
 			assert.equal(keyword.engine, "qmd");
 			assert.ok(keyword.results.length >= 1);
+
+			// Scoping is exact: another project's collection is not queried at all.
+			const elsewhere = await client.search("postgres", 3, "keyword", { ns: "project-other", scope: "project" });
+			assert.equal(elsewhere.results.length, 0, "a search must never cross into another project");
 		} finally {
 			child.kill("SIGKILL");
 			fs.rmSync(dir, { recursive: true, force: true });
-			removeCollection(collection);
+			removeCollections(collection, [ns, "project-other"]);
 		}
 	});
 } else {
@@ -1037,6 +1138,430 @@ check("the reset plan names what it will delete", () => {
 	assert.match(text, /join-tailnet-brain/, "it should say how to start again");
 });
 
+console.log("project namespaces from git");
+check("a remote URL becomes one canonical key whatever form it arrives in", () => {
+	assert.equal(canonicalRemote("https://github.com/acme/api.git"), "github.com/acme/api");
+	assert.equal(canonicalRemote("https://github.com/acme/api/"), "github.com/acme/api");
+	assert.equal(canonicalRemote("git@github.com:acme/api.git"), "github.com/acme/api");
+	assert.equal(canonicalRemote("ssh://git@github.com:22/acme/api"), "github.com/acme/api");
+	assert.equal(canonicalRemote("HTTPS://GitHub.com/ACME/API.git"), "github.com/acme/api");
+	assert.equal(
+		canonicalRemote("https://user:ghp_secret@github.com/acme/api.git"),
+		"github.com/acme/api",
+		"credentials must never reach the key",
+	);
+	assert.ok(!String(canonicalRemote("https://user:ghp_secret@github.com/acme/api.git")).includes("ghp"));
+	assert.equal(canonicalRemote("/home/aaron/repos/api"), null, "a local path is not a shareable identity");
+	assert.equal(canonicalRemote("file:///home/aaron/repos/api.git"), null);
+	assert.equal(canonicalRemote(""), null);
+});
+check("the namespace id is filesystem-safe, stable and not a reserved name", () => {
+	const id = nsIdFromKey("github.com/acme/api");
+	assert.equal(id, nsIdFromKey("github.com/acme/api"));
+	assert.match(id, /^[a-z0-9][a-z0-9._-]{0,63}$/);
+	assert.notEqual(id, nsIdFromKey("github.com/acme/web"), "different repositories must not collide");
+	assert.equal(isValidNs(".."), false);
+	assert.equal(isValidNs("a/b"), false);
+	assert.equal(isValidNs("Core"), false);
+	assert.equal(isValidNs("core"), false, "core is not a namespace: it has its own endpoint");
+	assert.equal(isValidNs("shared"), true);
+});
+check("the preferred remote decides, so a fork is not silently the upstream project", () => {
+	const remotes = [
+		{ name: "upstream", url: "git@github.com:acme/api.git" },
+		{ name: "origin", url: "git@github.com:me/api.git" },
+	];
+	assert.equal(pickRemote(remotes)?.name, "origin");
+	assert.equal(pickRemote(remotes, "upstream")?.name, "upstream");
+	assert.equal(pickRemote([{ name: "b", url: "x" }, { name: "a", url: "y" }])?.name, "a", "the pick is stable");
+	assert.equal(pickRemote([]), null);
+});
+check("every worktree of one repository resolves to the same root", () => {
+	assert.equal(mainWorktreeRoot("/repo", ".git"), "/repo");
+	assert.equal(mainWorktreeRoot("/repo/.worktrees/one", "/repo/.git"), "/repo");
+	assert.equal(mainWorktreeRoot("/repo", null), "/repo");
+});
+check("the ladder prefers the remote, then this machine's copy, then the path", () => {
+	const base = { cwd: "/repo", hostname: "mac", git: null };
+	const git = {
+		toplevel: "/repo",
+		commonDir: "/repo/.git",
+		remotes: [{ name: "origin", url: "git@github.com:acme/api.git" }],
+		superproject: null,
+	};
+	const withRemote = resolveNamespace({ ...base, git });
+	assert.equal(withRemote.source, "remote");
+	assert.equal(withRemote.key, "github.com/acme/api");
+	assert.equal(withRemote.ns, nsIdFromKey("github.com/acme/api"));
+	assert.equal(
+		resolveNamespace({ ...base, cwd: "/somewhere/else", git: { ...git, toplevel: "/somewhere/else" } }).ns,
+		withRemote.ns,
+		"a second clone is the same project",
+	);
+
+	const noRemote = resolveNamespace({ ...base, git: { ...git, remotes: [] } });
+	assert.equal(noRemote.source, "toplevel");
+	assert.equal(
+		resolveNamespace({
+			...base,
+			git: { ...git, remotes: [], toplevel: "/repo/.worktrees/one", commonDir: "/repo/.git" },
+		}).ns,
+		noRemote.ns,
+		"without a remote, worktrees still share one namespace",
+	);
+	assert.notEqual(
+		resolveNamespace({ ...base, git: { ...git, remotes: [] }, hostname: "other-box" }).ns,
+		noRemote.ns,
+		"a remote-less repository cannot be shared across machines",
+	);
+
+	const plain = resolveNamespace(base);
+	assert.equal(plain.source, "path");
+	assert.notEqual(plain.ns, resolveNamespace({ ...base, cwd: "/other" }).ns);
+
+	const pinned = resolveNamespace({ ...base, git, pin: "My-Project" });
+	assert.equal(pinned.source, "pin");
+	assert.equal(pinned.ns, "my-project");
+	assert.equal(
+		resolveNamespace({ ...base, git, pin: "../etc" }).source,
+		"remote",
+		"a pin that is not a legal namespace id must not escape the namespace dir",
+	);
+	assert.equal(resolveNamespace({ ...base, fallback: "legacy" }).ns, DEFAULT_NS);
+	assert.equal(
+		resolveNamespace({ ...base, git, fallback: "legacy" }).source,
+		"remote",
+		"the fallback is used last, not first",
+	);
+});
+await checkAsync("repository facts are read from git, not guessed", async () => {
+	const table: Record<string, string> = {
+		"rev-parse --show-toplevel": "/repo\n",
+		"rev-parse --git-common-dir": "/repo/.git\n",
+		"rev-parse --show-superproject-working-tree": "\n",
+		"remote -v":
+			"origin\tgit@github.com:acme/api.git (fetch)\norigin\tgit@github.com:acme/api.git (push)\nupstream\thttps://github.com/acme/upstream.git (fetch)\n",
+	};
+	const fake = async (_file: string, args: string[]) => {
+		const out = table[args.slice(2).join(" ")];
+		if (out === undefined) return { ok: false, stdout: "", stderr: "", missing: false, code: 128 };
+		return { ok: true, stdout: out, stderr: "", missing: false, code: 0 };
+	};
+	const facts = await detectGit("/repo", fake);
+	assert.ok(facts);
+	assert.equal(facts.toplevel, "/repo");
+	assert.deepEqual(facts.remotes.map((r) => r.name), ["origin", "upstream"], "one entry per remote, fetch lines only");
+	assert.equal(facts.superproject, null);
+	const resolved = await resolveForCwd("/repo", fake, { hostname: "mac" });
+	assert.equal(resolved.source, "remote");
+	assert.equal(resolved.ns, nsIdFromKey("github.com/acme/api"));
+
+	// No git at all: a clean fall-through to the path rung, not an exception.
+	const noGit = async () => ({ ok: false, stdout: "", stderr: "", missing: true, code: 127 });
+	assert.equal(await detectGit("/tmp", noGit), null);
+	const scratch = await resolveForCwd("/tmp/scratch", noGit, { hostname: "mac" });
+	assert.equal(scratch.source, "path");
+	assert.equal(scratch.ns, (await resolveForCwd("/tmp/scratch", noGit, { hostname: "mac" })).ns);
+	assert.notEqual(scratch.ns, (await resolveForCwd("/tmp/other", noGit, { hostname: "mac" })).ns);
+	assert.equal((await resolveForCwd("/tmp/scratch", noGit, { hostname: "mac", fallback: "legacy" })).ns, DEFAULT_NS);
+});
+
+console.log("memory hygiene: dedup, budgets, migration");
+check("a restated fact replaces its entry instead of growing the file", () => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "psm-dedup-"));
+	try {
+		const file = path.join(dir, "MEMORY.md");
+		const first = writeEntry(file, "<!-- t1 -->\nThe brain listens on port 8787", "The brain listens on port 8787");
+		assert.equal(first.deduped, false);
+		const second = writeEntry(file, "<!-- t2 -->\nThe brain listens on 8787", "The brain listens on 8787");
+		assert.equal(second.deduped, true, "restating a fact must not add a second copy");
+		const content = fs.readFileSync(file, "utf-8");
+		assert.equal(content.split("\n").filter((l) => l.trim()).length, 2, "one stamp and one entry");
+		assert.ok(!content.includes("t1"), "the replaced entry's stamp goes with it");
+		const changed = writeEntry(file, "<!-- t3 -->\nThe brain listens on port 9000 instead", "The brain listens on port 9000 instead");
+		assert.equal(changed.deduped, false, "a changed fact is a new entry, not a replacement");
+		assert.equal(similarity(tokenize("one two three"), tokenize("one two three")), 1);
+		assert.equal(similarity(tokenize("alpha"), tokenize("beta")), 0);
+	} finally {
+		fs.rmSync(dir, { recursive: true, force: true });
+	}
+});
+check("the injected block is budgeted, and core is never what gets dropped", () => {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "psm-ctx-"));
+	try {
+		const ns = "project-ctx";
+		fs.mkdirSync(path.join(root, "core"), { recursive: true });
+		fs.mkdirSync(path.join(root, "ns", ns, "daily"), { recursive: true });
+		fs.writeFileSync(path.join(root, "core", "MEMORY.md"), "- never use ternary operators\n");
+		fs.writeFileSync(path.join(root, "ns", ns, "MEMORY.md"), "# project\n\n- decided to use postgres\n");
+		const notes = Array.from({ length: 2_000 }, (_, i) => `- note ${i} ${i === 0 ? "#first" : ""} ${i === 1_999 ? "#last" : ""}`);
+		fs.writeFileSync(path.join(root, "ns", ns, "daily", `${todayStr()}.md`), notes.join("\n\n"));
+
+		// A log longer than its budget is clipped to the newest part, and says so.
+		const clipped = buildContext(root, ns);
+		assert.match(clipped, /never use ternary operators/, "core survives any budget pressure");
+		assert.match(clipped, /decided to use postgres/);
+		assert.match(clipped, /truncated to \d+ of \d+ chars/, "the log is trimmed and the trim is visible");
+		assert.match(clipped, /#last/, "the newest notes are the ones kept");
+		assert.ok(!clipped.includes("#first"), "the oldest notes are what gets dropped");
+		assert.ok(clipped.length <= TOTAL_CONTEXT_CHARS + 2_000, `budget respected: ${clipped.length} chars`);
+		assert.match(clipped, /~\d+ tokens/, "the size of each tier is visible");
+
+		// With the project file at its own budget, the daily log keeps only what is left
+		// over — it is not thrown away while the budget still has room.
+		const facts = Array.from({ length: 400 }, (_, i) => `- fact ${i} ${"y".repeat(30)}`);
+		fs.writeFileSync(path.join(root, "ns", ns, "MEMORY.md"), facts.join("\n\n"));
+		const squeezed = buildContext(root, ns);
+		assert.match(squeezed, /never use ternary operators/);
+		assert.match(squeezed, /#last/, "the log keeps its newest notes rather than vanishing");
+		assert.ok(!squeezed.includes("#first"), "and gives up its oldest");
+		assert.ok(squeezed.length <= TOTAL_CONTEXT_CHARS + 2_000, `budget respected: ${squeezed.length} chars`);
+		const projectSection = squeezed.match(/## Project memory \([^)]+\)[^[]*\[(\d+) chars/);
+		assert.ok(projectSection, "the project tier is still in the block");
+		assert.ok(
+			Number(projectSection?.[1] ?? 0) > 6_000,
+			`the project's own memory keeps most of its budget: ${projectSection?.[1]} chars`,
+		);
+
+		// A full scratchpad plus a yesterday log cannot both fit: the automatic log
+		// goes first, and the deliberate checklist and the project file stay.
+		fs.writeFileSync(path.join(root, "ns", ns, "SCRATCHPAD.md"), `- [ ] #scratchmark ${"z".repeat(3_900)}\n`);
+		fs.writeFileSync(path.join(root, "ns", ns, "daily", `${yesterdayStr()}.md`), "- yesterday note #yesterdaymark\n");
+		const tight = buildContext(root, ns);
+		assert.match(tight, /#scratchmark/, "the checklist survives");
+		assert.ok(!tight.includes("#yesterdaymark"), "the oldest log is dropped first");
+		assert.ok(!tight.includes("#last"), "then today's log, before the project's memory");
+		assert.ok(
+			Number(tight.match(/## Project memory \([^)]+\)[^[]*\[(\d+) chars/)?.[1] ?? 0) > 6_000,
+			"the project tier is still not the thing that gives way",
+		);
+		assert.ok(tight.length <= TOTAL_CONTEXT_CHARS + 2_000, `budget respected: ${tight.length} chars`);
+
+		const crossProjectOnly = buildContext(root, null);
+		assert.match(crossProjectOnly, /never use ternary operators/, "an unresolvable workspace still gets core");
+		assert.ok(!crossProjectOnly.includes("decided to use postgres"), "and no project memory it cannot attribute");
+	} finally {
+		fs.rmSync(root, { recursive: true, force: true });
+	}
+});
+check("migrating twice cannot duplicate what it moved", () => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "psm-migrate-"));
+	try {
+		fs.writeFileSync(path.join(dir, "MEMORY.md"), "- once only\n");
+		assert.equal(migrateFlat(dir).migrated, true);
+		assert.equal(migrateFlat(dir).migrated, false, "the flat files are gone after the first pass");
+		const shared = fs.readFileSync(path.join(dir, "shared", "MEMORY.md"), "utf-8");
+		assert.equal(shared.match(/once only/g)?.length, 1);
+		assert.equal(fs.existsSync(path.join(dir, "ns", DEFAULT_NS, "MEMORY.md")), true, "the original is archived");
+	} finally {
+		fs.rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+console.log("core, shared and project tiers over loopback");
+await checkAsync("core memory has exactly one writer and no other route", async () => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "psm-core-"));
+	const port = await freePort();
+	const collection = testCollection();
+	const child = await startBrain(dir, port, collection);
+	const client = new BrainClient({ host: "127.0.0.1", port, token: "", agentId: "test-agent", transport: localTransport() });
+	try {
+		assert.equal((await client.readCore()).content, "");
+		const added = await client.writeCore({ action: "append", content: "never commit directly to main" });
+		assert.equal(added.ok, true);
+		assert.match((await client.readCore()).content, /never commit directly to main/);
+
+		const again = await client.writeCore({ action: "append", content: "Never commit directly to main" });
+		assert.equal(again.deduped, true, "the same rule twice is one rule");
+		assert.equal((await client.readCore()).content.match(/never commit/gi)?.length, 1);
+
+		// No agent route reaches core, at the endpoint rather than by convention.
+		await assert.rejects(
+			() => client.writeOrQueue({ path: "/v1/write", body: { target: "long_term", ns: "core", content: "sneak" } }),
+			/core memory is written only through/,
+		);
+		await assert.rejects(() => client.forget({ match: "never commit", ns: "core" }), /core memory is edited only through/);
+		await assert.rejects(() => client.read("scratchpad", { ns: "core" }), /core memory has no scratchpad/);
+
+		const removed = await client.writeCore({ action: "remove", match: "never commit" });
+		assert.equal(removed.removed, 1);
+		assert.ok(fs.existsSync(path.join(dir, "core", "recovery", `${removed.recoveryId}.json`)));
+		assert.equal((await client.readCore()).content.trim(), "");
+	} finally {
+		child.kill("SIGKILL");
+		fs.rmSync(dir, { recursive: true, force: true });
+		removeCollections(collection);
+	}
+});
+await checkAsync("the shared tier is agent-managed and holds MEMORY.md only", async () => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "psm-shared-"));
+	const port = await freePort();
+	const collection = testCollection();
+	const child = await startBrain(dir, port, collection);
+	const client = new BrainClient({ host: "127.0.0.1", port, token: "", agentId: "test-agent", transport: localTransport() });
+	try {
+		await client.writeOrQueue({
+			path: "/v1/write",
+			body: { target: "long_term", ns: "shared", content: "prefer ripgrep over grep", agent: "a" },
+		});
+		assert.match((await client.read("long_term", { ns: "shared" })).content, /prefer ripgrep/);
+
+		await assert.rejects(
+			() => client.writeOrQueue({ path: "/v1/write", body: { target: "daily", ns: "shared", content: "nope" } }),
+			/shared tier holds MEMORY.md only/,
+		);
+		await assert.rejects(
+			() => client.writeNow({ path: "/v1/scratchpad", body: { action: "list", ns: "shared" } }),
+			/shared tier holds MEMORY.md only/,
+		);
+
+		// An agent prunes shared memory freely.
+		const removed = await client.forget({ match: "ripgrep", ns: "shared" });
+		assert.equal(removed.removed, 1);
+
+		// And a project write never leaks up into it.
+		await client.writeOrQueue({
+			path: "/v1/write",
+			body: { target: "long_term", ns: "project-iso", content: "a project-only fact", agent: "a" },
+		});
+		assert.equal((await client.read("long_term", { ns: "shared" })).content.trim(), "");
+	} finally {
+		child.kill("SIGKILL");
+		fs.rmSync(dir, { recursive: true, force: true });
+		removeCollections(collection, ["project-iso"]);
+	}
+});
+await checkAsync("namespaces are listed with their sizes, and two can be merged", async () => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "psm-ns-"));
+	const port = await freePort();
+	const collection = testCollection();
+	const child = await startBrain(dir, port, collection);
+	const client = new BrainClient({ host: "127.0.0.1", port, token: "", agentId: "test-agent", transport: localTransport() });
+	try {
+		await client.writeOrQueue({
+			path: "/v1/write",
+			body: {
+				target: "long_term",
+				ns: "old-name",
+				content: "fact from before the rename",
+				agent: "a",
+				nsKey: "github.com/acme/old",
+				nsLabel: "github.com/acme/old",
+			},
+		});
+		await client.writeOrQueue({ path: "/v1/write", body: { target: "daily", ns: "old-name", content: "a day of work", agent: "a" } });
+
+		const listing = await client.namespaces("old-name");
+		const entry = listing.namespaces.find((n) => n.id === "old-name");
+		assert.ok(entry, "the namespace should be listed");
+		assert.equal(entry.key, "github.com/acme/old", "the canonical key is recorded for the rename case");
+		assert.equal(entry.dailyFiles, 1);
+		assert.ok(entry.memory > 0);
+
+		const merged = await client.mergeNamespaces("old-name", "new-name");
+		assert.equal(merged.moved.daily, 1);
+		assert.match((await client.read("long_term", { ns: "new-name" })).content, /fact from before the rename/);
+		assert.equal((await client.read("long_term", { ns: "old-name" })).content, "");
+		const after = await client.namespaces("new-name");
+		assert.ok(!after.namespaces.some((n) => n.id === "old-name"));
+		assert.equal(after.namespaces.find((n) => n.id === "new-name")?.dailyFiles, 1);
+	} finally {
+		child.kill("SIGKILL");
+		fs.rmSync(dir, { recursive: true, force: true });
+		removeCollections(collection, ["old-name", "new-name"]);
+	}
+});
+await checkAsync("a bad namespace is refused, and no namespace means the legacy one", async () => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "psm-legacy-"));
+	const port = await freePort();
+	const collection = testCollection();
+	const child = await startBrain(dir, port, collection);
+	const client = new BrainClient({ host: "127.0.0.1", port, token: "", agentId: "test-agent", transport: localTransport() });
+	try {
+		const raw = await localTransport()("127.0.0.1", port, {
+			method: "GET",
+			path: "/v1/read?target=long_term&ns=../..",
+			headers: {},
+		});
+		assert.equal(raw.status, 400, "a namespace is a directory name and must not escape");
+		await assert.rejects(() => client.read("long_term", { ns: "../../etc" }), /invalid ns/);
+
+		// A caller that names nothing, such as a pre-tier agent, lands where the old
+		// flat memory was moved rather than in core or in someone's project.
+		await client.writeOrQueue({
+			path: "/v1/write",
+			body: { target: "long_term", content: "written without a namespace", agent: "old-agent" },
+		});
+		assert.ok(fs.existsSync(path.join(dir, "ns", DEFAULT_NS, "MEMORY.md")));
+		const listing = await client.namespaces();
+		assert.equal(listing.default, DEFAULT_NS);
+		assert.equal(listing.namespaces.find((n) => n.id === DEFAULT_NS)?.archived, true);
+	} finally {
+		child.kill("SIGKILL");
+		fs.rmSync(dir, { recursive: true, force: true });
+		removeCollections(collection);
+	}
+});
+await checkAsync("the flat v0.1 layout is moved into tiers on startup", async () => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "psm-mig-int-"));
+	fs.mkdirSync(path.join(dir, "daily"), { recursive: true });
+	fs.writeFileSync(path.join(dir, "MEMORY.md"), "- a durable decision from before tiers\n");
+	fs.writeFileSync(path.join(dir, "SCRATCHPAD.md"), "- [ ] an open item\n- [x] a finished item\n");
+	fs.writeFileSync(path.join(dir, "daily", "2026-01-02.md"), "old daily log\n");
+	const port = await freePort();
+	const collection = testCollection();
+	const child = await startBrain(dir, port, collection);
+	const client = new BrainClient({ host: "127.0.0.1", port, token: "", agentId: "test-agent", transport: localTransport() });
+	try {
+		const shared = await client.read("long_term", { ns: "shared" });
+		assert.match(shared.content, /a durable decision from before tiers/);
+		assert.match(shared.content, /an open item/);
+		assert.ok(!shared.content.includes("a finished item"), "a finished item is history, not memory");
+
+		const archived = await client.read("daily", { ns: DEFAULT_NS, date: "2026-01-02" });
+		assert.match(archived.content, /old daily log/);
+		assert.ok(fs.existsSync(path.join(dir, "ns", DEFAULT_NS, "SCRATCHPAD.md")));
+
+		assert.equal(fs.existsSync(path.join(dir, "MEMORY.md")), false, "nothing flat is left to migrate twice");
+		assert.equal(fs.existsSync(path.join(dir, "daily")), false);
+		assert.equal((await client.readCore()).content, "", "migration must never write core");
+	} finally {
+		child.kill("SIGKILL");
+		fs.rmSync(dir, { recursive: true, force: true });
+		removeCollections(collection);
+	}
+});
+
+await checkAsync("a project with no memory yet does not break a search", async () => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "psm-newproj-"));
+	const port = await freePort();
+	const collection = testCollection();
+	const child = await startBrain(dir, port, collection);
+	const client = new BrainClient({ host: "127.0.0.1", port, token: "", agentId: "test-agent", transport: localTransport() });
+	try {
+		await client.writeCore({ action: "append", content: "never force push to main" });
+		await client.writeOrQueue({
+			path: "/v1/write",
+			body: { target: "long_term", ns: "shared", content: "prefer ripgrep over grep", agent: "a" },
+		});
+		// A namespace that has never been written to has no directory, and so no qmd
+		// collection. It must not cost the agent the tiers that do have content, which
+		// is exactly the "have we done this before?" search in a new repository.
+		const res = await client.search("ripgrep", 5, "keyword", { ns: "brand-new-project", scope: "all" });
+		assert.ok(res.results.length >= 1, "the shared hit must still be found");
+		assert.equal(res.results[0].tier, "shared");
+		assert.ok(
+			!String(res.note ?? "").includes("Collection not found"),
+			`a missing collection must not fail the query: ${res.note}`,
+		);
+		assert.ok(!fs.existsSync(path.join(dir, "ns", "brand-new-project")), "a search must not create a namespace");
+	} finally {
+		child.kill("SIGKILL");
+		fs.rmSync(dir, { recursive: true, force: true });
+		removeCollections(collection, ["brand-new-project"]);
+	}
+});
+
 console.log("extension registration");
 await checkAsync("the extension registers its commands and tools", async () => {
 	const mod = await import("../index.js");
@@ -1058,6 +1583,7 @@ await checkAsync("the extension registers its commands and tools", async () => {
 	mod.default(stub as never);
 	assert.deepEqual(commands.sort(), [
 		"brain",
+		"core-memory",
 		"install-qmd",
 		"join-tailnet-agent",
 		"join-tailnet-brain",

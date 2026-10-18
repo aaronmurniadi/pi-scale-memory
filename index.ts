@@ -13,7 +13,8 @@
  *   /self-tag               — set this pi agent's role (brain or agent)
  *   /join-tailnet-brain     — join this machine and host the memory here
  *   /join-tailnet-agent     — join this machine as an agent
- *   /brain                  — status | sync | reindex | reconnect | reset
+ *   /brain                  — status | namespaces | ns | merge | compact | sync | reindex | reconnect | reset
+ *   /core-memory            — write core memory (the only writer), --remove to delete, no args to show
  *   /update-pi-scale-memory — update the extension itself, then reload
  *   /reset-pi-scale-settings — delete all local state and start over
  *   /install-qmd            — optional: install qmd for semantic search on the brain
@@ -41,6 +42,9 @@ import {
 	syncCache,
 } from "./src/cache.js";
 import { BrainClient, localTransport, retryDelayMs, tailnetTransport } from "./src/client.js";
+import { BUDGETS, DEFAULT_NS, SHARED } from "./brain/memory.mjs";
+import { type NamespaceResolution, resolveForCwd } from "./src/namespace.js";
+import { run } from "./src/shell.js";
 import {
 	CONFIG_DIR,
 	type Config,
@@ -92,6 +96,9 @@ const SUMMARY_MAX_CHARS = 60_000;
 const SUMMARY_TIMEOUT_MS = 25_000;
 const SUMMARY_SYSTEM_PROMPT =
 	"You extract durable memory from coding-agent conversations. Be terse and factual. Output markdown only.";
+const COMPACT_MIN_CHARS = 2_000;
+const COMPACT_SYSTEM_PROMPT =
+	"You compress an agent memory file without losing what it is for. Output markdown bullets only, no preamble.";
 const EXT_DIR = path.dirname(fileURLToPath(import.meta.url));
 
 function errMsg(e: unknown): string {
@@ -130,6 +137,20 @@ function isEmptySummary(summary: string): boolean {
 	return bullets.every((l) => /^\s*[-*]\s+none\.?\s*$/i.test(l));
 }
 
+function compactPrompt(content: string, budget: number): string {
+	return [
+		"Rewrite this memory file so it fits the budget while keeping everything a future session needs.",
+		"Keep: decisions, preferences, facts, conventions, and lessons that are still true.",
+		"Drop: narrative, session play-by-play, timestamps, restatements of the same fact, and anything already obvious from the code.",
+		"Merge duplicates into one line. Preserve #tags and [[links]]. Do not invent anything.",
+		`Target: under ${budget} characters. Output markdown bullets only.`,
+		"",
+		"<memory>",
+		content,
+		"</memory>",
+	].join("\n");
+}
+
 function uiFrom(ctx: ExtensionContext): Ui {
 	return {
 		async confirm(title, message) {
@@ -159,6 +180,8 @@ export default function (pi: ExtensionAPI) {
 	let agentNode: { socksPort: number; hostname: string } | null = null;
 	let client: BrainClient | null = null;
 	let snapshot = "";
+	/** Which project namespace this session reads and writes; resolved once at connect. */
+	let activeNs: NamespaceResolution | null = null;
 	let flushTimer: ReturnType<typeof setInterval> | null = null;
 	let turnsSinceCapture = 0;
 	let capturedMessageCount = 0;
@@ -193,7 +216,7 @@ export default function (pi: ExtensionAPI) {
 		if (!force && Date.now() - lastCacheSync < CACHE_SYNC_MS) return;
 		lastCacheSync = Date.now();
 		try {
-			const meta = await syncCache(client, cacheRoot);
+			const meta = await syncCache(client, cacheRoot, nsId());
 			status(ctx, `brain: ${client.brainName} (cache: ${meta.files} files)`);
 		} catch {
 			/* the mirror is best-effort; the brain stays authoritative */
@@ -221,7 +244,7 @@ export default function (pi: ExtensionAPI) {
 	async function useCachedSnapshot(ctx: ExtensionContext, cfg: Config): Promise<void> {
 		if (!cachingEnabled(cfg)) return;
 		if (!hasCache(cacheRoot)) return;
-		const cached = await contextWithFallback(null, cacheRoot);
+		const cached = await contextWithFallback(null, cacheRoot, nsId());
 		snapshot = cached.value;
 		if (ctx.hasUI) {
 			ctx.ui.notify(
@@ -238,6 +261,32 @@ export default function (pi: ExtensionAPI) {
 
 	function sessionTag(ctx: ExtensionContext): string {
 		return ctx.sessionManager.getSessionId().slice(0, 8);
+	}
+
+	/** The namespace a project-scoped read or write goes to, or the legacy one when unresolved. */
+	function nsId(): string {
+		return activeNs?.ns ?? DEFAULT_NS;
+	}
+
+	/**
+	 * Work out which project this session belongs to, from git, once per session.
+	 *
+	 * Two or three local git calls behind a short timeout, cached because a session's
+	 * working directory does not change. Everything falls back rather than failing: a
+	 * session in a non-repository directory still gets core and shared memory, and a
+	 * broken repo lands in the legacy namespace instead of erroring.
+	 */
+	async function resolveActiveNs(ctx: ExtensionContext, cfg: Config): Promise<NamespaceResolution> {
+		try {
+			return await resolveForCwd(ctx.cwd, run, {
+				pin: cfg.namespace,
+				preferredRemote: cfg.scopeRemote,
+				fallback: cfg.scopeFallback ?? "path",
+				hostname: agentId,
+			});
+		} catch {
+			return { ns: DEFAULT_NS, key: DEFAULT_NS, label: `${DEFAULT_NS} (unresolved)`, source: "fallback" };
+		}
 	}
 
 	// --- brain role: the local memory server on loopback ---
@@ -288,7 +337,8 @@ export default function (pi: ExtensionAPI) {
 				transport: localTransport(),
 			});
 			await client.health();
-			snapshot = await client.context();
+			activeNs = await resolveActiveNs(ctx, cfg);
+			snapshot = await client.context(activeNs.ns);
 			lastError = "";
 			status(ctx, `brain: local server on port ${cfg.brainPort}`);
 			if (ctx.hasUI && !(await qmdStatus()).installed) {
@@ -401,9 +451,16 @@ export default function (pi: ExtensionAPI) {
 			if (!(await candidate.discover())) {
 				throw new Error(`no peer answered as a brain on port ${cfg.brainPort}`);
 			}
-			await candidate.health();
+			const health = await candidate.health();
 			client = candidate;
-			snapshot = await client.context();
+			activeNs = await resolveActiveNs(ctx, cfg);
+			if (!health.scopes && ctx.hasUI) {
+				ctx.ui.notify(
+					"pi-scale-memory: this brain predates memory tiers, so writes go into its flat store and core memory is unavailable. Update the extension on the brain.",
+					"warning",
+				);
+			}
+			snapshot = await client.context(activeNs.ns);
 			lastError = "";
 			cancelAgentRetry();
 			await syncCacheNow(ctx, cfg, true);
@@ -478,19 +535,14 @@ export default function (pi: ExtensionAPI) {
 		await reapOrphanedTailscaled();
 		client = null;
 		snapshot = "";
+		activeNs = null;
 		lastError = "";
 	}
 
 	// --- periodic summaries stored to the brain ---
 
-	async function summarize(ctx: ExtensionContext): Promise<string | null> {
-		const branch = ctx.sessionManager.getBranch();
-		const messages = branch.flatMap((e) => {
-			if (e.type === "message") return [e.message];
-			return [];
-		});
-		const fresh = messages.slice(capturedMessageCount);
-		if (fresh.length < SUMMARY_MIN_MESSAGES) return null;
+	/** One model call, shared by the session summary and by /brain compact. */
+	async function askModel(ctx: ExtensionContext, system: string, prompt: string): Promise<string | null> {
 		const model = ctx.model;
 		if (!model) return null;
 		const registry = ctx.modelRegistry as any;
@@ -500,26 +552,35 @@ export default function (pi: ExtensionAPI) {
 			apiKey = await registry.getApiKeyForProvider(model.provider);
 		}
 		if (!apiKey) return null;
-
-		let text = serializeConversation(convertToLlm(fresh)).trim();
-		if (!text) return null;
-		if (text.length > SUMMARY_MAX_CHARS) text = text.slice(-SUMMARY_MAX_CHARS);
-		const msgs: Message[] = [
-			{ role: "user", content: [{ type: "text", text: summaryPrompt(text) }], timestamp: Date.now() },
-		];
+		const msgs: Message[] = [{ role: "user", content: [{ type: "text", text: prompt }], timestamp: Date.now() }];
 		try {
-			const res = await complete(model, { systemPrompt: SUMMARY_SYSTEM_PROMPT, messages: msgs }, { apiKey });
-			const out = res.content
+			const res = await complete(model, { systemPrompt: system, messages: msgs }, { apiKey });
+			return res.content
 				.filter((c): c is { type: "text"; text: string } => c.type === "text")
 				.map((c) => c.text)
 				.join("\n")
 				.trim();
-			capturedMessageCount = messages.length;
-			if (!out || isEmptySummary(out)) return null;
-			return out;
 		} catch {
 			return null;
 		}
+	}
+
+	async function summarize(ctx: ExtensionContext): Promise<string | null> {
+		const branch = ctx.sessionManager.getBranch();
+		const messages = branch.flatMap((e) => {
+			if (e.type === "message") return [e.message];
+			return [];
+		});
+		const fresh = messages.slice(capturedMessageCount);
+		if (fresh.length < SUMMARY_MIN_MESSAGES) return null;
+
+		let text = serializeConversation(convertToLlm(fresh)).trim();
+		if (!text) return null;
+		if (text.length > SUMMARY_MAX_CHARS) text = text.slice(-SUMMARY_MAX_CHARS);
+		const out = await askModel(ctx, SUMMARY_SYSTEM_PROMPT, summaryPrompt(text));
+		capturedMessageCount = messages.length;
+		if (!out || isEmptySummary(out)) return null;
+		return out;
 	}
 
 	async function capture(ctx: ExtensionContext, label: string, timeoutMs = SUMMARY_TIMEOUT_MS) {
@@ -531,18 +592,83 @@ export default function (pi: ExtensionAPI) {
 			});
 			const summary = await Promise.race([summarize(ctx), expired]);
 			if (!summary) return;
-			await client.writeOrQueue({
-				path: "/v1/write",
-				body: {
-					target: "daily",
-					content: `## Session Summary (auto, ${label})\n\n${summary}`,
-					agent: client.agentId,
-					session: sessionTag(ctx),
-				},
-			});
+				await client.writeOrQueue({
+					path: "/v1/write",
+					body: {
+						target: "daily",
+						ns: nsId(),
+						content: `## Session Summary (auto, ${label})\n\n${summary}`,
+						agent: client.agentId,
+						session: sessionTag(ctx),
+						nsKey: activeNs?.key,
+						nsLabel: activeNs?.label,
+					},
+				});
 		} finally {
 			if (timer) clearTimeout(timer);
 		}
+	}
+
+	/**
+	 * Fold one tier's MEMORY.md down with the session model.
+	 *
+	 * The brain has no model of its own, so compaction runs on the agent and writes
+	 * the result back as an overwrite. It refuses to touch a file that is already
+	 * small, and refuses to write a result that is not smaller than the original, so
+	 * a bad compaction cannot make memory worse than leaving it alone.
+	 */
+	async function compactNamespace(ctx: ExtensionContext, ns: string): Promise<void> {
+		const c = client;
+		if (!c) {
+			ctx.ui.notify(`${notConnected()} — compaction needs the brain.`, "warning");
+			return;
+		}
+		if (ns === "core") {
+			// Refused before the model call, not after it: core is short by construction
+			// and pruning it is a decision for the user, not a summariser.
+			ctx.ui.notify(
+				"Core memory is not compacted. It is short by construction, and its edits are yours: use /core-memory --remove to drop an entry.",
+				"info",
+			);
+			return;
+		}
+		// Compact to the tier's own budget, so a fold cannot leave the file still
+		// over what gets injected.
+		const budget = ns === SHARED ? BUDGETS.shared : BUDGETS.longTerm;
+		let content = "";
+		try {
+			const res = await readWithFallback(c, cacheRoot, "long_term", { ns });
+			content = String(res.value.content ?? "");
+		} catch (e) {
+			ctx.ui.notify(`Could not read ${ns}/MEMORY.md: ${errMsg(e)}`, "error");
+			return;
+		}
+		const trimmed = content.trim();
+		if (trimmed.length < COMPACT_MIN_CHARS) {
+			ctx.ui.notify(`${ns}/MEMORY.md is ${trimmed.length} chars — nothing worth compacting.`, "info");
+			return;
+		}
+		const before = content.length;
+		const folded = await askModel(ctx, COMPACT_SYSTEM_PROMPT, compactPrompt(content, budget));
+		if (!folded) {
+			ctx.ui.notify("Compaction needs the session model and an API key; nothing was written.", "warning");
+			return;
+		}
+		if (folded.length >= before) {
+			ctx.ui.notify(`Compaction produced ${folded.length} chars from ${before}; kept the original.`, "info");
+			return;
+		}
+		try {
+			await c.writeNow({
+				path: "/v1/write",
+				body: { target: "long_term", mode: "overwrite", ns, content: folded, agent: c.agentId },
+			});
+		} catch (e) {
+			ctx.ui.notify(`Compaction write failed: ${errMsg(e)}`, "error");
+			return;
+		}
+		const saved = Math.ceil((before - folded.length) / 4);
+		ctx.ui.notify(`Compacted ${ns}/MEMORY.md: ${before} → ${folded.length} chars (~${saved} tokens less in every session).`, "info");
 	}
 
 	// --- lifecycle ---
@@ -587,15 +713,24 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("before_agent_start", async (event) => {
 		if (!snapshot) return;
+		const where = activeNs ? `${activeNs.label} (${activeNs.source})` : "unresolved";
 		const header = [
 			"\n\n## Memory (shared brain)",
-			"(Loaded once at session start from the shared brain; other agents may have written since. Use memory_read / memory_search for the latest.)",
-			"Use memory_write to persist important information; it is stored remotely and shared by all agents.",
-			"- Decisions, preferences, durable facts → MEMORY.md (memory_write long_term)",
-			"- Day-to-day notes → daily log (memory_write daily)",
-			"- Things to fix later → scratchpad tool",
+			`(Loaded once at session start from the shared brain; project tier: ${where}. Other agents may have written since — use memory_read / memory_search for the latest.)`,
+			"",
+			"Three tiers, all of them budgeted. Keep them small enough to be worth their tokens:",
+			"- **Project memory** (default): decisions, findings and facts about this repository. memory_write, scope project.",
+			"- **Shared memory** (scope shared): only what is true for every project, such as a convention you have now confirmed twice.",
+			"- **Core memory**: human-authored. Never attempt to write it, and do not ask for a tool for it. When the user wants something remembered everywhere, tell them to run /core-memory.",
+			"",
+			"Writing so memory stays useful:",
+			"- Write the durable fact, not the conversation that produced it. One line beats a paragraph.",
+			"- memory_search first; if the fact is already there, update that entry instead of adding a near-copy.",
+			"- A near-duplicate write replaces the older entry automatically, so restating costs a round trip and adds nothing.",
+			"- Project daily logs (memory_write daily) are for work notes; only today and yesterday are read back.",
+			"- Shared memory is yours to prune: drop what turned out wrong or obvious with memory_forget, scope shared.",
 			"- Use #tags and [[links]] in content to improve search recall.",
-			'- If someone says "remember this," write it immediately.',
+			'- If someone says "remember this," write it to project memory immediately.',
 			"",
 			snapshot,
 		];
@@ -615,7 +750,7 @@ export default function (pi: ExtensionAPI) {
 		if (!client) return;
 		await capture(ctx, "pre-compact");
 		try {
-			snapshot = await client.context();
+			snapshot = await client.context(nsId());
 		} catch {
 			/* keep the previous snapshot */
 		}
@@ -623,7 +758,7 @@ export default function (pi: ExtensionAPI) {
 
 	// --- /brain ---
 	pi.registerCommand("brain", {
-		description: "pi-scale-memory: status | sync | reconnect | reset",
+		description: "pi-scale-memory: status | namespaces | ns | merge | compact | sync | reindex | reconnect | reset",
 		handler: async (args, ctx) => {
 			const sub = (args ?? "").trim().split(/\s+/)[0] || "status";
 			if (sub === "reset") {
@@ -641,7 +776,7 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				try {
-					const meta = await syncCache(client, cacheRoot);
+					const meta = await syncCache(client, cacheRoot, nsId());
 					ctx.ui.notify(`Cache refreshed: ${meta.files} file(s) taken ${meta.takenAt} in ${cacheRoot}`, "info");
 				} catch (e) {
 					ctx.ui.notify(`Cache sync failed: ${errMsg(e)}`, "error");
@@ -656,7 +791,7 @@ export default function (pi: ExtensionAPI) {
 				try {
 					const h = await client.health();
 					ctx.ui.notify(
-						`Brain search: engine=${h.search?.engine ?? "?"} mode=${h.search?.mode ?? "?"} collection=${h.search?.collection ?? "?"} indexing=${h.search?.indexing ?? "?"}`,
+						`Brain search: engine=${h.search?.engine ?? "?"} mode=${h.search?.mode ?? "?"} collections=${h.search?.collections?.join(",") ?? "?"} indexing=${h.search?.indexing ?? "?"} | scopes: ${h.scopes?.join(",") ?? "flat (pre-tier brain)"}`,
 						"info",
 					);
 				} catch (e) {
@@ -669,6 +804,99 @@ export default function (pi: ExtensionAPI) {
 
 				await disconnect();
 				await connect(ctx);
+				return;
+			}
+			if (sub === "namespaces") {
+				if (!client) {
+					ctx.ui.notify(`${notConnected()} — the brain owns the namespaces.`, "warning");
+					return;
+				}
+				try {
+					const listing = await client.namespaces(nsId());
+					const tokens = (n: number) => `~${Math.ceil(n / 4)} tokens`;
+					const lines = [
+						`core:   ${listing.core.memory} chars ${tokens(listing.core.memory)} (loaded in every session)`,
+						`shared: ${listing.shared.memory} chars ${tokens(listing.shared.memory)} (loaded in every session)`,
+						`active: ${nsId()}${activeNs ? ` — ${activeNs.label}, from ${activeNs.source}` : ""}`,
+						"",
+					];
+					for (const n of listing.namespaces) {
+						const here = n.id === nsId() ? "*" : " ";
+						let flags = "";
+						if (n.archived) flags += " [archived]";
+						if (n.id === listing.default) flags += " [default]";
+						lines.push(
+							`${here} ${n.id}${flags} — mem ${n.memory} | scratch ${n.scratchpad} | daily ${n.dailyFiles} file(s), ${n.daily} chars | ${n.label}`,
+						);
+					}
+					ctx.ui.notify(lines.join("\n"), "info");
+				} catch (e) {
+					ctx.ui.notify(`Could not list namespaces: ${errMsg(e)}`, "error");
+				}
+				return;
+			}
+			if (sub === "ns") {
+				const wanted = (args ?? "").trim().split(/\s+/).slice(1).join(" ").trim();
+				if (!wanted) {
+					if (!activeNs) {
+						ctx.ui.notify("Namespace: not resolved yet.", "info");
+						return;
+					}
+					const pin = loadConfig(false).namespace;
+					ctx.ui.notify(
+						`Namespace: ${activeNs.ns}\nkey: ${activeNs.key}\nresolved from: ${activeNs.source}\npin: ${pin ?? "(none)"}`,
+						"info",
+					);
+					return;
+				}
+				if (wanted === "--clear") {
+					updateConfig({ namespace: undefined });
+					activeNs = await resolveActiveNs(ctx, loadConfig(false));
+					ctx.ui.notify(`Pin cleared; this workspace resolves to ${activeNs.ns}.`, "info");
+					return;
+				}
+				updateConfig({ namespace: wanted });
+				activeNs = await resolveActiveNs(ctx, loadConfig(false));
+				ctx.ui.notify(
+					`Pinned this machine to '${wanted}'. Every session on this machine now uses it; /brain ns --clear removes the pin.`,
+					"info",
+				);
+				if (client) {
+					try {
+						snapshot = await client.context(nsId());
+					} catch {
+						/* keep the previous snapshot */
+					}
+				}
+				return;
+			}
+			if (sub === "merge") {
+				const parts = (args ?? "").trim().split(/\s+/).slice(1);
+				const from = parts[0];
+				const into = parts[1];
+				if (!from || !into) {
+					ctx.ui.notify("Usage: /brain merge <from-ns> <into-ns>", "warning");
+					return;
+				}
+				if (!client) {
+					ctx.ui.notify(`${notConnected()} — the brain owns the namespaces.`, "warning");
+					return;
+				}
+				try {
+					const res = await client.mergeNamespaces(from, into);
+					const daily = res.moved?.daily ?? 0;
+					ctx.ui.notify(
+						`Merged ${from} into ${into}: ${daily} daily log(s), ${res.moved?.memory ? "MEMORY.md appended" : "MEMORY.md unchanged"}.`,
+						"info",
+					);
+				} catch (e) {
+					ctx.ui.notify(`Merge failed: ${errMsg(e)}`, "error");
+				}
+				return;
+			}
+			if (sub === "compact") {
+				const target = (args ?? "").trim().split(/\s+/)[1] ?? nsId();
+				await compactNamespace(ctx, target);
 				return;
 			}
 			const cfg = loadConfig(false);
@@ -709,10 +937,81 @@ export default function (pi: ExtensionAPI) {
 				if (node) nodeInfo = `node: ${node.hostname} ${node.ip} tags=[${node.tags.join(",")}]`;
 				else nodeInfo = "node: not joined (run /join-tailnet-brain)";
 			}
+			// What memory costs: core and shared are injected in every session, so their
+			// size is a standing token bill rather than a one-off.
+			let tierInfo = "";
+			let nsInfo = `ns: ${nsId()}`;
+			if (activeNs) nsInfo += ` (${activeNs.label}, ${activeNs.source})`;
+			try {
+				const listing = await client.namespaces(nsId());
+				const project = listing.namespaces.find((n) => n.id === nsId());
+				const projectChars = project ? project.memory + project.scratchpad : 0;
+				const standing = listing.core.memory + listing.shared.memory;
+				tierInfo = ` | tiers: core ${listing.core.memory}b shared ${listing.shared.memory}b project ${projectChars}b (~${Math.ceil((standing + projectChars) / 4)} tok/session)`;
+			} catch {
+				/* sizes are a nicety, not a status requirement */
+			}
 			ctx.ui.notify(
-				`Role: ${cfg.role ?? "unset"} | brain: ${client.brainName} (${where}) health=${health} search=${search} queued=${client.pending} | ${cacheInfo} | ${nodeInfo}`,
+				`Role: ${cfg.role ?? "unset"} | brain: ${client.brainName} (${where}) health=${health} search=${search} queued=${client.pending} | ${cacheInfo} | ${nsInfo}${tierInfo} | ${nodeInfo}`,
 				"info",
 			);
+		},
+	});
+
+	// --- /core-memory: the only writer to core memory ---
+	pi.registerCommand("core-memory", {
+		description:
+			"pi-scale-memory: write core memory (loaded in every session, every project). No arguments shows it, --remove <match> deletes",
+		handler: async (args, ctx) => {
+			const c = client;
+			if (!c) {
+				ctx.ui.notify(`${notConnected()} — core memory lives on the brain. Nothing was written.`, "warning");
+				return;
+			}
+			const raw = (args ?? "").trim();
+			try {
+				if (!raw) {
+					const out = await c.readCore();
+					const content = String(out.content ?? "").trim();
+					if (!content) {
+						ctx.ui.notify("Core memory is empty. Add to it with /core-memory <memory>.", "info");
+						return;
+					}
+					ctx.ui.notify(
+						`Core memory (${content.length} chars, ~${Math.ceil(content.length / 4)} tokens in every session):\n\n${content}`,
+						"info",
+					);
+					return;
+				}
+				if (raw === "--remove" || raw.startsWith("--remove ")) {
+					const match = raw.slice("--remove".length).trim();
+					if (!match) {
+						ctx.ui.notify("Usage: /core-memory --remove <match>", "warning");
+						return;
+					}
+					const res = await c.writeCore({ action: "remove", match });
+					if (!res.removed) {
+						ctx.ui.notify("Nothing in core memory matched; nothing was removed.", "info");
+						return;
+					}
+					ctx.ui.notify(`Removed ${res.removed} core entr(y/ies). Recovery id: ${res.recoveryId}`, "info");
+					return;
+				}
+				if (raw.startsWith("--")) {
+					ctx.ui.notify("Usage: /core-memory <memory> | /core-memory --remove <match> | /core-memory", "warning");
+					return;
+				}
+				const res = await c.writeCore({ action: "append", content: raw });
+				if (res.deduped) {
+					ctx.ui.notify("Core memory already said that; the existing entry was updated in place.", "info");
+					return;
+				}
+				ctx.ui.notify("Added to core memory. It is loaded in every session, on every project.", "info");
+			} catch (e) {
+				// Core writes are never queued: a rule you believe was saved must not be
+				// sitting in an outbox that could still fail.
+				ctx.ui.notify(`Core memory write failed: ${errMsg(e)} — nothing was stored.`, "error");
+			}
 		},
 	});
 
@@ -970,16 +1269,22 @@ export default function (pi: ExtensionAPI) {
 		name: "memory_write",
 		label: "Memory Write",
 		description: [
-			"Write to the shared remote memory (the brain). Two targets:",
-			"- 'long_term': MEMORY.md (curated durable facts, decisions, preferences). Mode: 'append' or 'overwrite'.",
-			"- 'daily': append to today's daily log (daily/<YYYY-MM-DD>.md).",
-			"Use this when the user asks you to remember something, or when you learn important preferences/decisions.",
-			"Use #tags (#decision, #preference, #lesson, #bug) and [[links]] in content to improve searchability.",
+			"Write to memory on the brain. Two writable tiers:",
+			"- 'project' (default): this repository's memory, shared with every agent working on it.",
+			"- 'shared': memory that applies to every project. Conventions and lessons only, not project findings.",
+			"Core memory is human-authored and has no tool: the user writes it with /core-memory. Tell them to run it when something belongs everywhere.",
+			"Targets: 'long_term' (MEMORY.md, curated) and 'daily' (project only, append-only work notes).",
+			"Search first: a write that restates an existing entry replaces it instead of adding a near-copy.",
 		].join("\n"),
 		parameters: Type.Object({
 			target: StringEnum(["long_term", "daily"] as const, {
 				description: "'long_term' for MEMORY.md, 'daily' for today's log",
 			}),
+			scope: Type.Optional(
+				StringEnum(["project", "shared"] as const, {
+					description: "Default: project. 'shared' applies to every project and keeps no daily log",
+				}),
+			),
 			content: Type.String({ description: "Content to write (Markdown)" }),
 			mode: Type.Optional(
 				StringEnum(["append", "overwrite"] as const, { description: "long_term only. Default: append" }),
@@ -987,19 +1292,39 @@ export default function (pi: ExtensionAPI) {
 		}),
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			const c = requireClient();
-			const body = { ...params, agent: c.agentId, session: sessionTag(ctx) };
+			const scope = params.scope ?? "project";
+			if (scope === "shared" && params.target === "daily") {
+				return textResult("The shared tier holds MEMORY.md only. Write daily notes to project memory (scope project).");
+			}
+			const ns = scope === "shared" ? SHARED : nsId();
+			const body = {
+				target: params.target,
+				content: params.content,
+				mode: params.mode,
+				ns,
+				agent: c.agentId,
+				session: sessionTag(ctx),
+				nsKey: activeNs?.key,
+				nsLabel: activeNs?.label,
+			};
 			if (params.target === "long_term" && params.mode === "overwrite") {
 				await c.writeNow({ path: "/v1/write", body });
-				return textResult("Overwrote MEMORY.md on the brain.");
+				return textResult(`Overwrote ${ns}/MEMORY.md on the brain.`, { ns });
 			}
 			const res = await c.writeOrQueue({ path: "/v1/write", body });
 			if (res.queued) {
 				return textResult(
 					"Brain unreachable; write queued and will be sent automatically. It appears in the local cache after the next successful sync.",
-					{ queued: true },
+					{ queued: true, ns },
 				);
 			}
-			return textResult(`Wrote to ${res.result?.file ?? params.target} on the brain.`);
+			if (res.result?.deduped) {
+				return textResult(
+					`Updated the existing entry in ${res.result.file}: this restated something already stored, so it replaced it rather than adding a near-copy.`,
+					{ ns, deduped: true },
+				);
+			}
+			return textResult(`Wrote to ${res.result?.file ?? params.target} on the brain.`, { ns });
 		},
 	});
 
@@ -1007,18 +1332,26 @@ export default function (pi: ExtensionAPI) {
 		name: "memory_read",
 		label: "Memory Read",
 		description: [
-			"Read a shared memory file from the brain.",
-			"- 'long_term': MEMORY.md",
-			"- 'scratchpad': SCRATCHPAD.md",
-			"- 'daily': a daily log (pass date YYYY-MM-DD, default today)",
-			"- 'list': list daily log dates",
+			"Read a memory file from the brain.",
+			"Tiers:",
+			"- 'project' (default): this repository's MEMORY.md, SCRATCHPAD.md or daily logs.",
+			"- 'shared': the cross-project MEMORY.md, managed by agents.",
+			"- 'core': the human-authored core memory (long_term only).",
 		].join("\n"),
 		parameters: Type.Object({
 			target: StringEnum(["long_term", "scratchpad", "daily", "list"] as const, { description: "What to read" }),
+			scope: Type.Optional(
+				StringEnum(["project", "shared", "core"] as const, { description: "Default: project" }),
+			),
 			date: Type.Optional(Type.String({ description: "YYYY-MM-DD for daily" })),
 		}),
 		async execute(_id, params) {
-			const res = await readWithFallback(offlineCapableClient(), cacheRoot, params.target, params.date);
+			const scope = params.scope ?? "project";
+			if (scope === "core" && params.target !== "long_term") {
+				return textResult("Core memory is a single file: read it with scope 'core' and target 'long_term'.");
+			}
+			const ns = scope === "core" ? "core" : scope === "shared" ? SHARED : nsId();
+			const res = await readWithFallback(offlineCapableClient(), cacheRoot, params.target, { ns, date: params.date });
 			let text = "";
 			if (params.target === "list") {
 				const raw = res.value.files;
@@ -1032,7 +1365,7 @@ export default function (pi: ExtensionAPI) {
 				text = String(res.value.content);
 			}
 			if (res.source === "cache") text = `${offlineNote(res.takenAt)}\n\n${text}`;
-			return textResult(text, { source: res.source, takenAt: res.takenAt });
+			return textResult(text, { source: res.source, takenAt: res.takenAt, ns, scope });
 		},
 	});
 
@@ -1040,7 +1373,7 @@ export default function (pi: ExtensionAPI) {
 		name: "scratchpad",
 		label: "Scratchpad",
 		description: [
-			"Shared checklist of things to fix later or keep in mind (stored on the brain). Actions:",
+			"This project's checklist of things to fix later or keep in mind (stored on the brain, per repository). Actions:",
 			"add (new unchecked item), done / undo (match by substring), clear_done, list.",
 		].join("\n"),
 		parameters: Type.Object({
@@ -1049,7 +1382,7 @@ export default function (pi: ExtensionAPI) {
 		}),
 		async execute(_id, params) {
 			const c = requireClient();
-			const body = { ...params, agent: c.agentId };
+			const body = { ...params, ns: nsId(), agent: c.agentId };
 			let items: { done: boolean; text: string }[];
 			if (params.action === "add") {
 				const res = await c.writeOrQueue({ path: "/v1/scratchpad", body });
@@ -1067,7 +1400,8 @@ export default function (pi: ExtensionAPI) {
 		name: "memory_search",
 		label: "Memory Search",
 		description: [
-			"Search all shared memory on the brain (MEMORY.md, SCRATCHPAD.md, daily logs).",
+			"Search memory on the brain. The default scope covers core memory, shared memory and this project.",
+			"Results are labelled with the tier they came from, and never include another project.",
 			"qmd powers the search when the brain has it installed:",
 			"- mode 'keyword': BM25 full-text, fastest.",
 			"- mode 'semantic' (default): vector similarity, finds paraphrases.",
@@ -1083,26 +1417,37 @@ export default function (pi: ExtensionAPI) {
 					description: "Search mode. Default: the brain's configured mode.",
 				}),
 			),
+			scope: Type.Optional(
+				StringEnum(["all", "project", "shared", "core"] as const, {
+					description: "Default: all (core + shared + this project). Narrow it when you know where the answer should be.",
+				}),
+			),
 		}),
 		async execute(_id, params) {
-			const res = await searchWithFallback(
-				offlineCapableClient(),
-				cacheRoot,
-				params.query,
-				params.limit ?? 5,
-				params.mode,
-			);
+			const res = await searchWithFallback(offlineCapableClient(), cacheRoot, params.query, params.limit ?? 5, {
+				mode: params.mode,
+				ns: nsId(),
+				scope: params.scope ?? "all",
+			});
 			const lines: string[] = [];
 			if (res.source === "cache") lines.push(offlineNote(res.takenAt));
 			if (res.engine !== "qmd") lines.push(cacheLabel(res));
 			if (res.note) lines.push(`(brain note: ${res.note})`);
+			if (res.tiers && res.tiers.length > 0) lines.push(`(tiers searched: ${res.tiers.join(", ")})`);
 			if (res.results.length === 0) lines.push("No matches.");
-			else lines.push(res.results.map((r, i) => `### ${i + 1}. ${r.file} (score ${r.score})\n${r.text}`).join("\n\n"));
+			else {
+				lines.push(
+					res.results
+						.map((r, i) => `### ${i + 1}. [${r.tier ?? "project"}] ${r.file} (score ${r.score})\n${r.text}`)
+						.join("\n\n"),
+				);
+			}
 			return textResult(lines.join("\n\n"), {
 				source: res.source,
 				takenAt: res.takenAt,
 				engine: res.engine,
 				mode: res.mode,
+				scope: res.scope,
 				count: res.results.length,
 			});
 		},
@@ -1111,17 +1456,34 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "memory_forget",
 		label: "Memory Forget",
-		description:
-			"Delete paragraphs containing a substring from MEMORY.md (or a daily log) on the brain. Use when a stored fact is wrong or outdated. A recovery record is kept on the brain.",
+		description: [
+			"Delete paragraphs containing a substring from MEMORY.md (or a daily log) on the brain.",
+			"Use when a stored fact is wrong, outdated, or not worth its tokens any more.",
+			"Core memory is out of reach here: the user removes those with /core-memory --remove.",
+			"A recovery record is kept on the brain.",
+		].join("\n"),
 		parameters: Type.Object({
 			match: Type.String({ description: "Case-insensitive substring identifying the entries to remove" }),
 			target: Type.Optional(StringEnum(["long_term", "daily"] as const, { description: "Default: long_term" })),
+			scope: Type.Optional(
+				StringEnum(["project", "shared"] as const, { description: "Default: project" }),
+			),
 			date: Type.Optional(Type.String({ description: "YYYY-MM-DD when target is daily" })),
 		}),
 		async execute(_id, params) {
-			const res = await requireClient().forget(params);
-			if (!res.removed) return textResult("Nothing matched.");
-			return textResult(`Removed ${res.removed} paragraph(s). Recovery id: ${res.recoveryId}`);
+			const scope = params.scope ?? "project";
+			const ns = scope === "shared" ? SHARED : nsId();
+			const res = await requireClient().forget({
+				match: params.match,
+				target: params.target,
+				date: params.date,
+				ns,
+			});
+			if (!res.removed) return textResult("Nothing matched.", { ns, removed: 0 });
+			return textResult(`Removed ${res.removed} paragraph(s) from ${ns}. Recovery id: ${res.recoveryId}`, {
+				ns,
+				removed: res.removed,
+			});
 		},
 	});
 }

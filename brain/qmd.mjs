@@ -6,12 +6,25 @@
  * Everything here degrades quietly: when qmd is missing or errors, the brain
  * falls back to its own BM25 search over the same files.
  *
- * Env: QMD_COLLECTION (default pi-scale-memory), QMD_UPDATE (background|manual|off),
- *      QMD_SEARCH_TIMEOUT_MS, QMD_EMBED_TIMEOUT_MS
+ * Env: QMD_COLLECTION (the flat v0.1 collection name, reported when it is unused),
+ *      QMD_COLLECTION_PREFIX (default psm: one collection per tier is `psm-<tier>`),
+ *      QMD_UPDATE (background|manual|off), QMD_SEARCH_TIMEOUT_MS, QMD_EMBED_TIMEOUT_MS
  */
 import { execFile } from "node:child_process";
+import fs from "node:fs";
 
 export const COLLECTION = process.env.QMD_COLLECTION || "pi-scale-memory";
+/**
+ * One collection per tier: `psm-core`, `psm-shared`, and `psm-<namespace>` per
+ * project. qmd filters by collection (`-c`, repeatable) and not by path, so a
+ * collection per tier is what makes a scoped search exact rather than a
+ * post-filter over other projects' hits.
+ */
+export const COLLECTION_PREFIX = process.env.QMD_COLLECTION_PREFIX || "psm";
+
+export function collectionFor(ns) {
+	return `${COLLECTION_PREFIX}-${ns}`;
+}
 
 /** qmd subcommand per mode. `query` is hybrid + rerank, the slow but best one. */
 export const MODE_SUBCOMMAND = { keyword: "search", semantic: "vsearch", deep: "query" };
@@ -31,7 +44,9 @@ let updating = false;
  * on this (briefly) so an agent can search for something it just wrote.
  */
 let indexDirty = false;
-let collectionCache = null;
+let collectionCache = new Map();
+/** Tiers written since the last index pass, so only they need new embeddings. */
+let pendingCollections = new Set();
 const log = (msg) => console.log(`[qmd] ${msg}`);
 
 // ---------------------------------------------------------------------------
@@ -71,23 +86,42 @@ export function normalizeMode(value) {
 	return "semantic";
 }
 
-/** `qmd://collection/MEMORY.md` -> `MEMORY.md`. */
+/** `qmd://collection/MEMORY.md` -> `MEMORY.md`, for any of the named collections. */
 export function relativeFile(file, collection) {
 	if (!file) return "";
-	const prefix = `qmd://${collection}/`;
-	if (file.startsWith(prefix)) return file.slice(prefix.length);
+	for (const name of asList(collection)) {
+		const prefix = `qmd://${name}/`;
+		if (file.startsWith(prefix)) return file.slice(prefix.length);
+	}
 	return String(file);
+}
+
+function asList(value) {
+	if (Array.isArray(value)) return value;
+	return [value];
+}
+
+/** Which of the queried collections a hit came from, so the caller can label its tier. */
+export function collectionOf(file, collection) {
+	if (!file) return "";
+	for (const name of asList(collection)) {
+		if (String(file).startsWith(`qmd://${name}/`)) return name;
+	}
+	return "";
 }
 
 export function normalizeHits(raw, collection) {
 	if (!Array.isArray(raw)) return [];
+	const names = asList(collection);
 	return raw.map((hit) => {
+		const rawPath = hit.path ?? hit.file;
 		let text = hit.content ?? hit.chunk ?? hit.snippet ?? "";
 		if (typeof text === "string") text = text.trim();
 		let score = hit.score ?? 0;
 		if (typeof score !== "number") score = 0;
 		return {
-			file: relativeFile(hit.path ?? hit.file, collection),
+			file: relativeFile(rawPath, names),
+			collection: collectionOf(rawPath, names),
 			score: Number(score.toFixed(3)),
 			text: String(text).slice(0, 1200),
 			line: hit.line ?? null,
@@ -98,7 +132,10 @@ export function normalizeHits(raw, collection) {
 export function qmdArgs(mode, collection, query, limit) {
 	let sub = MODE_SUBCOMMAND[mode];
 	if (!sub) sub = MODE_SUBCOMMAND.semantic;
-	return [sub, "--json", "-c", collection, "-n", String(limit), query];
+	const args = [sub, "--json"];
+	for (const name of asList(collection)) args.push("-c", name);
+	args.push("-n", String(limit), query);
+	return args;
 }
 
 export function modeTimeoutMs(mode) {
@@ -117,6 +154,16 @@ export function parseCollections(stdout) {
 		if (m) names.push(m[1]);
 	}
 	return names;
+}
+
+/**
+ * Collections that nothing searches any more: the flat v0.1 collection and any
+ * left over from tests. Startup reports them, because `qmd update` reindexes every
+ * collection on the machine whether or not anyone reads it.
+ */
+export function unusedCollections(names, live = []) {
+	const keep = new Set(live);
+	return names.filter((name) => !keep.has(name) && (name === COLLECTION || name.startsWith(`${COLLECTION_PREFIX}-test`)));
 }
 
 export function updateMode() {
@@ -151,15 +198,18 @@ export async function detectQmd() {
 
 export async function hasCollection(collection = COLLECTION) {
 	const now = Date.now();
-	if (collectionCache && collectionCache.collection === collection) {
+	const cached = collectionCache.get(collection);
+	if (cached) {
 		let ttl = NEGATIVE_TTL_MS;
-		if (collectionCache.present) ttl = POSITIVE_TTL_MS;
-		if (now - collectionCache.checkedAt < ttl) return collectionCache.present;
+		if (cached.present) ttl = POSITIVE_TTL_MS;
+		if (now - cached.checkedAt < ttl) return cached.present;
 	}
 	const res = await run(["collection", "list"], 15_000);
 	let present = false;
 	if (res.ok) present = parseCollections(res.stdout).includes(collection);
-	collectionCache = { collection, present, checkedAt: Date.now() };
+	// One entry per name: a search checks several tiers, and a single-slot cache
+	// would evict each other and re-run `qmd collection list` every time.
+	collectionCache.set(collection, { present, checkedAt: Date.now() });
 	return present;
 }
 
@@ -167,8 +217,9 @@ export async function hasCollection(collection = COLLECTION) {
 export function resetCaches() {
 	available = null;
 	checkedAt = 0;
-	collectionCache = null;
+	collectionCache.clear();
 	indexDirty = false;
+	pendingCollections = new Set();
 }
 
 export function isIndexDirty() {
@@ -187,6 +238,10 @@ export async function waitForIndex(maxMs) {
 
 /** Create the collection and its path contexts if they are missing. */
 export async function ensureCollection(dir, collection = COLLECTION) {
+	// A tier with no directory yet has no memory, and `qmd collection add` refuses a
+	// missing path. Report it rather than invoking qmd: the caller decides whether a
+	// missing collection is fatal (it is not — the other tiers still answer).
+	if (!fs.existsSync(dir)) return false;
 	if (await hasCollection(collection)) return true;
 	const added = await run(["collection", "add", dir, "--name", collection], 30_000);
 	if (!added.ok) {
@@ -195,14 +250,14 @@ export async function ensureCollection(dir, collection = COLLECTION) {
 	}
 	const contexts = [
 		["/daily", "Daily append-only agent work logs organized by date"],
-		["/", "Shared coding-agent memory: decisions, preferences, facts, lessons"],
+		["/", "Coding-agent memory: decisions, preferences, facts, lessons"],
 	];
 	for (const [ctxPath, description] of contexts) {
 		await run(["context", "add", ctxPath, description, "-c", collection], 15_000);
 	}
 	// Seed the cache: the check above cached "missing", and without this the next
 	// few seconds of searches would keep falling back to BM25 for no reason.
-	collectionCache = { collection, present: true, checkedAt: Date.now() };
+	collectionCache.set(collection, { present: true, checkedAt: Date.now() });
 	log(`collection '${collection}' created for ${dir}`);
 	return true;
 }
@@ -217,8 +272,7 @@ export async function embedIndex(collection = COLLECTION) {
 }
 
 export async function qmdSearch(mode, query, limit, collection = COLLECTION) {
-	const res = await run(qmdArgs(mode, collection, query, limit), modeTimeoutMs(mode));
-	if (!res.ok) {
+	const res = await run(qmdArgs(mode, collection, query, limit), modeTimeoutMs(mode));	if (!res.ok) {
 		const message = stripAnsi(res.stderr).trim() || stripAnsi(res.err?.message ?? "").trim();
 		let hint = "";
 		if (res.err?.killed) hint = " (qmd timed out; the first semantic/deep query loads models)";
@@ -235,12 +289,13 @@ export async function qmdSearch(mode, query, limit, collection = COLLECTION) {
 // ---------------------------------------------------------------------------
 
 /**
- * Re-index after a write, debounced and serialized. `qmd update` then a scoped
- * `qmd embed` keeps both the keyword index and the vectors current; both are
- * fire-and-forget so a write never waits on the indexer.
+ * Re-index after a write, debounced and serialized. `qmd update` covers every
+ * collection; `qmd embed` does not, so the tiers named here are embedded
+ * individually and everything written meanwhile is folded into the same pass.
  */
-export function scheduleIndexRefresh(reason = "write") {
+export function scheduleIndexRefresh(reason = "write", collections = []) {
 	if (updateMode() !== "background") return;
+	for (const name of collections) pendingCollections.add(name);
 	indexDirty = true;
 	if (updateTimer) clearTimeout(updateTimer);
 	updateTimer = setTimeout(() => {
@@ -250,29 +305,37 @@ export function scheduleIndexRefresh(reason = "write") {
 	updateTimer.unref?.();
 }
 
-export async function refreshIndex(reason = "manual") {
+export async function refreshIndex(reason = "manual", collections = []) {
+	for (const name of collections) pendingCollections.add(name);
 	if (updating) {
-		// Fold this request into a slightly later run rather than skipping it.
+		// Fold this request into a slightly later run rather than skipping it. The
+		// pending set survives, so the next pass still embeds what this one missed.
 		scheduleIndexRefresh(`${reason}:requeued`);
 		return { ok: false, detail: "already running" };
 	}
 	if (!(await detectQmd())) {
 		indexDirty = false;
+		pendingCollections.clear();
 		return { ok: false, detail: "qmd not available" };
 	}
 	updating = true;
+	const targets = [...pendingCollections];
+	pendingCollections.clear();
 	try {
 		const updated = await updateIndex();
 		if (!updated.ok) {
 			log(`update failed: ${stripAnsi(updated.stderr).trim().split("\n").pop()}`);
 			return { ok: false, detail: "update failed" };
 		}
-		const embedded = await embedIndex();
-		if (!embedded.ok) {
-			log(`embed failed: ${stripAnsi(embedded.stderr).trim().split("\n").pop()}`);
-			return { ok: true, detail: `re-indexed (${reason}); embeddings pending` };
+		for (const name of targets) {
+			const embedded = await embedIndex(name);
+			if (!embedded.ok) {
+				log(`embed failed for ${name}: ${stripAnsi(embedded.stderr).trim().split("\n").pop()}`);
+				return { ok: true, detail: `re-indexed (${reason}); embeddings pending` };
+			}
 		}
-		return { ok: true, detail: `re-indexed (${reason})` };
+		const embeddedNote = targets.length ? `; embedded ${targets.length} collection(s)` : "";
+		return { ok: true, detail: `re-indexed (${reason})${embeddedNote}` };
 	} finally {
 		updating = false;
 		indexDirty = false;

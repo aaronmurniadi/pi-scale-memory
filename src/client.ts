@@ -6,6 +6,9 @@ export interface SearchHit {
 	score: number;
 	text: string;
 	line?: number | null;
+	/** Which tier answered: core, shared, or the project namespace. */
+	tier?: string;
+	collection?: string;
 }
 
 export interface SearchResponse {
@@ -13,13 +16,64 @@ export interface SearchResponse {
 	mode: string;
 	results: SearchHit[];
 	note?: string;
+	scope?: string;
+	tiers?: string[];
+}
+
+/** The scopes a caller may ask for. `all` covers core plus shared plus the project. */
+export type SearchScope = "all" | "project" | "shared" | "core" | "legacy";
+
+export interface TierFiles {
+	files: Record<string, string>;
+}
+
+/** The mirror payload: both cross-project tiers, plus one project when one is named. */
+export interface Snapshot {
+	takenAt: string;
+	ns: string | null;
+	core: TierFiles;
+	shared: TierFiles;
+	project: (TierFiles & { id: string }) | null;
+}
+
+export interface NamespaceEntry {
+	id: string;
+	label: string;
+	key: string | null;
+	archived: boolean;
+	agents: string[];
+	lastSeen: string | null;
+	memory: number;
+	scratchpad: number;
+	daily: number;
+	dailyFiles: number;
+	lastWrite: string;
+}
+
+export interface NamespaceListing {
+	active: string | null;
+	default: string;
+	core: { memory: number; scratchpad: number; daily: number; dailyFiles: number; lastWrite: string };
+	shared: { memory: number; scratchpad: number; daily: number; dailyFiles: number; lastWrite: string };
+	namespaces: NamespaceEntry[];
 }
 
 export interface BrainHealth {
 	ok: boolean;
 	role: string;
 	date: string;
-	search?: { engine: string; mode: string; collection: string; ready: boolean; indexing: boolean; update: string };
+	/** Present on a brain that understands tiers; absent on the flat v0.1 brain. */
+	scopes?: string[];
+	defaultNs?: string;
+	core?: boolean;
+	search?: {
+		engine: string;
+		mode: string;
+		collections?: string[];
+		ready: boolean;
+		indexing: boolean;
+		update: string;
+	};
 }
 
 export interface WriteRequest {
@@ -186,27 +240,68 @@ export class BrainClient {
 		return this.call("GET", "/v1/health");
 	}
 
-	async context(): Promise<string> {
-		const res = await this.call("GET", "/v1/context");
+	async context(ns?: string | null): Promise<string> {
+		const q = new URLSearchParams();
+		if (ns) q.set("ns", ns);
+		const suffix = q.toString();
+		const res = await this.call("GET", `/v1/context${suffix ? `?${suffix}` : ""}`);
 		return res.context ?? "";
 	}
 
-	/** Full memory tree, for the agent-side offline mirror. */
-	snapshot(): Promise<{ takenAt: string; files: Record<string, string> }> {
-		return this.call("GET", "/v1/snapshot");
+	/** Cross-project tiers plus one project, for the agent-side offline mirror. */
+	snapshot(ns?: string | null): Promise<Snapshot> {
+		const q = new URLSearchParams();
+		if (ns) q.set("ns", ns);
+		const suffix = q.toString();
+		return this.call("GET", `/v1/snapshot${suffix ? `?${suffix}` : ""}`) as Promise<Snapshot>;
 	}
 
-	async read(target: string, date?: string): Promise<any> {
+	async read(target: string, opts: { ns?: string | null; date?: string } = {}): Promise<any> {
 		const q = new URLSearchParams({ target });
-		if (date) q.set("date", date);
+		if (opts.ns) q.set("ns", opts.ns);
+		if (opts.date) q.set("date", opts.date);
 		return this.call("GET", `/v1/read?${q}`);
 	}
 
-	async search(query: string, limit: number, mode?: string): Promise<SearchResponse> {
+	readCore(): Promise<{ content: string }> {
+		return this.call("GET", "/v1/core");
+	}
+
+	/** The only writer to core memory. Reached only from the /core-memory command. */
+	writeCore(body: { action: "append" | "remove" | "list"; content?: string; match?: string }): Promise<any> {
+		return this.call("POST", "/v1/core", body);
+	}
+
+	namespaces(ns?: string | null): Promise<NamespaceListing> {
+		const q = new URLSearchParams();
+		if (ns) q.set("ns", ns);
+		const suffix = q.toString();
+		return this.call("GET", `/v1/namespaces${suffix ? `?${suffix}` : ""}`) as Promise<NamespaceListing>;
+	}
+
+	mergeNamespaces(from: string, into: string): Promise<any> {
+		return this.call("POST", "/v1/ns/merge", { from, into });
+	}
+
+	async search(
+		query: string,
+		limit: number,
+		mode?: string,
+		opts: { ns?: string | null; scope?: SearchScope } = {},
+	): Promise<SearchResponse> {
 		const q = new URLSearchParams({ q: query, limit: String(limit) });
 		if (mode) q.set("mode", mode);
+		if (opts.ns) q.set("ns", opts.ns);
+		if (opts.scope) q.set("scope", opts.scope);
 		const res = await this.call("GET", `/v1/search?${q}`);
-		return { engine: String(res.engine ?? "bm25"), mode: String(res.mode ?? "keyword"), results: res.results ?? [], note: res.note };
+		return {
+			engine: String(res.engine ?? "bm25"),
+			mode: String(res.mode ?? "keyword"),
+			results: res.results ?? [],
+			note: res.note,
+			scope: res.scope,
+			tiers: res.tiers,
+		};
 	}
 
 	forget(body: Record<string, unknown>) {
