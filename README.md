@@ -128,6 +128,14 @@ Agents mirror the brain so a dead network or a sleeping brain machine does not c
 - **Offline reads** fall back to the mirror, labelled `(brain unreachable — showing the cached copy taken …; it may be stale)`. **Offline writes** are queued in memory and sent when the brain returns; a write still queued when pi exits is lost.
 - **Disable it** with `PI_SCALE_MEMORY_CACHE=0`. The brain role never caches.
 
+## Brain log panel
+
+On the machine serving the memory, pi's terminal shows a **brain log panel**: a live list of every read and write the brain handles, with the namespace, what happened, and which agent asked. It follows the terminal width — wider than 80 columns it is a column on the right, a third of the width and the full height; at 80 columns or fewer it becomes a 5-row strip across the top. It is read-only and never takes focus, so the editor keeps working.
+
+The panel is an overlay rather than a real split, because pi's interactive layout has no split-pane API; on a wide terminal it floats over the right third of the transcript. It appears whenever this machine's role is `brain` and pi runs in TUI mode, and goes away on `/psm-role agent`.
+
+Its lines come from an activity log the brain server appends to, so it shows every agent on the tailnet, not only this pi. Each line is one JSON object (the operation, namespace, target, outcome, and how long it took); the log is trimmed in place when it passes its size cap and the panel notices. Agents name themselves with an `x-psm-agent` header on every request — that is what makes a read attributable at all, since a read has no body to carry the name.
+
 ## Configuration
 
 Saved per machine at `~/.pi/agent/pi-scale-memory/config.json` (mode 0600): role, the pre-auth key, the brain port, and an optional brain token. Environment overrides:
@@ -154,6 +162,8 @@ Brain-side environment (where `brain/server.mjs` runs):
 | `BRAIN_DIR` | `~/.pi-scale-brain` | memory directory |
 | `BRAIN_HOST` | `127.0.0.1` | listen address |
 | `BRAIN_TOKEN` | unset | require `Authorization: Bearer <token>` |
+| `BRAIN_ACTIVITY_LOG` | `$BRAIN_DIR/activity.jsonl` | where the brain writes the activity log the brain log panel tails |
+| `BRAIN_ACTIVITY_MAX_BYTES` | `1048576` | size at which the activity log is rewritten with its last 4000 lines |
 | `QMD_COLLECTION_PREFIX` | `psm` | one collection per tier is named `<prefix>-<tier>`, since qmd filters by collection and not by path |
 | `QMD_COLLECTION` | `pi-scale-memory` | the flat v0.1 collection name; the brain reports it at startup when nothing searches it any more, because `qmd update` reindexes every collection on the machine |
 | `QMD_UPDATE` | `background` | `background` re-indexes after writes; `manual`/`off` leave the index to you |

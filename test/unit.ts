@@ -13,6 +13,13 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { ensureBrainServer, stopBrainServer } from "../src/brain-server.js";
 import {
+	ActivityTail,
+	clockOf,
+	formatEntry,
+	panelModeFor,
+	parseActivityLine,
+} from "../src/brain-log-panel.js";
+import {
 	cacheDir,
 	contextWithFallback,
 	hasCache,
@@ -773,6 +780,52 @@ await checkAsync("tiered write/read/search/scratchpad/forget round-trip", async 
 		child.kill("SIGKILL");
 		fs.rmSync(dir, { recursive: true, force: true });
 		removeCollections(collection, [ns, "project-b"]);
+	}
+});
+
+await checkAsync("every memory operation lands in the activity log, and health does not", async () => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "psm-activity-"));
+	const port = await freePort();
+	const collection = testCollection();
+	const child = await startBrain(dir, port, collection);
+	const client = new BrainClient({
+		host: "127.0.0.1",
+		port,
+		token: "",
+		agentId: "panel-test",
+		transport: localTransport(),
+	});
+	try {
+		await client.writeOrQueue({
+			path: "/v1/write",
+			body: { target: "long_term", ns: "project-a", content: "chose #postgres", agent: "panel-test" },
+		});
+		await client.read("long_term", { ns: "project-a" });
+		await client.search("postgres", 5, "keyword", { ns: "project-a", scope: "project" });
+
+		const log = fs.readFileSync(path.join(dir, "activity.jsonl"), "utf-8");
+		const entries = log.trim().split("\n").map(parseActivityLine);
+		assert.equal(entries.length, 3, "one line per operation, and /v1/health is not one");
+		assert.deepEqual(entries.map((e) => e?.op).sort(), ["read", "search", "write"]);
+
+		const write = entries.find((e) => e?.op === "write");
+		assert.equal(write?.ns, "project-a");
+		assert.equal(write?.target, "long_term");
+		assert.equal(write?.mode, "append");
+		assert.equal(write?.agent, "panel-test", "the caller is named even on reads");
+		assert.equal(write?.status, 200);
+
+		const read = entries.find((e) => e?.op === "read");
+		assert.equal(read?.agent, "panel-test");
+		assert.equal(read?.target, "long_term");
+
+		const search = entries.find((e) => e?.op === "search");
+		assert.ok((search?.hits ?? 0) >= 1);
+		assert.equal(search?.q, "postgres");
+	} finally {
+		child.kill("SIGKILL");
+		fs.rmSync(dir, { recursive: true, force: true });
+		removeCollections(collection, ["project-a"]);
 	}
 });
 
@@ -1637,6 +1690,68 @@ await checkAsync("a brain that never answers cannot hold up the exit path", asyn
 	} finally {
 		for (const socket of open) socket.destroy();
 		silent.close();
+	}
+});
+
+console.log("brain log panel");
+check("the panel is a right column only above 80 columns", () => {
+	assert.equal(panelModeFor(40), "top");
+	assert.equal(panelModeFor(80), "top", "80 is not larger than 80, so it stays horizontal");
+	assert.equal(panelModeFor(81), "right");
+	assert.equal(panelModeFor(240), "right");
+});
+
+check("activity lines parse, and junk is dropped", () => {
+	const entry = parseActivityLine(
+		JSON.stringify({ t: "2026-10-18T20:31:04.123Z", op: "write", ns: "project-a", target: "long_term", mode: "append", agent: "pi@host" }),
+	);
+	assert.ok(entry);
+	assert.match(clockOf(entry.t), /^\d{2}:\d{2}:\d{2}$/, "a log line shows a wall-clock time");
+	assert.equal(clockOf("not a date"), "--:--:--");
+	assert.equal(formatEntry(entry), "project-a long_term append");
+	assert.equal(parseActivityLine(""), null);
+	assert.equal(parseActivityLine("{ not json"), null);
+	assert.equal(parseActivityLine(JSON.stringify({ op: "write" })), null, "a line with no timestamp is not an entry");
+
+	const search = parseActivityLine(JSON.stringify({ t: "x", op: "search", ns: "all", q: "postgres", hits: 1 }));
+	assert.ok(search);
+	assert.match(formatEntry(search), /"postgres" 1 hits/);
+
+	const forget = parseActivityLine(JSON.stringify({ t: "x", op: "forget", ns: "project-a", target: "long_term", removed: 2 }));
+	assert.ok(forget);
+	assert.equal(formatEntry(forget), "project-a long_term -2");
+});
+
+check("the tail reader picks up appends, joins split lines and survives a trim", () => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "psm-tail-"));
+	const file = path.join(dir, "activity.jsonl");
+	const line = (op: string, extra: Record<string, unknown> = {}) =>
+		JSON.stringify({ t: "2026-10-18T20:31:04.123Z", op, ...extra });
+	try {
+		fs.writeFileSync(file, `${line("read")}\n`);
+		const tail = new ActivityTail(file);
+		tail.prime();
+		assert.equal(tail.entries.length, 1);
+
+		fs.appendFileSync(file, `${line("write")}\n`);
+		assert.equal(tail.poll(), 1);
+		assert.equal(tail.entries.length, 2);
+		assert.equal(tail.poll(), 0, "nothing new means nothing is read");
+
+		// A poll can land mid-line; the fragment waits for the rest.
+		const whole = line("search", { hits: 3 });
+		fs.appendFileSync(file, whole.slice(0, 24));
+		assert.equal(tail.poll(), 0);
+		fs.appendFileSync(file, `${whole.slice(24)}\n`);
+		assert.equal(tail.poll(), 1);
+		assert.equal(tail.entries.at(-1)?.op, "search");
+
+		// The server trims in place; the reader starts over instead of reading nothing.
+		fs.writeFileSync(file, `${line("forget", { removed: 1 })}\n`);
+		assert.equal(tail.poll(), 1);
+		assert.equal(tail.entries.at(-1)?.op, "forget");
+	} finally {
+		fs.rmSync(dir, { recursive: true, force: true });
 	}
 });
 

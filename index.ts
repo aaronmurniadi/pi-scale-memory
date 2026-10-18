@@ -3,7 +3,8 @@
  *
  * Roles (/psm-role):
  *   brain — runs the memory server on its own tailnet node and publishes it with
- *           `tailscale serve`.
+ *           `tailscale serve`. In the terminal UI it also shows the brain log
+ *           panel: every memory read and write the server handles (src/brain-log-panel.ts).
  *   agent — uses its own userspace tailscaled (no TUN device, no route changes,
  *           SOCKS5 proxy only) so joining the tailnet leaves the machine's system
  *           Tailscale alone. It asks each peer which one is the brain, and mirrors
@@ -55,6 +56,7 @@ import {
 	updateConfig,
 } from "./src/config.js";
 import { brainLogPath, ensureBrainServer, stopBrainServer } from "./src/brain-server.js";
+import { type BrainLogPanelHandle, mountBrainLogPanel } from "./src/brain-log-panel.js";
 import { inspectInstall, runUpdate } from "./src/update.js";
 import { reapOrphanedTailscaled, tailscaleInstalled } from "./src/tailnet.js";
 import { findBrain, isBrainResponse } from "./src/discovery.js";
@@ -218,6 +220,8 @@ export default function (pi: ExtensionAPI) {
 	let lastError = "";
 	let localBrainStarted = false;
 	let lastCacheSync = 0;
+	/** The brain-log panel, present only while this machine serves the memory. */
+	let brainLogPanel: BrainLogPanelHandle | null = null;
 	const cacheRoot = cacheDir();
 
 	const agentId = `${os.hostname().split(".")[0]}`;
@@ -560,13 +564,35 @@ export default function (pi: ExtensionAPI) {
 		const cfg = loadConfig();
 		if (cfg.role === "brain") {
 			await connectLocal(ctx, cfg);
+			syncBrainLogPanel(ctx, cfg);
 			return;
 		}
 		await connectAgent(ctx, cfg);
 		if (!snapshot && cachingEnabled(cfg)) await useCachedSnapshot(ctx, cfg);
+		syncBrainLogPanel(ctx, cfg);
+	}
+
+	/**
+	 * The panel belongs to the brain and only exists in the terminal UI. It follows
+	 * the role, so /psm-role, /psm-join and a session start all land here.
+	 */
+	function syncBrainLogPanel(ctx: ExtensionContext, cfg: Config): void {
+		const wanted = ctx.mode === "tui" && cfg.role === "brain";
+		if (wanted) {
+			if (!brainLogPanel) brainLogPanel = mountBrainLogPanel(ctx);
+			return;
+		}
+		stopBrainLogPanel();
+	}
+
+	function stopBrainLogPanel(): void {
+		if (!brainLogPanel) return;
+		brainLogPanel.stop();
+		brainLogPanel = null;
 	}
 
 	async function disconnect(): Promise<void> {
+		stopBrainLogPanel();
 		if (flushTimer) {
 			clearInterval(flushTimer);
 			flushTimer = null;
@@ -739,6 +765,8 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", async (event, ctx) => {
+		// The panel is this session's overlay, whatever the reason for leaving.
+		stopBrainLogPanel();
 		if (flushTimer) {
 			clearInterval(flushTimer);
 			flushTimer = null;

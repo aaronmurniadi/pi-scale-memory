@@ -236,6 +236,9 @@ export class BrainClient {
 		const host = await this.hostFor();
 		const headers: Record<string, string> = { "content-type": "application/json" };
 		if (this.opts.token) headers.authorization = `Bearer ${this.opts.token}`;
+		// Names the caller on reads and searches too, which have no body to carry it:
+		// the brain's activity log is what the brain-log panel shows.
+		headers["x-psm-agent"] = this.opts.agentId;
 		let payload: string | undefined;
 		if (body !== undefined) payload = JSON.stringify(body);
 

@@ -87,6 +87,13 @@ const SEARCH_MODE = normalizeMode(process.env.QMD_SEARCH_MODE);
 const INDEX_WAIT_MS = Number(process.env.QMD_INDEX_WAIT_MS ?? 5_000);
 const SCOPES = [CORE, SHARED, "project"];
 const REGISTRY = path.join(DIR, "registry.json");
+/**
+ * One JSON line per memory operation, for the brain-log panel on this machine to
+ * tail. Kept out of the daemon log so the server's own output stays readable.
+ */
+const ACTIVITY_LOG = process.env.BRAIN_ACTIVITY_LOG || path.join(DIR, "activity.jsonl");
+const ACTIVITY_MAX_BYTES = Math.max(64 * 1024, Number(process.env.BRAIN_ACTIVITY_MAX_BYTES || 1_048_576));
+const ACTIVITY_KEEP_LINES = 4000;
 
 /** Search state reported by /v1/health so agents can label their results. */
 const searchState = { engine: "bm25", mode: SEARCH_MODE, ready: false, note: null };
@@ -119,6 +126,43 @@ function tag(agent, session) {
 	let who = agent || "agent";
 	if (session) who += `:${session}`;
 	return `<!-- ${stamp()} [${who}] -->`;
+}
+
+/**
+ * Who asked. The client sends x-psm-agent on every call; a write body is the
+ * fallback for an older client that only names its agent there.
+ */
+function actorOf(req, body) {
+	const header = req.headers["x-psm-agent"];
+	if (typeof header === "string" && header) return header;
+	if (body && typeof body.agent === "string" && body.agent) return body.agent;
+	return "";
+}
+
+/**
+ * Append one line to the activity log the brain-log panel tails.
+ *
+ * A memory request must never fail because logging did, so every error here is
+ * swallowed. Once the file passes ACTIVITY_MAX_BYTES it is rewritten with only
+ * its last ACTIVITY_KEEP_LINES; the panel notices the shrink and restarts.
+ */
+function logActivity(entry) {
+	try {
+		fs.mkdirSync(path.dirname(ACTIVITY_LOG), { recursive: true });
+		fs.appendFileSync(ACTIVITY_LOG, `${JSON.stringify({ t: new Date().toISOString(), ...entry })}\n`);
+		if (fs.statSync(ACTIVITY_LOG).size > ACTIVITY_MAX_BYTES) trimActivity();
+	} catch {
+		/* activity logging is best-effort */
+	}
+}
+
+function trimActivity() {
+	try {
+		const lines = fs.readFileSync(ACTIVITY_LOG, "utf-8").split("\n").filter(Boolean);
+		fs.writeFileSync(ACTIVITY_LOG, `${lines.slice(-ACTIVITY_KEEP_LINES).join("\n")}\n`);
+	} catch {
+		/* leave the file as it is */
+	}
 }
 
 function dateOrToday(d) {
@@ -586,7 +630,18 @@ async function indexAfterWrite(ns) {
 }
 
 const server = http.createServer(async (req, res) => {
-	const send = (status, obj) => {
+	const started = Date.now();
+	/**
+	 * Answer, and record the operation for the activity log.
+	 *
+	 * A route passes what it did; a failure that never reached one (401, 404, a
+	 * bad body) is logged as a plain error. /v1/health stays out of the log: agents
+	 * probe it constantly and it would drown everything else.
+	 */
+	const send = (status, obj, activity) => {
+		const fields = activity ?? {};
+		if (status >= 400 && !fields.op) fields.op = "error";
+		if (fields.op) logActivity({ ...fields, status, ms: Date.now() - started });
 		res.writeHead(status, { "content-type": "application/json" });
 		res.end(JSON.stringify(obj));
 	};
@@ -612,60 +667,112 @@ const server = http.createServer(async (req, res) => {
 			let ns = null;
 			if (raw === CORE) ns = null;
 			else if (raw && isValidNs(raw) && !isShared(raw)) ns = raw;
-			return send(200, { ns, context: buildContext(DIR, ns), sizes: tierSizes(DIR, ns) });
+			return send(
+				200,
+				{ ns, context: buildContext(DIR, ns), sizes: tierSizes(DIR, ns) },
+				{ op: "context", ns: ns ?? "all", agent: actorOf(req) },
+			);
 		}
 		// Full mirror for agent caches: the two cross-project tiers plus one project.
 		if (route === "GET /v1/snapshot") {
 			const raw = url.searchParams.get("ns");
 			const ns = raw && isValidNs(raw) && !isShared(raw) ? raw : null;
 			const project = ns ? { id: ns, files: snapshotTier(nsDir(DIR, ns)) } : null;
-			return send(200, {
-				takenAt: stamp(),
-				ns,
-				core: { files: snapshotTier(coreDir(DIR)) },
-				shared: { files: snapshotTier(sharedDir(DIR)) },
-				project,
+			return send(
+				200,
+				{
+					takenAt: stamp(),
+					ns,
+					core: { files: snapshotTier(coreDir(DIR)) },
+					shared: { files: snapshotTier(sharedDir(DIR)) },
+					project,
+				},
+				{ op: "snapshot", ns: ns ?? "all", agent: actorOf(req) },
+			);
+		}
+		if (route === "GET /v1/read") {
+			return send(200, handleRead(url.searchParams), {
+				op: "read",
+				ns: url.searchParams.get("ns") || "project",
+				target: url.searchParams.get("target") || "long_term",
+				agent: actorOf(req),
 			});
 		}
-		if (route === "GET /v1/read") return send(200, handleRead(url.searchParams));
 		if (route === "GET /v1/search") {
 			const limit = clampLimit(Number(url.searchParams.get("limit")) || 5);
 			const mode = normalizeMode(url.searchParams.get("mode") ?? SEARCH_MODE);
 			const query = url.searchParams.get("q") || "";
 			const ns = url.searchParams.get("ns") || "";
 			const scope = normalizeScope(url.searchParams.get("scope"));
-			return send(200, await runSearch(query, mode, limit, ns, scope));
+			const out = await runSearch(query, mode, limit, ns, scope);
+			return send(200, out, {
+				op: "search",
+				ns: ns || "all",
+				scope,
+				mode,
+				q: query.slice(0, 60),
+				hits: out.results?.length ?? 0,
+				agent: actorOf(req),
+			});
 		}
 		if (route === "GET /v1/namespaces") {
 			const active = url.searchParams.get("ns") || null;
-			return send(200, handleNamespaces(active));
+			return send(200, handleNamespaces(active), { op: "namespaces", ns: active ?? "all", agent: actorOf(req) });
 		}
-		if (route === "GET /v1/core") return send(200, { content: readSafe(memoryPath(coreDir(DIR))) ?? "" });
+		if (route === "GET /v1/core") {
+			return send(200, { content: readSafe(memoryPath(coreDir(DIR))) ?? "" }, {
+				op: "read",
+				ns: CORE,
+				target: "long_term",
+				agent: actorOf(req),
+			});
+		}
 		if (route === "POST /v1/write") {
 			const body = await readBody(req);
 			const out = await handleWrite(body);
 			await indexAfterWrite(out.ns);
-			return send(200, out);
+			return send(200, out, {
+				op: "write",
+				ns: out.ns,
+				target: body.target || "long_term",
+				mode: body.mode || "append",
+				deduped: Boolean(out.deduped),
+				agent: actorOf(req, body),
+			});
 		}
 		if (route === "POST /v1/scratchpad") {
-			const out = await handleScratchpad(await readBody(req));
+			const body = await readBody(req);
+			const out = await handleScratchpad(body);
 			await indexAfterWrite(out.ns);
-			return send(200, out);
+			return send(200, out, {
+				op: "scratchpad",
+				ns: out.ns,
+				action: body.action || "list",
+				agent: actorOf(req, body),
+			});
 		}
 		if (route === "POST /v1/forget") {
 			const body = await readBody(req);
 			const out = await handleForget(body);
 			await indexAfterWrite(out.ns);
-			return send(200, out);
+			return send(200, out, {
+				op: "forget",
+				ns: out.ns,
+				target: body.target || "long_term",
+				removed: out.removed ?? 0,
+				agent: actorOf(req, body),
+			});
 		}
 		if (route === "POST /v1/core") {
-			const out = await handleCore(await readBody(req));
+			const body = await readBody(req);
+			const out = await handleCore(body);
 			await indexAfterWrite(CORE);
-			return send(200, out);
+			return send(200, out, { op: "core", action: body.action || "append", agent: actorOf(req, body) });
 		}
 		if (route === "POST /v1/ns/merge") {
-			const out = await handleMerge(await readBody(req));
-			return send(200, out);
+			const body = await readBody(req);
+			const out = await handleMerge(body);
+			return send(200, out, { op: "merge", from: body.from, into: body.into, agent: actorOf(req, body) });
 		}
 		throw httpErr(404, "not found");
 	} catch (e) {
