@@ -1,5 +1,5 @@
 /**
- * /update — update the extension itself.
+ * /psm-update — update the extension itself.
  *
  * Two install shapes are supported:
  *   - a git checkout (this repo cloned locally, or pi installed from a local path):

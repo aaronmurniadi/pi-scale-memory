@@ -7,7 +7,8 @@
  * cache so they can keep reading while offline.
  *
  * Three tiers live under BRAIN_DIR (see brain/memory.mjs for the layout):
- *   core    human-authored, written only through /v1/core by /core-memory
+ *   core    human-authored, written only through /v1/core (/psm-core-memory, or
+ *           memory_write with scope core when the user asks for it)
  *   shared  agent-managed cross-project memory
  *   project one namespace per git repository, resolved by the agent
  *
@@ -89,7 +90,7 @@ const REGISTRY = path.join(DIR, "registry.json");
 
 /** Search state reported by /v1/health so agents can label their results. */
 const searchState = { engine: "bm25", mode: SEARCH_MODE, ready: false, note: null };
-/** Collections the brain believes exist: what /v1/health reports and /memory search prints. */
+/** Collections the brain believes exist: what /v1/health reports and /psm-memory search prints. */
 const knownCollections = new Set();
 
 fs.mkdirSync(path.join(DIR, "ns"), { recursive: true });
@@ -173,11 +174,11 @@ function resolveRead(rawNs, target) {
 
 /**
  * Where a write may point. Core is structurally unreachable from here: the only
- * route that touches core/MEMORY.md is /v1/core, which only /core-memory calls.
+ * route that touches core/MEMORY.md is /v1/core, which only /psm-core-memory calls.
  */
 function resolveWrite(rawNs, target) {
 	const raw = rawNs || DEFAULT_NS;
-	if (raw === CORE) throw httpErr(400, "core memory is written only through /v1/core (the /core-memory command)");
+	if (raw === CORE) throw httpErr(400, "core memory is written only through /v1/core (the /psm-core-memory command, or memory_write with scope core)");
 	if (!isValidNs(raw)) throw httpErr(400, `invalid ns '${raw}'`);
 	if (isShared(raw) && target !== "long_term") {
 		throw httpErr(400, `the shared tier holds MEMORY.md only; it has no ${target}`);
@@ -363,7 +364,7 @@ async function handleForget(body) {
 	if (!match) throw httpErr(400, "match required");
 	const target = body.target === "daily" ? "daily" : "long_term";
 	if (body.ns === CORE || body.target === CORE) {
-		throw httpErr(400, "core memory is edited only through /core-memory (append) and /core-memory --remove");
+		throw httpErr(400, "core memory is edited only through /v1/core (/psm-core-memory, or memory_write with scope core)");
 	}
 	const { ns, dir } = resolveWrite(body.ns, target);
 	const file = target === "daily" ? dailyPath(dir, dateOrToday(body.date)) : memoryPath(dir);
@@ -371,7 +372,7 @@ async function handleForget(body) {
 	return { ok: true, ns, ...out };
 }
 
-/** Core is a single human-authored file; this endpoint is its only writer. */
+/** Core is a single human-authored file; this endpoint is its only route in. */
 async function handleCore(body) {
 	const dir = coreDir(DIR);
 	const file = memoryPath(dir);

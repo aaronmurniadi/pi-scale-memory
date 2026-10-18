@@ -429,12 +429,12 @@ check("a spent pre-auth key is recognised and explained", () => {
 	assert.equal(keyRejected("backend error: requested tag [tag:x] are invalid or not permitted"), false);
 	assert.equal(keyRejected("Failed to connect to local tailscaled"), false);
 
-	const help = keyRejectedHelp("/join agent", "invalid key: API key abc not valid");
+	const help = keyRejectedHelp("/psm-join agent", "invalid key: API key abc not valid");
 	assert.match(help, /Join once per machine|once per machine/, "it should say one join is enough here");
 	assert.match(help, /Settings -> Keys/, "it should say where to make a new key");
-	assert.match(help, /join agent/, "it should name the command to re-run");
+	assert.match(help, /psm-join agent/, "it should name the command to re-run");
 	assert.match(help, /Tailscale said: .*abc/, "it should keep what Tailscale actually said");
-	assert.match(keyRejectedHelp("/join brain"), /join brain/, "the brain has its own command");
+	assert.match(keyRejectedHelp("/psm-join brain"), /psm-join brain/, "the brain has its own command");
 	assert.ok(!keyRejectedHelp().includes("Tailscale said:"), "nothing observed, nothing repeated");
 });
 
@@ -1135,7 +1135,7 @@ check("the reset plan names what it will delete", () => {
 	assert.ok(text.includes(configDir()), "the confirmation must show the real path");
 	assert.match(text, /admin console/, "it should be honest that devices remain in Tailscale");
 	assert.match(text, /start over/i);
-	assert.match(text, /join brain/, "it should say how to start again");
+	assert.match(text, /psm-join brain/, "it should say how to start again");
 });
 
 console.log("project namespaces from git");
@@ -1359,7 +1359,7 @@ check("migrating twice cannot duplicate what it moved", () => {
 });
 
 console.log("core, shared and project tiers over loopback");
-await checkAsync("core memory has exactly one writer and no other route", async () => {
+await checkAsync("core memory has one writable route and no other", async () => {
 	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "psm-core-"));
 	const port = await freePort();
 	const collection = testCollection();
@@ -1567,14 +1567,16 @@ await checkAsync("the extension registers its commands and tools", async () => {
 	const mod = await import("../index.js");
 	const commands: string[] = [];
 	const tools: string[] = [];
+	const toolDefs: { name: string; parameters: { properties: Record<string, { enum?: string[] }> } }[] = [];
 	const events: string[] = [];
 	const stub = {
 		on(event: string) {
 			events.push(event);
 			return () => {};
 		},
-		registerTool(tool: { name: string }) {
+		registerTool(tool: { name: string; parameters: { properties: Record<string, { enum?: string[] }> } }) {
 			tools.push(tool.name);
+			toolDefs.push(tool);
 		},
 		registerCommand(name: string) {
 			commands.push(name);
@@ -1582,13 +1584,13 @@ await checkAsync("the extension registers its commands and tools", async () => {
 	};
 	mod.default(stub as never);
 	assert.deepEqual(commands.sort(), [
-		"core-memory",
-		"install-qmd",
-		"join",
-		"memory",
-		"reset",
-		"role",
-		"update",
+		"psm-core-memory",
+		"psm-install-qmd",
+		"psm-join",
+		"psm-memory",
+		"psm-reset",
+		"psm-role",
+		"psm-update",
 	]);
 	assert.deepEqual(tools.sort(), [
 		"memory_forget",
@@ -1599,6 +1601,11 @@ await checkAsync("the extension registers its commands and tools", async () => {
 	]);
 	assert.ok(events.includes("session_start"));
 	assert.ok(events.includes("before_agent_start"));
+	// The user can put a rule in core memory by asking for it; the scope is what
+	// carries that permission, so the tool has to accept it.
+	const write = toolDefs.find((t) => t.name === "memory_write");
+	assert.ok(write, "memory_write is registered");
+	assert.deepEqual(write.parameters.properties.scope.enum, ["project", "shared", "core"]);
 });
 
 fs.rmSync(process.env.PI_SCALE_MEMORY_CONFIG_DIR as string, { recursive: true, force: true });

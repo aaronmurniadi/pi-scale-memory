@@ -23,7 +23,7 @@ The growth did not just add noise. It deleted memory from the prompt:
 
 | Tier | Scope | Written by | Injected |
 |---|---|---|---|
-| **Core** | every session, every project, every machine | `/core-memory` only | always, even when no project resolves |
+| **Core** | every session, every project, every machine | `/psm-core-memory` only | always, even when no project resolves |
 | **Shared** | every session, every project | agents: `memory_write scope shared`, pruned with `memory_forget scope shared` | always |
 | **Project** | one git repository | agents, freely: `MEMORY.md`, scratchpad, daily log | when a project namespace resolves |
 
@@ -33,15 +33,15 @@ The split is by **authority**, not only by topic. The reason core exists separat
 
 | Path | Can reach core? |
 |---|---|
-| `/core-memory` command → `POST /v1/core` | **yes, the only writer** |
-| `memory_write` → `POST /v1/write` | no: the handler rejects `target: "core"` / `ns: "core"` |
+| `/psm-core-memory` command or `memory_write` scope `core` → `POST /v1/core` | **yes, the only writable route** |
+| `memory_write` scope `project`/`shared` → `POST /v1/write` | no: the handler rejects `target: "core"` / `ns: "core"` |
 | automatic capture → `POST /v1/write` with `target: "daily"` | no: it writes the project's daily log |
 | `scratchpad` → `POST /v1/scratchpad` | no: project namespaces only |
 | `memory_forget` → `POST /v1/forget` | no: core is not an accepted target |
-| `/core-memory --remove` → `POST /v1/core` | yes, the only deletion path, with a recovery copy |
+| `/psm-core-memory --remove` → `POST /v1/core` | yes, the only deletion path, with a recovery copy |
 | editing `core/MEMORY.md` on the brain machine by hand | out of band; the extension neither does nor prevents this |
 
-No tool is bound to `POST /v1/core`, so a model that decides to write core has no route to it. This is why the restriction is enforced at the endpoint rather than stated in the prompt.
+The only tool bound to `POST /v1/core` is `memory_write` scope `core`, which the user asks for by name. Every other path rejects core at the endpoint, so the restriction does not depend on the prompt being obeyed.
 
 Core writes are also never queued (`writeNow`, not `writeOrQueue`): if the brain is unreachable the command reports the failure instead of leaving a rule that the user believes was stored in an outbox.
 
@@ -67,8 +67,8 @@ Normalization: scheme, userinfo, port, trailing slash and `.git` are stripped, s
 
 Two failure modes are designed for rather than discovered:
 
-- **Fork vs upstream.** `origin` of a fork is not the upstream project. `scopeRemote` picks a different remote, and `/memory merge` plus the registry's recorded key handle the case where they were already treated as separate.
-- **Remote renamed or moved.** The key changes and the memory looks lost. `/memory merge <from> <into>` folds the namespaces together, and the brain's registry keeps the canonical key each agent reported.
+- **Fork vs upstream.** `origin` of a fork is not the upstream project. `scopeRemote` picks a different remote, and `/psm-memory merge` plus the registry's recorded key handle the case where they were already treated as separate.
+- **Remote renamed or moved.** The key changes and the memory looks lost. `/psm-memory merge <from> <into>` folds the namespaces together, and the brain's registry keeps the canonical key each agent reported.
 
 Worktrees share a namespace: `rev-parse --git-common-dir` resolves to `<root>/.git`, so `repo/.worktrees/x` maps onto `repo` instead of getting its own memory.
 
@@ -100,8 +100,8 @@ When the block does not fit, the least valuable section is given whatever room i
 The point of the tiers is that the prompt holds useful memory rather than accumulated noise, so three mechanisms work against dilution:
 
 - **Write-time dedup.** An entry that restates an existing paragraph (token-set Jaccard ≥ 0.8 against `MEMORY.md` paragraphs, stamps ignored) replaces it in place and reports `deduped`. Appending the same fact twice costs nothing and adds nothing. Daily logs opt out: repetition there is history.
-- **Compaction.** `/memory compact [ns]` folds a `MEMORY.md` with the session model. The brain has no model of its own, so it runs on the agent and writes back an overwrite; it refuses files below the threshold and refuses a result that is not shorter than the original, so a bad fold cannot make memory worse than leaving it alone.
-- **Visibility and pruning.** `/memory ns` reports each namespace's size and daily-log count, and `/memory status` reports the standing cost of core + shared + project in tokens per session. Shared and project memory are prunable with `memory_forget` (recovery copies kept), and core with `/core-memory --remove`.
+- **Compaction.** `/psm-memory compact [ns]` folds a `MEMORY.md` with the session model. The brain has no model of its own, so it runs on the agent and writes back an overwrite; it refuses files below the threshold and refuses a result that is not shorter than the original, so a bad fold cannot make memory worse than leaving it alone.
+- **Visibility and pruning.** `/psm-memory ns` reports each namespace's size and daily-log count, and `/psm-memory status` reports the standing cost of core + shared + project in tokens per session. Shared and project memory are prunable with `memory_forget` (recovery copies kept), and core with `/psm-core-memory --remove`.
 
 ## API
 
@@ -141,7 +141,7 @@ On the first start after the upgrade, `migrateFlat` moves the v0.1 layout:
 - `daily/` moves to the `legacy` namespace, which nothing injects, and the original flat files are archived there too.
 - The move is idempotent: the flat files are gone afterwards, and the shared write is deduplicated, so an interrupted run cannot duplicate content.
 
-The one caveat worth stating: the old `MEMORY.md` contains agent-written entries, because the old write path could not tell them apart from yours. Core therefore starts empty rather than seeded from it. Whatever of that content belongs in core is yours to add with `/core-memory`, and the rest stays readable in shared.
+The one caveat worth stating: the old `MEMORY.md` contains agent-written entries, because the old write path could not tell them apart from yours. Core therefore starts empty rather than seeded from it. Whatever of that content belongs in core is yours to add with `/psm-core-memory`, and the rest stays readable in shared.
 
 ## Compatibility
 
@@ -153,7 +153,7 @@ The one caveat worth stating: the old `MEMORY.md` contains agent-written entries
 The suite spawns a real brain over loopback with a throwaway `BRAIN_DIR`, so the tiers are tested end to end rather than mocked:
 
 - namespace resolution over URL forms, worktrees, submodules, no-remote, no-git and pin precedence, with the git runner injected so no repository is needed;
-- core's single writer, including rejection at `/v1/write` and `/v1/forget`, and the recovery copy on removal;
+- core's one writable route, including rejection at `/v1/write` and `/v1/forget`, and the recovery copy on removal;
 - shared's write rules (no daily, no scratchpad) and that a project write never leaks into it;
 - project isolation in both reads and searches, and that a search never crosses into another project;
 - traversal rejection and the `legacy` default for a caller that names no namespace;
@@ -171,7 +171,7 @@ Per-tier qmd collections are exercised only when qmd is installed, through throw
 | Container/monorepo sub-scoping | Not implemented. A monorepo is one namespace; splitting it by path stays opt-in work if it is ever wanted |
 | Mirror disk usage | One directory per project worked on, never evicted. Deliberate: sessions share one cache dir, so eviction would delete a live session's offline memory. Bounded by how many projects a machine works in, and revisitable with mtime-based pruning if that ever matters |
 | A write racing a namespace merge | The merge locks each destination file it copies, but a write to the source namespace between the last copy and the `rm` can recreate the source directory holding one file, with no registry entry. Narrow, and the namespace still works; a follow-up merge would fold it in |
-| Compaction is manual | `/memory compact` exists but nothing schedules it. Core has no compaction at all, by design |
+| Compaction is manual | `/psm-memory compact` exists but nothing schedules it. Core has no compaction at all, by design |
 | Daily logs are unbounded on disk | Only today and yesterday are injected, so growth costs disk and index time, not prompt tokens. No auto-deletion, deliberately |
 | Leftover v0.1 qmd collection | Reported at startup; removing it is a manual `qmd collection remove` |
 | `npm test` needs `tsx` | The `test` script calls `tsx`, which is not in `devDependencies`, so a fresh clone needs `npx tsx test/unit.ts` or an added dependency |
@@ -179,7 +179,7 @@ Per-tier qmd collections are exercised only when qmd is installed, through throw
 ## Decisions
 
 - Three tiers by write authority: core (human-only), shared (agent-managed, cross-project), project (agent-managed, per repository).
-- Core is written only by `/core-memory`, enforced at the brain: no tool and no other route can reach it, and core writes are never queued.
+- Core is reached only through `POST /v1/core`, enforced at the brain: `/psm-core-memory` for the user, `memory_write` scope `core` for an agent asked for it, and core writes are never queued.
 - Core holds one file: no scratchpad, no daily log, no compaction.
 - Shared holds `MEMORY.md` only, and automatic capture never writes it.
 - Project identity is the canonical git remote, with machine-local fallbacks for repositories without one and for non-repositories.

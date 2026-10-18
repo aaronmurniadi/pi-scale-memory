@@ -272,7 +272,7 @@ export class BrainClient {
 		return this.call("GET", "/v1/core");
 	}
 
-	/** The only writer to core memory. Reached only from the /core-memory command. */
+	/** Core's one writable route: /psm-core-memory, and memory_write scope core on the user's request. */
 	writeCore(body: { action: "append" | "remove" | "list"; content?: string; match?: string }): Promise<any> {
 		return this.call("POST", "/v1/core", body);
 	}

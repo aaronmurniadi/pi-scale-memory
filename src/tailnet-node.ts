@@ -151,7 +151,7 @@ export function keyRejected(stderr: string): boolean {
  * because a node keeps its state and reuses its device from then on. The most
  * likely cause is a single-use key that this machine has already joined with.
  */
-export function keyRejectedHelp(command = "/join agent", detail = ""): string {
+export function keyRejectedHelp(command = "/psm-join agent", detail = ""): string {
 	const lines = [
 		"Tailscale refused this pre-auth key, so this node could not register.",
 		"",
@@ -182,7 +182,7 @@ export function tagRejectedHelp(observed: string[] = []): string {
 		"",
 		"If the key must keep its tags, the tailnet policy has to allow whoever the key",
 		"belongs to to apply them (admin console -> Access controls -> tagOwners).",
-		"Re-run /join brain afterwards.",
+		"Re-run /psm-join brain afterwards.",
 	);
 	return lines.join("\n");
 }
@@ -287,7 +287,7 @@ export async function ensureBrainNode(opts: {
 		if (!opts.authKey) {
 			return {
 				ok: false,
-				detail: "this machine's tailscale node is not joined yet; run /join brain with a pre-auth key",
+				detail: "this machine's tailscale node is not joined yet; run /psm-join brain with a pre-auth key",
 				status: status ?? undefined,
 				joined: false,
 				served: false,
@@ -304,7 +304,7 @@ export async function ensureBrainNode(opts: {
 		if (!up.ok) {
 			let detail = `tailscale up failed: ${up.stderr.trim().split("\n").slice(-3).join(" ")}`;
 			if (tagRejected(up.stderr)) detail = tagRejectedHelp(status?.tags ?? []);
-			if (keyRejected(up.stderr)) detail = keyRejectedHelp("/join brain", failureText(up));
+			if (keyRejected(up.stderr)) detail = keyRejectedHelp("/psm-join brain", failureText(up));
 			return { ok: false, detail, status: status ?? undefined, joined: false, served: false };
 		}
 		joined = true;
@@ -502,7 +502,7 @@ export async function ensureAgentNode(opts: {
 		if (!opts.authKey) {
 			return {
 				ok: false,
-				detail: "this machine's tailscale node is not joined yet; run /join agent with a pre-auth key",
+				detail: "this machine's tailscale node is not joined yet; run /psm-join agent with a pre-auth key",
 				joined: false,
 			};
 		}
@@ -516,7 +516,7 @@ export async function ensureAgentNode(opts: {
 		}
 		if (!up.ok) {
 			if (keyRejected(up.stderr)) {
-				return { ok: false, detail: keyRejectedHelp("/join agent", failureText(up)), joined: false };
+				return { ok: false, detail: keyRejectedHelp("/psm-join agent", failureText(up)), joined: false };
 			}
 			return { ok: false, detail: `tailscale up failed: ${failureText(up)}`, joined: false };
 		}
@@ -534,7 +534,7 @@ export async function ensureAgentNode(opts: {
 	if (socksPort === null) {
 		return {
 			ok: false,
-			detail: "the node is up but its SOCKS port is not recorded; run /reset and join again",
+			detail: "the node is up but its SOCKS port is not recorded; run /psm-reset and join again",
 			joined,
 		};
 	}

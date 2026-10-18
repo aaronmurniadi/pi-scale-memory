@@ -4,7 +4,7 @@
  * Three tiers share one layout, so the same functions serve the brain's
  * authoritative copy and an agent's offline mirror of it:
  *
- *   core/MEMORY.md              human-authored; written only by /core-memory
+ *   core/MEMORY.md              human-authored; written only by /psm-core-memory
  *   shared/MEMORY.md            agent-managed memory that applies to every project
  *   ns/<id>/MEMORY.md           one git repository (see src/namespace.ts)
  *   ns/<id>/SCRATCHPAD.md       its working checklist
@@ -306,7 +306,7 @@ export function buildContext(root, ns) {
 	return `# Memory\n\n${kept.map(renderSection).join("\n\n---\n\n")}`;
 }
 
-/** Rough size of each tier, for /memory ns: how much prompt budget is in use. */
+/** Rough size of each tier, for /psm-memory ns: how much prompt budget is in use. */
 export function tierSizes(root, ns) {
 	const sizes = {
 		core: (readSafe(memoryPath(coreDir(root))) ?? "").length,
@@ -425,7 +425,7 @@ function moveFile(from, to) {
  * MEMORY.md and any open scratchpad items become the shared tier, because both are
  * cross-project agent-managed notes and core takes no agent writes. The originals,
  * and the old daily logs, are archived under the legacy namespace, which nothing
- * injects and which can be read by pinning it (/memory ns legacy).
+ * injects and which can be read by pinning it (/psm-memory ns legacy).
  *
  * Idempotent: the flat files are moved away, so a second run finds nothing, and a
  * crash between the shared write and the move cannot duplicate content because the

@@ -1,7 +1,7 @@
 /**
  * pi-scale-memory — one shared memory for many pi agents, over Tailscale.
  *
- * Roles (/role):
+ * Roles (/psm-role):
  *   brain — runs the memory server on its own tailnet node and publishes it with
  *           `tailscale serve`.
  *   agent — uses its own userspace tailscaled (no TUN device, no route changes,
@@ -10,14 +10,14 @@
  *           the memory for offline reads.
  *
  * Commands:
- *   /role                   — set this pi agent's role (brain or agent)
- *   /join brain             — join this machine and host the memory here
- *   /join agent             — join this machine as an agent
- *   /memory                 — status | ns | pin | merge | compact | sync | search | connect
- *   /core-memory            — write core memory (the only writer), --remove to delete, no args to show
- *   /update                 — update the extension itself, then reload
- *   /reset                  — delete all local state and start over
- *   /install-qmd            — optional: install qmd for semantic search on the brain
+ *   /psm-role                   — set this pi agent's role (brain or agent)
+ *   /psm-join brain             — join this machine and host the memory here
+ *   /psm-join agent             — join this machine as an agent
+ *   /psm-memory                 — status | ns | pin | merge | compact | sync | search | connect
+ *   /psm-core-memory            — write core memory by hand, --remove to delete, no args to show
+ *   /psm-update                 — update the extension itself, then reload
+ *   /psm-reset                  — delete all local state and start over
+ *   /psm-install-qmd            — optional: install qmd for semantic search on the brain
  */
 import { spawn } from "node:child_process";
 import * as fs from "node:fs";
@@ -147,7 +147,7 @@ function compactPrompt(content: string, budget: number): string {
 		"",
 		"<memory>",
 		content,
-		"</memory>",
+		"</psm-memory>",
 	].join("\n");
 }
 
@@ -255,7 +255,7 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	function requireClient(): BrainClient {
-		if (!client) throw new Error(`${notConnected()}. Run /memory connect.`);
+		if (!client) throw new Error(`${notConnected()}. Run /psm-memory connect.`);
 		return client;
 	}
 
@@ -326,7 +326,7 @@ export default function (pi: ExtensionAPI) {
 					if (ctx.hasUI) ctx.ui.notify(`pi-scale-memory: agents cannot reach this brain — ${node.detail}`, "warning");
 				}
 			} else if (ctx.hasUI) {
-				ctx.ui.notify("pi-scale-memory: run /join brain so agents can reach this brain.", "warning");
+				ctx.ui.notify("pi-scale-memory: run /psm-join brain so agents can reach this brain.", "warning");
 			}
 
 			client = new BrainClient({
@@ -343,7 +343,7 @@ export default function (pi: ExtensionAPI) {
 			status(ctx, `brain: local server on port ${cfg.brainPort}`);
 			if (ctx.hasUI && !(await qmdStatus()).installed) {
 				ctx.ui.notify(
-					"pi-scale-memory: qmd is not installed, so memory_search uses BM25. Run /install-qmd for semantic search.",
+					"pi-scale-memory: qmd is not installed, so memory_search uses BM25. Run /psm-install-qmd for semantic search.",
 					"info",
 				);
 			}
@@ -423,7 +423,7 @@ export default function (pi: ExtensionAPI) {
 		if (!cfg.authKey && !cfg.loginServer) {
 			lastError = "not joined yet";
 			status(ctx, "brain: not joined");
-			if (ctx.hasUI) ctx.ui.notify("pi-scale-memory: run /join agent to join the tailnet.", "warning");
+			if (ctx.hasUI) ctx.ui.notify("pi-scale-memory: run /psm-join agent to join the tailnet.", "warning");
 			return;
 		}
 		status(ctx, "brain: joining tailnet…");
@@ -489,10 +489,10 @@ export default function (pi: ExtensionAPI) {
 	function scheduleAgentRetry(ctx: ExtensionContext): void {
 		if (retryTimer) return;
 		if (retryAttempt >= MAX_RETRY_ATTEMPTS) {
-			status(ctx, "brain: offline, run /memory connect");
+			status(ctx, "brain: offline, run /psm-memory connect");
 			if (ctx.hasUI) {
 				ctx.ui.notify(
-					`pi-scale-memory: gave up after ${MAX_RETRY_ATTEMPTS} tries (${lastError || "no peer answered as a brain"}). Run /memory connect to try again.`,
+					`pi-scale-memory: gave up after ${MAX_RETRY_ATTEMPTS} tries (${lastError || "no peer answered as a brain"}). Run /psm-memory connect to try again.`,
 					"warning",
 				);
 			}
@@ -546,7 +546,7 @@ export default function (pi: ExtensionAPI) {
 		}
 		cancelAgentRetry();
 		// The node is shared per machine and stays up between sessions, so this only
-		// drops our handle to it. /reset stops it for good.
+		// drops our handle to it. /psm-reset stops it for good.
 		agentNode = null;
 		// Clear out anything an older version left running with its socket already
 		// deleted, which is unreachable from then on.
@@ -559,7 +559,7 @@ export default function (pi: ExtensionAPI) {
 
 	// --- periodic summaries stored to the brain ---
 
-	/** One model call, shared by the session summary and by /memory compact. */
+	/** One model call, shared by the session summary and by /psm-memory compact. */
 	async function askModel(ctx: ExtensionContext, system: string, prompt: string): Promise<string | null> {
 		const model = ctx.model;
 		if (!model) return null;
@@ -645,7 +645,7 @@ export default function (pi: ExtensionAPI) {
 			// Refused before the model call, not after it: core is short by construction
 			// and pruning it is a decision for the user, not a summariser.
 			ctx.ui.notify(
-				"Core memory is not compacted. It is short by construction, and its edits are yours: use /core-memory --remove to drop an entry.",
+				"Core memory is not compacted. It is short by construction, and its edits are yours: use /psm-core-memory --remove to drop an entry.",
 				"info",
 			);
 			return;
@@ -739,7 +739,7 @@ export default function (pi: ExtensionAPI) {
 			"Three tiers, all of them budgeted. Keep them small enough to be worth their tokens:",
 			"- **Project memory** (default): decisions, findings and facts about this repository. memory_write, scope project.",
 			"- **Shared memory** (scope shared): only what is true for every project, such as a convention you have now confirmed twice.",
-			"- **Core memory**: human-authored. Never attempt to write it, and do not ask for a tool for it. When the user wants something remembered everywhere, tell them to run /core-memory.",
+			"- **Core memory** (scope core): the human's own rules, loaded in every session on every project. Write it only when the user explicitly asks for something to be core memory ('remember <file> as core memory'); never on your own initiative. They can also write it themselves with /psm-core-memory.",
 			"",
 			"Writing so memory stays useful:",
 			"- Write the durable fact, not the conversation that produced it. One line beats a paragraph.",
@@ -774,8 +774,8 @@ export default function (pi: ExtensionAPI) {
 		}
 	});
 
-	// --- /memory ---
-	pi.registerCommand("memory", {
+	// --- /psm-memory ---
+	pi.registerCommand("psm-memory", {
 		description: "pi-scale-memory: status | ns | pin | merge | compact | sync | search | connect",
 		handler: async (args, ctx) => {
 			const sub = (args ?? "").trim().split(/\s+/)[0] || "status";
@@ -832,7 +832,7 @@ export default function (pi: ExtensionAPI) {
 						`Namespace: ${activeNs.ns}`,
 						`key: ${activeNs.key}`,
 						`resolved from: ${activeNs.source}`,
-						`pin: ${pin ?? "(none)"} (set with /memory pin <ns>, clear with /memory pin --clear)`,
+						`pin: ${pin ?? "(none)"} (set with /psm-memory pin <ns>, clear with /psm-memory pin --clear)`,
 						"",
 					);
 				}
@@ -869,7 +869,7 @@ export default function (pi: ExtensionAPI) {
 			if (sub === "pin") {
 				const wanted = (args ?? "").trim().split(/\s+/).slice(1).join(" ").trim();
 				if (!wanted) {
-					ctx.ui.notify("Usage: /memory pin <ns> | /memory pin --clear", "warning");
+					ctx.ui.notify("Usage: /psm-memory pin <ns> | /psm-memory pin --clear", "warning");
 					return;
 				}
 				if (wanted === "--clear") {
@@ -881,7 +881,7 @@ export default function (pi: ExtensionAPI) {
 				updateConfig({ namespace: wanted });
 				activeNs = await resolveActiveNs(ctx, loadConfig(false));
 				ctx.ui.notify(
-					`Pinned this machine to '${wanted}'. Every session on this machine now uses it; /memory pin --clear removes the pin.`,
+					`Pinned this machine to '${wanted}'. Every session on this machine now uses it; /psm-memory pin --clear removes the pin.`,
 					"info",
 				);
 				if (client) {
@@ -898,7 +898,7 @@ export default function (pi: ExtensionAPI) {
 				const from = parts[0];
 				const into = parts[1];
 				if (!from || !into) {
-					ctx.ui.notify("Usage: /memory merge <from-ns> <into-ns>", "warning");
+					ctx.ui.notify("Usage: /psm-memory merge <from-ns> <into-ns>", "warning");
 					return;
 				}
 				if (!client) {
@@ -954,11 +954,11 @@ export default function (pi: ExtensionAPI) {
 			// The node is machine-wide, so report it from the node itself: it is there
 			// even for a session that has not connected to a brain yet.
 			const agent = await agentNodeStatus();
-			let nodeInfo = `node: ${agent?.hostname || "not joined (run /join agent)"}`;
+			let nodeInfo = `node: ${agent?.hostname || "not joined (run /psm-join agent)"}`;
 			if (cfg.role === "brain") {
 				const node = await nodeStatus();
 				if (node) nodeInfo = `node: ${node.hostname} ${node.ip} tags=[${node.tags.join(",")}]`;
-				else nodeInfo = "node: not joined (run /join brain)";
+				else nodeInfo = "node: not joined (run /psm-join brain)";
 			}
 			// What memory costs: core and shared are injected in every session, so their
 			// size is a standing token bill rather than a one-off.
@@ -981,8 +981,8 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	// --- /core-memory: the only writer to core memory ---
-	pi.registerCommand("core-memory", {
+	// --- /psm-core-memory: the human's writer to core memory ---
+	pi.registerCommand("psm-core-memory", {
 		description:
 			"pi-scale-memory: write core memory (loaded in every session, every project). No arguments shows it, --remove <match> deletes",
 		handler: async (args, ctx) => {
@@ -997,7 +997,7 @@ export default function (pi: ExtensionAPI) {
 					const out = await c.readCore();
 					const content = String(out.content ?? "").trim();
 					if (!content) {
-						ctx.ui.notify("Core memory is empty. Add to it with /core-memory <memory>.", "info");
+						ctx.ui.notify("Core memory is empty. Add to it with /psm-core-memory <memory>.", "info");
 						return;
 					}
 					ctx.ui.notify(
@@ -1009,7 +1009,7 @@ export default function (pi: ExtensionAPI) {
 				if (raw === "--remove" || raw.startsWith("--remove ")) {
 					const match = raw.slice("--remove".length).trim();
 					if (!match) {
-						ctx.ui.notify("Usage: /core-memory --remove <match>", "warning");
+						ctx.ui.notify("Usage: /psm-core-memory --remove <match>", "warning");
 						return;
 					}
 					const res = await c.writeCore({ action: "remove", match });
@@ -1021,7 +1021,7 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				if (raw.startsWith("--")) {
-					ctx.ui.notify("Usage: /core-memory <memory> | /core-memory --remove <match> | /core-memory", "warning");
+					ctx.ui.notify("Usage: /psm-core-memory <memory> | /psm-core-memory --remove <match> | /psm-core-memory", "warning");
 					return;
 				}
 				const res = await c.writeCore({ action: "append", content: raw });
@@ -1038,8 +1038,8 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	// --- /role ---
-	pi.registerCommand("role", {
+	// --- /psm-role ---
+	pi.registerCommand("psm-role", {
 		description: "Set this pi agent's role: brain (hosts memory) or agent (uses memory)",
 		handler: async (args, ctx) => {
 			const current = loadConfig(false).role;
@@ -1058,12 +1058,12 @@ export default function (pi: ExtensionAPI) {
 			await connect(ctx);
 			if (role === "brain") {
 				ctx.ui.notify(
-					"This pi agent is the brain: memory is served locally. Next: /join brain, then create a reusable pre-auth key in the Tailscale admin console for the agents.",
+					"This pi agent is the brain: memory is served locally. Next: /psm-join brain, then create a reusable pre-auth key in the Tailscale admin console for the agents.",
 					"info",
 				);
 				return;
 			}
-			ctx.ui.notify("This pi agent is an agent: it asks the tailnet which peer is the brain. Next: /join agent.", "info");
+			ctx.ui.notify("This pi agent is an agent: it asks the tailnet which peer is the brain. Next: /psm-join agent.", "info");
 			if (current === "brain") ctx.ui.notify("Note: the local brain server keeps running if you started it.", "info");
 		},
 	});
@@ -1101,7 +1101,7 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 		ctx.ui.notify(
-			`Joined the tailnet, but no peer answered as a brain on port ${cfg.brainPort} yet. It tries ${MAX_RETRY_ATTEMPTS} times on its own; if none of them finds a brain, run /memory connect to try again — and /join brain on the machine that should host one.`,
+			`Joined the tailnet, but no peer answered as a brain on port ${cfg.brainPort} yet. It tries ${MAX_RETRY_ATTEMPTS} times on its own; if none of them finds a brain, run /psm-memory connect to try again — and /psm-join brain on the machine that should host one.`,
 			"warning",
 		);
 	}
@@ -1209,15 +1209,15 @@ export default function (pi: ExtensionAPI) {
 		ctx.ui.notify(`${result.detail} The brain machine is where qmd matters.`, "info");
 	}
 
-	// --- /install-qmd ---
-	pi.registerCommand("install-qmd", {
+	// --- /psm-install-qmd ---
+	pi.registerCommand("psm-install-qmd", {
 		description: "Install qmd (semantic search for the brain) into a prefix on your PATH",
 		handler: async (_args, ctx) => {
 			await installQmdFlow(ctx);
 		},
 	});
 
-	// --- full reset (used by /reset) ---
+	// --- full reset (used by /psm-reset) ---
 	async function resetEverything(ctx: ExtensionContext): Promise<void> {
 		const plan = planReset();
 		if (!(await ctx.ui.confirm("Reset pi-scale-memory completely?", describeReset(plan)))) {
@@ -1233,17 +1233,17 @@ export default function (pi: ExtensionAPI) {
 		ctx.ui.notify(summarizeReset(outcome), "info");
 	}
 
-	// --- /reset ---
-	pi.registerCommand("reset", {
+	// --- /psm-reset ---
+	pi.registerCommand("psm-reset", {
 		description: "Delete all pi-scale-memory state (config, cache, tailscale nodes) and start over",
 		handler: async (_args, ctx) => {
 			await resetEverything(ctx);
 		},
 	});
 
-	// --- /join: one command, the role as its argument ---
-	pi.registerCommand("join", {
-		description: "Join the tailnet: /join agent (this machine uses the memory) or /join brain (this machine hosts it)",
+	// --- /psm-join: one command, the role as its argument ---
+	pi.registerCommand("psm-join", {
+		description: "Join the tailnet: /psm-join agent (this machine uses the memory) or /psm-join brain (this machine hosts it)",
 		handler: async (args, ctx) => {
 			const role = (args ?? "").trim().toLowerCase();
 			if (role === "agent") {
@@ -1254,12 +1254,12 @@ export default function (pi: ExtensionAPI) {
 				await joinAsBrain(ctx);
 				return;
 			}
-			ctx.ui.notify("Usage: /join agent | /join brain", "warning");
+			ctx.ui.notify("Usage: /psm-join agent | /psm-join brain", "warning");
 		},
 	});
 
-	// --- /update ---
-	pi.registerCommand("update", {
+	// --- /psm-update ---
+	pi.registerCommand("psm-update", {
 		description: "Update this extension (git pull or pi update), then reload it",
 		handler: async (_args, ctx) => {
 			const info = await inspectInstall(EXT_DIR);
@@ -1292,21 +1292,21 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "memory_write",
 		label: "Memory Write",
-		description: [
-			"Write to memory on the brain. Two writable tiers:",
-			"- 'project' (default): this repository's memory, shared with every agent working on it.",
-			"- 'shared': memory that applies to every project. Conventions and lessons only, not project findings.",
-			"Core memory is human-authored and has no tool: the user writes it with /core-memory. Tell them to run it when something belongs everywhere.",
-			"Targets: 'long_term' (MEMORY.md, curated) and 'daily' (project only, append-only work notes).",
-			"Search first: a write that restates an existing entry replaces it instead of adding a near-copy.",
-		].join("\n"),
+			description: [
+				"Write to memory on the brain. Three tiers:",
+				"- 'project' (default): this repository's memory, shared with every agent working on it.",
+				"- 'shared': memory that applies to every project. Conventions and lessons only, not project findings.",
+				"- 'core': the human's rules, loaded in every session on every project. Use it only when the user explicitly asks for something to be core memory; for anything else they want remembered everywhere, use 'shared' or point them at /psm-core-memory.",
+				"Targets: 'long_term' (MEMORY.md, curated) and 'daily' (project only, append-only work notes). Core is long_term only and is never queued.",
+				"Search first: a write that restates an existing entry replaces it instead of adding a near-copy.",
+			].join("\n"),
 		parameters: Type.Object({
 			target: StringEnum(["long_term", "daily"] as const, {
 				description: "'long_term' for MEMORY.md, 'daily' for today's log",
 			}),
 			scope: Type.Optional(
-				StringEnum(["project", "shared"] as const, {
-					description: "Default: project. 'shared' applies to every project and keeps no daily log",
+				StringEnum(["project", "shared", "core"] as const, {
+					description: "Default: project. 'shared' applies to every project and keeps no daily log. 'core' is the human's tier: only on their explicit request",
 				}),
 			),
 			content: Type.String({ description: "Content to write (Markdown)" }),
@@ -1319,6 +1319,18 @@ export default function (pi: ExtensionAPI) {
 			const scope = params.scope ?? "project";
 			if (scope === "shared" && params.target === "daily") {
 				return textResult("The shared tier holds MEMORY.md only. Write daily notes to project memory (scope project).");
+			}
+			if (scope === "core") {
+				if (params.target !== "long_term") {
+					return textResult("Core memory is one file: write it with scope 'core' and target 'long_term'.");
+				}
+				// Never queued, like /psm-core-memory: requireClient throws when the brain is
+				// unreachable, and a rule the user believes was saved must not sit in an outbox.
+				const res = await c.writeCore({ action: "append", content: params.content });
+				if (res.deduped) {
+					return textResult("Core memory already said that; the existing entry was updated in place.", { scope: "core", deduped: true });
+				}
+				return textResult("Added to core memory. It is loaded in every session, on every project.", { scope: "core" });
 			}
 			const ns = scope === "shared" ? SHARED : nsId();
 			const body = {
@@ -1483,7 +1495,7 @@ export default function (pi: ExtensionAPI) {
 		description: [
 			"Delete paragraphs containing a substring from MEMORY.md (or a daily log) on the brain.",
 			"Use when a stored fact is wrong, outdated, or not worth its tokens any more.",
-			"Core memory is out of reach here: the user removes those with /core-memory --remove.",
+			"Core memory is out of reach here: the user removes those with /psm-core-memory --remove.",
 			"A recovery record is kept on the brain.",
 		].join("\n"),
 		parameters: Type.Object({
