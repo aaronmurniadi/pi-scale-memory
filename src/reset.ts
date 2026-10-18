@@ -93,8 +93,8 @@ export function describeReset(plan: ResetPlan): string {
 	lines.push(
 		"",
 		"This removes the saved role, pre-auth keys, brain token, cached memory and the",
-		"brain's tailscale state, so you can start over with /join-tailnet-brain or",
-		"/join-tailnet-agent.",
+		"brain's tailscale state, so you can start over with /join brain or",
+		"/join agent.",
 		"",
 		"Machine entries this created stay in the Tailscale admin console until you delete",
 		"them or they expire.",
@@ -170,7 +170,7 @@ export function summarizeReset(outcome: ResetOutcome): string {
 	else lines.push("Nothing was left to remove.");
 	lines.push(
 		"",
-		"Start over with /join-tailnet-brain or /join-tailnet-agent.",
+		"Start over with /join brain or /join agent.",
 		`Log: ${brainLogPath()} is gone as well, so a fresh session starts clean.`,
 	);
 	return lines.join("\n");

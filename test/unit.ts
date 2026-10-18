@@ -429,12 +429,12 @@ check("a spent pre-auth key is recognised and explained", () => {
 	assert.equal(keyRejected("backend error: requested tag [tag:x] are invalid or not permitted"), false);
 	assert.equal(keyRejected("Failed to connect to local tailscaled"), false);
 
-	const help = keyRejectedHelp("/join-tailnet-agent", "invalid key: API key abc not valid");
+	const help = keyRejectedHelp("/join agent", "invalid key: API key abc not valid");
 	assert.match(help, /Join once per machine|once per machine/, "it should say one join is enough here");
 	assert.match(help, /Settings -> Keys/, "it should say where to make a new key");
-	assert.match(help, /join-tailnet-agent/, "it should name the command to re-run");
+	assert.match(help, /join agent/, "it should name the command to re-run");
 	assert.match(help, /Tailscale said: .*abc/, "it should keep what Tailscale actually said");
-	assert.match(keyRejectedHelp("/join-tailnet-brain"), /join-tailnet-brain/, "the brain has its own command");
+	assert.match(keyRejectedHelp("/join brain"), /join brain/, "the brain has its own command");
 	assert.ok(!keyRejectedHelp().includes("Tailscale said:"), "nothing observed, nothing repeated");
 });
 
@@ -1135,7 +1135,7 @@ check("the reset plan names what it will delete", () => {
 	assert.ok(text.includes(configDir()), "the confirmation must show the real path");
 	assert.match(text, /admin console/, "it should be honest that devices remain in Tailscale");
 	assert.match(text, /start over/i);
-	assert.match(text, /join-tailnet-brain/, "it should say how to start again");
+	assert.match(text, /join brain/, "it should say how to start again");
 });
 
 console.log("project namespaces from git");
@@ -1582,14 +1582,13 @@ await checkAsync("the extension registers its commands and tools", async () => {
 	};
 	mod.default(stub as never);
 	assert.deepEqual(commands.sort(), [
-		"brain",
 		"core-memory",
 		"install-qmd",
-		"join-tailnet-agent",
-		"join-tailnet-brain",
-		"reset-pi-scale-settings",
-		"self-tag",
-		"update-pi-scale-memory",
+		"join",
+		"memory",
+		"reset",
+		"role",
+		"update",
 	]);
 	assert.deepEqual(tools.sort(), [
 		"memory_forget",

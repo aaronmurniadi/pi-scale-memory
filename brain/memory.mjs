@@ -306,7 +306,7 @@ export function buildContext(root, ns) {
 	return `# Memory\n\n${kept.map(renderSection).join("\n\n---\n\n")}`;
 }
 
-/** Rough size of each tier, for /brain status: how much prompt budget is in use. */
+/** Rough size of each tier, for /memory ns: how much prompt budget is in use. */
 export function tierSizes(root, ns) {
 	const sizes = {
 		core: (readSafe(memoryPath(coreDir(root))) ?? "").length,
@@ -425,7 +425,7 @@ function moveFile(from, to) {
  * MEMORY.md and any open scratchpad items become the shared tier, because both are
  * cross-project agent-managed notes and core takes no agent writes. The originals,
  * and the old daily logs, are archived under the legacy namespace, which nothing
- * injects and which can be read by pinning it (/brain ns legacy).
+ * injects and which can be read by pinning it (/memory ns legacy).
  *
  * Idempotent: the flat files are moved away, so a second run finds nothing, and a
  * crash between the shared write and the move cannot duplicate content because the

@@ -67,8 +67,8 @@ Normalization: scheme, userinfo, port, trailing slash and `.git` are stripped, s
 
 Two failure modes are designed for rather than discovered:
 
-- **Fork vs upstream.** `origin` of a fork is not the upstream project. `scopeRemote` picks a different remote, and `/brain merge` plus the registry's recorded key handle the case where they were already treated as separate.
-- **Remote renamed or moved.** The key changes and the memory looks lost. `/brain merge <from> <into>` folds the namespaces together, and the brain's registry keeps the canonical key each agent reported.
+- **Fork vs upstream.** `origin` of a fork is not the upstream project. `scopeRemote` picks a different remote, and `/memory merge` plus the registry's recorded key handle the case where they were already treated as separate.
+- **Remote renamed or moved.** The key changes and the memory looks lost. `/memory merge <from> <into>` folds the namespaces together, and the brain's registry keeps the canonical key each agent reported.
 
 Worktrees share a namespace: `rev-parse --git-common-dir` resolves to `<root>/.git`, so `repo/.worktrees/x` maps onto `repo` instead of getting its own memory.
 
@@ -100,8 +100,8 @@ When the block does not fit, the least valuable section is given whatever room i
 The point of the tiers is that the prompt holds useful memory rather than accumulated noise, so three mechanisms work against dilution:
 
 - **Write-time dedup.** An entry that restates an existing paragraph (token-set Jaccard ≥ 0.8 against `MEMORY.md` paragraphs, stamps ignored) replaces it in place and reports `deduped`. Appending the same fact twice costs nothing and adds nothing. Daily logs opt out: repetition there is history.
-- **Compaction.** `/brain compact [ns]` folds a `MEMORY.md` with the session model. The brain has no model of its own, so it runs on the agent and writes back an overwrite; it refuses files below the threshold and refuses a result that is not shorter than the original, so a bad fold cannot make memory worse than leaving it alone.
-- **Visibility and pruning.** `/brain namespaces` reports each namespace's size and daily-log count, and `/brain status` reports the standing cost of core + shared + project in tokens per session. Shared and project memory are prunable with `memory_forget` (recovery copies kept), and core with `/core-memory --remove`.
+- **Compaction.** `/memory compact [ns]` folds a `MEMORY.md` with the session model. The brain has no model of its own, so it runs on the agent and writes back an overwrite; it refuses files below the threshold and refuses a result that is not shorter than the original, so a bad fold cannot make memory worse than leaving it alone.
+- **Visibility and pruning.** `/memory ns` reports each namespace's size and daily-log count, and `/memory status` reports the standing cost of core + shared + project in tokens per session. Shared and project memory are prunable with `memory_forget` (recovery copies kept), and core with `/core-memory --remove`.
 
 ## API
 
@@ -171,7 +171,7 @@ Per-tier qmd collections are exercised only when qmd is installed, through throw
 | Container/monorepo sub-scoping | Not implemented. A monorepo is one namespace; splitting it by path stays opt-in work if it is ever wanted |
 | Mirror disk usage | One directory per project worked on, never evicted. Deliberate: sessions share one cache dir, so eviction would delete a live session's offline memory. Bounded by how many projects a machine works in, and revisitable with mtime-based pruning if that ever matters |
 | A write racing a namespace merge | The merge locks each destination file it copies, but a write to the source namespace between the last copy and the `rm` can recreate the source directory holding one file, with no registry entry. Narrow, and the namespace still works; a follow-up merge would fold it in |
-| Compaction is manual | `/brain compact` exists but nothing schedules it. Core has no compaction at all, by design |
+| Compaction is manual | `/memory compact` exists but nothing schedules it. Core has no compaction at all, by design |
 | Daily logs are unbounded on disk | Only today and yesterday are injected, so growth costs disk and index time, not prompt tokens. No auto-deletion, deliberately |
 | Leftover v0.1 qmd collection | Reported at startup; removing it is a manual `qmd collection remove` |
 | `npm test` needs `tsx` | The `test` script calls `tsx`, which is not in `devDependencies`, so a fresh clone needs `npx tsx test/unit.ts` or an added dependency |

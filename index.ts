@@ -1,7 +1,7 @@
 /**
  * pi-scale-memory — one shared memory for many pi agents, over Tailscale.
  *
- * Roles (/self-tag):
+ * Roles (/role):
  *   brain — runs the memory server on its own tailnet node and publishes it with
  *           `tailscale serve`.
  *   agent — uses its own userspace tailscaled (no TUN device, no route changes,
@@ -10,13 +10,13 @@
  *           the memory for offline reads.
  *
  * Commands:
- *   /self-tag               — set this pi agent's role (brain or agent)
- *   /join-tailnet-brain     — join this machine and host the memory here
- *   /join-tailnet-agent     — join this machine as an agent
- *   /brain                  — status | namespaces | ns | merge | compact | sync | reindex | connect | reset
+ *   /role                   — set this pi agent's role (brain or agent)
+ *   /join brain             — join this machine and host the memory here
+ *   /join agent             — join this machine as an agent
+ *   /memory                 — status | ns | pin | merge | compact | sync | search | connect
  *   /core-memory            — write core memory (the only writer), --remove to delete, no args to show
- *   /update-pi-scale-memory — update the extension itself, then reload
- *   /reset-pi-scale-settings — delete all local state and start over
+ *   /update                 — update the extension itself, then reload
+ *   /reset                  — delete all local state and start over
  *   /install-qmd            — optional: install qmd for semantic search on the brain
  */
 import { spawn } from "node:child_process";
@@ -255,7 +255,7 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	function requireClient(): BrainClient {
-		if (!client) throw new Error(`${notConnected()}. Run /brain connect.`);
+		if (!client) throw new Error(`${notConnected()}. Run /memory connect.`);
 		return client;
 	}
 
@@ -326,7 +326,7 @@ export default function (pi: ExtensionAPI) {
 					if (ctx.hasUI) ctx.ui.notify(`pi-scale-memory: agents cannot reach this brain — ${node.detail}`, "warning");
 				}
 			} else if (ctx.hasUI) {
-				ctx.ui.notify("pi-scale-memory: run /join-tailnet-brain so agents can reach this brain.", "warning");
+				ctx.ui.notify("pi-scale-memory: run /join brain so agents can reach this brain.", "warning");
 			}
 
 			client = new BrainClient({
@@ -423,7 +423,7 @@ export default function (pi: ExtensionAPI) {
 		if (!cfg.authKey && !cfg.loginServer) {
 			lastError = "not joined yet";
 			status(ctx, "brain: not joined");
-			if (ctx.hasUI) ctx.ui.notify("pi-scale-memory: run /join-tailnet-agent to join the tailnet.", "warning");
+			if (ctx.hasUI) ctx.ui.notify("pi-scale-memory: run /join agent to join the tailnet.", "warning");
 			return;
 		}
 		status(ctx, "brain: joining tailnet…");
@@ -489,10 +489,10 @@ export default function (pi: ExtensionAPI) {
 	function scheduleAgentRetry(ctx: ExtensionContext): void {
 		if (retryTimer) return;
 		if (retryAttempt >= MAX_RETRY_ATTEMPTS) {
-			status(ctx, "brain: offline, run /brain connect");
+			status(ctx, "brain: offline, run /memory connect");
 			if (ctx.hasUI) {
 				ctx.ui.notify(
-					`pi-scale-memory: gave up after ${MAX_RETRY_ATTEMPTS} tries (${lastError || "no peer answered as a brain"}). Run /brain connect to try again.`,
+					`pi-scale-memory: gave up after ${MAX_RETRY_ATTEMPTS} tries (${lastError || "no peer answered as a brain"}). Run /memory connect to try again.`,
 					"warning",
 				);
 			}
@@ -546,7 +546,7 @@ export default function (pi: ExtensionAPI) {
 		}
 		cancelAgentRetry();
 		// The node is shared per machine and stays up between sessions, so this only
-		// drops our handle to it. /reset-pi-scale-settings stops it for good.
+		// drops our handle to it. /reset stops it for good.
 		agentNode = null;
 		// Clear out anything an older version left running with its socket already
 		// deleted, which is unreachable from then on.
@@ -559,7 +559,7 @@ export default function (pi: ExtensionAPI) {
 
 	// --- periodic summaries stored to the brain ---
 
-	/** One model call, shared by the session summary and by /brain compact. */
+	/** One model call, shared by the session summary and by /memory compact. */
 	async function askModel(ctx: ExtensionContext, system: string, prompt: string): Promise<string | null> {
 		const model = ctx.model;
 		if (!model) return null;
@@ -774,15 +774,11 @@ export default function (pi: ExtensionAPI) {
 		}
 	});
 
-	// --- /brain ---
-	pi.registerCommand("brain", {
-		description: "pi-scale-memory: status | namespaces | ns | merge | compact | sync | reindex | connect | reset",
+	// --- /memory ---
+	pi.registerCommand("memory", {
+		description: "pi-scale-memory: status | ns | pin | merge | compact | sync | search | connect",
 		handler: async (args, ctx) => {
 			const sub = (args ?? "").trim().split(/\s+/)[0] || "status";
-			if (sub === "reset") {
-				await resetEverything(ctx);
-				return;
-			}
 			if (sub === "sync") {
 				const cfg = loadConfig(false);
 				if (!cachingEnabled(cfg)) {
@@ -801,7 +797,7 @@ export default function (pi: ExtensionAPI) {
 				}
 				return;
 			}
-			if (sub === "reindex") {
+			if (sub === "search") {
 				if (!client) {
 					ctx.ui.notify(`${notConnected()} — the brain owns the search index.`, "warning");
 					return;
@@ -817,29 +813,42 @@ export default function (pi: ExtensionAPI) {
 				}
 				return;
 			}
-			// `connect` is the name the messages point at; `reconnect` is kept as the
-			// original spelling so muscle memory and older notes still work.
-			if (sub === "reconnect" || sub === "connect") {
+			if (sub === "connect") {
 				await stopBrainNode();
 
 				await disconnect();
 				await connect(ctx);
 				return;
 			}
-			if (sub === "namespaces") {
+			// `ns` answers with this machine's namespace and the brain's list of them;
+			// `pin` is the one that writes, so a read never looks like a write.
+			if (sub === "ns") {
+				const lines: string[] = [];
+				if (!activeNs) {
+					lines.push("Namespace: not resolved yet.");
+				} else {
+					const pin = loadConfig(false).namespace;
+					lines.push(
+						`Namespace: ${activeNs.ns}`,
+						`key: ${activeNs.key}`,
+						`resolved from: ${activeNs.source}`,
+						`pin: ${pin ?? "(none)"} (set with /memory pin <ns>, clear with /memory pin --clear)`,
+						"",
+					);
+				}
 				if (!client) {
-					ctx.ui.notify(`${notConnected()} — the brain owns the namespaces.`, "warning");
+					lines.push(`${notConnected()} — the brain owns the namespace list.`);
+					ctx.ui.notify(lines.join("\n"), "warning");
 					return;
 				}
 				try {
 					const listing = await client.namespaces(nsId());
 					const tokens = (n: number) => `~${Math.ceil(n / 4)} tokens`;
-					const lines = [
+					lines.push(
 						`core:   ${listing.core.memory} chars ${tokens(listing.core.memory)} (loaded in every session)`,
 						`shared: ${listing.shared.memory} chars ${tokens(listing.shared.memory)} (loaded in every session)`,
-						`active: ${nsId()}${activeNs ? ` — ${activeNs.label}, from ${activeNs.source}` : ""}`,
 						"",
-					];
+					);
 					for (const n of listing.namespaces) {
 						const here = n.id === nsId() ? "*" : " ";
 						let flags = "";
@@ -849,24 +858,18 @@ export default function (pi: ExtensionAPI) {
 							`${here} ${n.id}${flags} — mem ${n.memory} | scratch ${n.scratchpad} | daily ${n.dailyFiles} file(s), ${n.daily} chars | ${n.label}`,
 						);
 					}
-					ctx.ui.notify(lines.join("\n"), "info");
 				} catch (e) {
-					ctx.ui.notify(`Could not list namespaces: ${errMsg(e)}`, "error");
+					lines.push(`Could not list namespaces: ${errMsg(e)}`);
+					ctx.ui.notify(lines.join("\n"), "error");
+					return;
 				}
+				ctx.ui.notify(lines.join("\n"), "info");
 				return;
 			}
-			if (sub === "ns") {
+			if (sub === "pin") {
 				const wanted = (args ?? "").trim().split(/\s+/).slice(1).join(" ").trim();
 				if (!wanted) {
-					if (!activeNs) {
-						ctx.ui.notify("Namespace: not resolved yet.", "info");
-						return;
-					}
-					const pin = loadConfig(false).namespace;
-					ctx.ui.notify(
-						`Namespace: ${activeNs.ns}\nkey: ${activeNs.key}\nresolved from: ${activeNs.source}\npin: ${pin ?? "(none)"}`,
-						"info",
-					);
+					ctx.ui.notify("Usage: /memory pin <ns> | /memory pin --clear", "warning");
 					return;
 				}
 				if (wanted === "--clear") {
@@ -878,7 +881,7 @@ export default function (pi: ExtensionAPI) {
 				updateConfig({ namespace: wanted });
 				activeNs = await resolveActiveNs(ctx, loadConfig(false));
 				ctx.ui.notify(
-					`Pinned this machine to '${wanted}'. Every session on this machine now uses it; /brain ns --clear removes the pin.`,
+					`Pinned this machine to '${wanted}'. Every session on this machine now uses it; /memory pin --clear removes the pin.`,
 					"info",
 				);
 				if (client) {
@@ -895,7 +898,7 @@ export default function (pi: ExtensionAPI) {
 				const from = parts[0];
 				const into = parts[1];
 				if (!from || !into) {
-					ctx.ui.notify("Usage: /brain merge <from-ns> <into-ns>", "warning");
+					ctx.ui.notify("Usage: /memory merge <from-ns> <into-ns>", "warning");
 					return;
 				}
 				if (!client) {
@@ -951,11 +954,11 @@ export default function (pi: ExtensionAPI) {
 			// The node is machine-wide, so report it from the node itself: it is there
 			// even for a session that has not connected to a brain yet.
 			const agent = await agentNodeStatus();
-			let nodeInfo = `node: ${agent?.hostname || "not joined (run /join-tailnet-agent)"}`;
+			let nodeInfo = `node: ${agent?.hostname || "not joined (run /join agent)"}`;
 			if (cfg.role === "brain") {
 				const node = await nodeStatus();
 				if (node) nodeInfo = `node: ${node.hostname} ${node.ip} tags=[${node.tags.join(",")}]`;
-				else nodeInfo = "node: not joined (run /join-tailnet-brain)";
+				else nodeInfo = "node: not joined (run /join brain)";
 			}
 			// What memory costs: core and shared are injected in every session, so their
 			// size is a standing token bill rather than a one-off.
@@ -1035,8 +1038,8 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	// --- /self-tag ---
-	pi.registerCommand("self-tag", {
+	// --- /role ---
+	pi.registerCommand("role", {
 		description: "Set this pi agent's role: brain (hosts memory) or agent (uses memory)",
 		handler: async (args, ctx) => {
 			const current = loadConfig(false).role;
@@ -1045,7 +1048,7 @@ export default function (pi: ExtensionAPI) {
 			if (arg === "brain" || arg === "agent") {
 				role = arg;
 			} else {
-				const picked = await ctx.ui.select("Tag this pi agent as:", ["brain", "agent"]);
+				const picked = await ctx.ui.select("Set this pi agent's role:", ["brain", "agent"]);
 				if (!picked) return;
 				if (picked === "brain" || picked === "agent") role = picked;
 			}
@@ -1055,12 +1058,12 @@ export default function (pi: ExtensionAPI) {
 			await connect(ctx);
 			if (role === "brain") {
 				ctx.ui.notify(
-					"This pi agent is the brain: memory is served locally. Next: /join-tailnet-brain, then create a reusable pre-auth key in the Tailscale admin console for the agents.",
+					"This pi agent is the brain: memory is served locally. Next: /join brain, then create a reusable pre-auth key in the Tailscale admin console for the agents.",
 					"info",
 				);
 				return;
 			}
-			ctx.ui.notify("This pi agent is an agent: it asks the tailnet which peer is the brain. Next: /join-tailnet-agent.", "info");
+			ctx.ui.notify("This pi agent is an agent: it asks the tailnet which peer is the brain. Next: /join agent.", "info");
 			if (current === "brain") ctx.ui.notify("Note: the local brain server keeps running if you started it.", "info");
 		},
 	});
@@ -1098,7 +1101,7 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 		ctx.ui.notify(
-			`Joined the tailnet, but no peer answered as a brain on port ${cfg.brainPort} yet. It tries ${MAX_RETRY_ATTEMPTS} times on its own; if none of them finds a brain, run /brain connect to try again — and /join-tailnet-brain on the machine that should host one.`,
+			`Joined the tailnet, but no peer answered as a brain on port ${cfg.brainPort} yet. It tries ${MAX_RETRY_ATTEMPTS} times on its own; if none of them finds a brain, run /memory connect to try again — and /join brain on the machine that should host one.`,
 			"warning",
 		);
 	}
@@ -1214,7 +1217,7 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	// --- full reset (shared by /reset-pi-scale-settings and /brain reset) ---
+	// --- full reset (used by /reset) ---
 	async function resetEverything(ctx: ExtensionContext): Promise<void> {
 		const plan = planReset();
 		if (!(await ctx.ui.confirm("Reset pi-scale-memory completely?", describeReset(plan)))) {
@@ -1230,32 +1233,33 @@ export default function (pi: ExtensionAPI) {
 		ctx.ui.notify(summarizeReset(outcome), "info");
 	}
 
-	// --- /reset-pi-scale-settings ---
-	pi.registerCommand("reset-pi-scale-settings", {
+	// --- /reset ---
+	pi.registerCommand("reset", {
 		description: "Delete all pi-scale-memory state (config, cache, tailscale nodes) and start over",
 		handler: async (_args, ctx) => {
 			await resetEverything(ctx);
 		},
 	});
 
-	// --- /join-tailnet-agent ---
-	pi.registerCommand("join-tailnet-agent", {
-		description: "Join the tailnet as an agent device with a pre-auth key",
-		handler: async (_args, ctx) => {
-			await joinAsAgent(ctx);
+	// --- /join: one command, the role as its argument ---
+	pi.registerCommand("join", {
+		description: "Join the tailnet: /join agent (this machine uses the memory) or /join brain (this machine hosts it)",
+		handler: async (args, ctx) => {
+			const role = (args ?? "").trim().toLowerCase();
+			if (role === "agent") {
+				await joinAsAgent(ctx);
+				return;
+			}
+			if (role === "brain") {
+				await joinAsBrain(ctx);
+				return;
+			}
+			ctx.ui.notify("Usage: /join agent | /join brain", "warning");
 		},
 	});
 
-	// --- /join-tailnet-brain ---
-	pi.registerCommand("join-tailnet-brain", {
-		description: "Join the tailnet on this machine and host the memory",
-		handler: async (_args, ctx) => {
-			await joinAsBrain(ctx);
-		},
-	});
-
-	// --- /update-pi-scale-memory ---
-	pi.registerCommand("update-pi-scale-memory", {
+	// --- /update ---
+	pi.registerCommand("update", {
 		description: "Update this extension (git pull or pi update), then reload it",
 		handler: async (_args, ctx) => {
 			const info = await inspectInstall(EXT_DIR);

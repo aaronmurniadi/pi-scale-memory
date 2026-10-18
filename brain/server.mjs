@@ -89,7 +89,7 @@ const REGISTRY = path.join(DIR, "registry.json");
 
 /** Search state reported by /v1/health so agents can label their results. */
 const searchState = { engine: "bm25", mode: SEARCH_MODE, ready: false, note: null };
-/** Collections the brain believes exist: what /v1/health reports and /brain reindex prints. */
+/** Collections the brain believes exist: what /v1/health reports and /memory search prints. */
 const knownCollections = new Set();
 
 fs.mkdirSync(path.join(DIR, "ns"), { recursive: true });

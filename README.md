@@ -6,7 +6,7 @@ A pi extension that gives many pi agents one shared memory (a "brain") over a pr
 
 The brain runs a detached userspace node and publishes its memory API to the tailnet with `tailscale serve --tcp`, which proxies tailnet traffic to `127.0.0.1`. Agents run a detached node too, one per machine, and reach the brain through its SOCKS5 proxy. Every session on a machine shares that one node, so a machine joins once and keeps the same device from then on. Agents also keep a local mirror of the memory, so they can still read while the brain is unreachable.
 
-**A brain that is not answering yet is retried three times, then left to you.** A node that has just joined needs a moment to find paths to its peers, and a reset brain comes back under a new address, so the agent warms those paths through the Tailscale layer and retries on a growing delay (5s, 10s, 20s) instead of giving up on the first attempt. After that it stops and says so in the status line, because by then the cause is usually something only you can change — no brain running yet, the wrong port, a machine that is asleep — and a loop that retries in silence would hide it. Run `/brain connect` to try again; reads keep coming from the local mirror in the meantime.
+**A brain that is not answering yet is retried three times, then left to you.** A node that has just joined needs a moment to find paths to its peers, and a reset brain comes back under a new address, so the agent warms those paths through the Tailscale layer and retries on a growing delay (5s, 10s, 20s) instead of giving up on the first attempt. After that it stops and says so in the status line, because by then the cause is usually something only you can change — no brain running yet, the wrong port, a machine that is asleep — and a loop that retries in silence would hide it. Run `/memory connect` to try again; reads keep coming from the local mirror in the meantime.
 
 **Agents find the brain by asking, not by tag.** Each agent reads the peer list it already has from its own netmap and asks every peer on the memory port whether it is the brain. A peer answers by identifying itself in its `/v1/health` response (`service: pi-scale-memory`, `role: brain`), so no tag policy, no `tagOwners`, and no port scanning of anything outside your tailnet are involved. **This extension uses no tags at all** — there is no tag to declare, and nothing to configure in `tagOwners`, for either role.
 
@@ -23,7 +23,7 @@ Nothing is published to the internet: the memory API is reachable only from the 
 
 ## Roles
 
-`/self-tag` sets what this pi agent is, and the join commands set it too:
+`/role` sets what this pi agent is, and the join commands set it too:
 
 | Role | What it does | Memory path |
 |---|---|---|
@@ -48,24 +48,24 @@ Keeping the tiers worth their tokens:
 
 - Each tier is injected under a budget — core 2 000 chars, shared 3 000, project `MEMORY.md` 8 000, scratchpad 4 000, today 6 000, yesterday 4 000 — under a 12 000-char ceiling for the whole block. When the block does not fit, the least valuable part is given the room that is left before anything is dropped, so a section is only discarded when what remains could not hold a useful fragment of it. `MEMORY.md` is trimmed from the front so the newest entries survive. The order is deliberate memory before automatic logs: core, shared, project memory, scratchpad, today, yesterday. Core and shared are never the part that gives way.
 - A write that restates an existing entry **replaces** it rather than appending a near-copy, and tells the writer it did (`deduped`). `/core-memory` reporting "already said that" is that working, not a silent no-op.
-- `/brain compact [ns]` folds a `MEMORY.md` down with the session model and refuses to write a result that is not shorter than the original.
-- `/brain namespaces` lists every namespace with its size and daily-log count, so what a session is paying for is visible rather than guessed.
-- A remote that is renamed or moved changes the namespace key. `/brain merge <from> <into>` folds the old namespace into the new one, and the canonical key each agent reports is kept in the brain's registry for exactly this case.
+- `/memory compact [ns]` folds a `MEMORY.md` down with the session model and refuses to write a result that is not shorter than the original.
+- `/memory ns` prints this machine's namespace and lists every namespace with its size and daily-log count, so what a session is paying for is visible rather than guessed.
+- A remote that is renamed or moved changes the namespace key. `/memory merge <from> <into>` folds the old namespace into the new one, and the canonical key each agent reports is kept in the brain's registry for exactly this case.
 
-Upgrading from the flat v0.1 layout moves `MEMORY.md` and any open scratchpad items into **shared** — they were cross-project notes written by agents, and core takes no agent writes — and archives the old daily logs under a `legacy` namespace that nothing injects. A caller that names no namespace, such as an older agent, lands in `legacy` too. Read it with `/brain ns legacy`, and `/brain ns --clear` to resolve from git again.
+Upgrading from the flat v0.1 layout moves `MEMORY.md` and any open scratchpad items into **shared** — they were cross-project notes written by agents, and core takes no agent writes — and archives the old daily logs under a `legacy` namespace that nothing injects. A caller that names no namespace, such as an older agent, lands in `legacy` too. Read it with `/memory pin legacy` to pin this machine to it, and `/memory pin --clear` to resolve from git again.
 
 ## Commands
 
 | Command | Applies to | What it does |
 |---|---|---|
-| `/join-tailnet-brain` | brain | Starts this machine's own userspace Tailscale node, joins it with a pre-auth key, publishes the memory port to the tailnet, and sets the role to `brain` |
-| `/join-tailnet-agent` | agent | Joins with a pre-auth key on a private userspace tailscaled, then asks the tailnet which peer is the brain |
-| `/self-tag [brain\|agent]` | both | Sets the role on its own, without joining |
+| `/join brain` | brain | Starts this machine's own userspace Tailscale node, joins it with a pre-auth key, publishes the memory port to the tailnet, and sets the role to `brain` |
+| `/join agent` | agent | Joins with a pre-auth key on a private userspace tailscaled, then asks the tailnet which peer is the brain |
+| `/role [brain\|agent]` | both | Sets the role on its own, without joining |
 | `/install-qmd` | brain | Installs qmd for semantic search, into a prefix that is on your `PATH`, then restarts the brain so it indexes with it |
-| `/reset-pi-scale-settings` | both | Stops the daemons this extension started, logs its tailscale nodes out, and deletes all of its state so you can start over |
+| `/reset` | both | Stops the daemons this extension started, logs its tailscale nodes out, and deletes all of its state so you can start over |
 | `/core-memory <memory>` | both | Writes **core memory**, and is the only writer to it. No arguments shows core; `--remove <match>` deletes matching entries, keeping a recovery copy |
-| `/brain status\|namespaces\|ns\|merge\|compact\|sync\|reindex\|connect\|reset` | both | Shows role, brain, health, search engine, namespace and tier sizes, queue and cache age; lists namespaces; pins the namespace for this machine (`--clear` unpins); merges two namespaces; folds a `MEMORY.md` down with the session model, to that tier's own budget; refreshes the offline mirror; reports the brain's index; reconnects (`connect`, or its older spelling `reconnect`); `reset` is the same as `/reset-pi-scale-settings` |
-| `/update-pi-scale-memory` | both | Updates the extension (git pull, or `pi update`) and reloads it |
+| `/memory status\|ns\|pin\|merge\|compact\|sync\|search\|connect` | both | Shows role, brain, health, search engine, namespace and tier sizes, queue and cache age; prints this machine's namespace and lists the brain's namespaces; pins the namespace for this machine (`--clear` unpins); merges two namespaces; folds a `MEMORY.md` down with the session model, to that tier's own budget; refreshes the offline mirror; reports the brain's search engine and collections; reconnects |
+| `/update` | both | Updates the extension (git pull, or `pi update`) and reloads it |
 
 ### Quick start
 
@@ -75,13 +75,13 @@ a node registers once and keeps its identity, so a key is spent only by that
 machine's first join. Then, on the machine that will hold the memory:
 
 ```
-/join-tailnet-brain  # paste the brain's key
+/join brain  # paste the brain's key
 ```
 
 On every other machine:
 
 ```
-/join-tailnet-agent  # paste an agent key
+/join agent  # paste an agent key
 ```
 
 That is the whole setup. The brain prints the node name and tailnet address it joined as, and agents report the node name they registered as plus the brain they found. Nothing has to be declared beforehand: agents identify the brain by asking it. One key covers one machine's first join; make it reusable only if you want the same key to serve several machines.
@@ -93,7 +93,7 @@ Two nodes appear in your tailnet: `pi-brain-<host>` for the brain and `pi-agent-
 Two things must hold, and the extension reports when either is missing:
 
 - the ACL must let each agent reach the brain's node on the memory port (default 8787);
-- the brain's node must be joined and serving, which `/join-tailnet-brain` ensures. On later sessions the brain restarts that node itself from its saved state, so it is only needed once.
+- the brain's node must be joined and serving, which `/join brain` ensures. On later sessions the brain restarts that node itself from its saved state, so it is only needed once.
 
 Since discovery uses no tags, the ACL simply has to allow your devices to reach
 that port:
@@ -108,7 +108,7 @@ Narrow `dst` to the brain's device or a group if you want tighter control. Tags
 can still be used in your ACL if you use them elsewhere in your tailnet, but this
 extension neither needs nor sets any.
 
-An agent that joins successfully but finds no brain reports how many peers it asked and on which port, and tells you to run `/join-tailnet-brain` on the brain, rather than pretending it connected. If more than one peer answers as a brain, it says so and names them, because that ambiguity would otherwise pick one silently.
+An agent that joins successfully but finds no brain reports how many peers it asked and on which port, and tells you to run `/join brain` on the brain, rather than pretending it connected. If more than one peer answers as a brain, it says so and names them, because that ambiguity would otherwise pick one silently.
 
 A single brain can also be pinned, which skips discovery entirely — useful on a
 tailnet with many peers:
@@ -117,7 +117,7 @@ tailnet with many peers:
 PI_SCALE_MEMORY_BRAIN_HOST=100.64.0.5 pi
 ```
 
-The brain's node is detached and survives pi exiting, so agents keep reaching the memory while no session is open on the brain machine. `/brain reset` stops it.
+The brain's node is detached and survives pi exiting, so agents keep reaching the memory while no session is open on the brain machine. `/reset` stops it.
 
 ## Search
 
@@ -164,7 +164,7 @@ Set `QMD_UPDATE=off` on the brain to keep the extension out of the indexer entir
 Agents mirror the brain so a dead network or a sleeping brain machine does not cost them their memory. The brain stays authoritative: the mirror is only consulted when a request to it fails.
 
 - **What is mirrored:** core, shared, and the project the session is in. A project another session mirrored stays as it was last seen, and each tier keeps its own timestamp, because every session on a machine shares this cache directory. The mirror keeps the brain's own layout (`core/`, `shared/`, `ns/<id>/`) under `~/.pi/agent/pi-scale-memory/cache/`, so offline reads are built and ranked by the same code as online ones. Deletions propagate.
-- **When it syncs:** on connect and every 60s while connected (`PI_SCALE_MEMORY_CACHE_SYNC_MS`). `/brain sync` forces one; `/brain status` shows file count and age.
+- **When it syncs:** on connect and every 60s while connected (`PI_SCALE_MEMORY_CACHE_SYNC_MS`). `/memory sync` forces one; `/memory status` shows file count and age.
 - **Offline reads:** `memory_read`, `memory_search` and the session-start memory block fall back to the mirror, labelled `(brain unreachable — showing the cached copy taken …; it may be stale)`.
 - **Offline writes:** queued in memory and sent when the brain returns. A write still queued when pi exits is lost.
 - **Same ranking offline:** the mirror reuses the brain's own context builder and BM25 search (`brain/memory.mjs`), so offline results are ranked and trimmed exactly like online ones.
@@ -233,7 +233,7 @@ This extension targets Tailscale. It has not been tested against Headscale; `PI_
 
 ## Starting over
 
-`/reset-pi-scale-settings` (or `/brain reset`) stops the brain server and the brain's tailscale node, logs this session's agent node out, and deletes the extension's whole state directory — saved role, pre-auth keys, brain token, cached memory, the brain's tailscale state, logs and pid files:
+`/reset` stops the brain server and the brain's tailscale node, logs this session's agent node out, and deletes the extension's whole state directory — saved role, pre-auth keys, brain token, cached memory, the brain's tailscale state, logs and pid files:
 
 ```
 ~/.pi/agent/pi-scale-memory/
@@ -241,11 +241,11 @@ This extension targets Tailscale. It has not been tested against Headscale; `PI_
 
 It also clears socket directories left behind by sessions that crashed, but only those older than an hour, so a concurrently running pi is left alone. Everything it will stop and delete is listed in the confirmation prompt before anything happens; declining changes nothing.
 
-It cannot delete the machines this extension registered in your tailnet — that needs the admin console or the Tailscale API. They are listed there as devices named `pi-brain-<host>` and `pi-agent-<host>`. A reset logs the agent node out too, before its socket is removed, so the device does not linger holding an expired key. After a reset, set up again with `/join-tailnet-brain` or `/join-tailnet-agent`, which registers a fresh device.
+It cannot delete the machines this extension registered in your tailnet — that needs the admin console or the Tailscale API. They are listed there as devices named `pi-brain-<host>` and `pi-agent-<host>`. A reset logs the agent node out too, before its socket is removed, so the device does not linger holding an expired key. After a reset, set up again with `/join brain` or `/join agent`, which registers a fresh device.
 
 ## Updating
 
-`/update-pi-scale-memory` detects how the extension was installed:
+`/update` detects how the extension was installed:
 
 - a **git checkout** (cloned locally, or installed from a local path): refuses to touch a dirty tree or a detached HEAD, then `git pull --ff-only` and reports the commit change;
 - a **pi package** listed in `~/.pi/agent/settings.json`: runs `pi update <source>`;
